@@ -16,7 +16,7 @@ pub use schema::{
     GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
     HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig, IdentityConfig, LarkConfig,
     MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
-    NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpChallengeDelivery, OtpConfig,
+    NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OpenMemoryConfig, OtpChallengeDelivery, OtpConfig,
     OtpMethod, OutboundLeakGuardAction, OutboundLeakGuardConfig, PeripheralBoardConfig,
     PeripheralsConfig, PerplexityFilterConfig, PluginEntryConfig, PluginsConfig, ProgressMode,
     ProviderConfig, ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig,

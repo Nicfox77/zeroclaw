@@ -6,6 +6,7 @@ pub enum MemoryBackendKind {
     CortexMem,
     Postgres,
     Qdrant,
+    OpenMemory,
     Markdown,
     None,
     Unknown,
@@ -85,6 +86,15 @@ const SQLITE_QDRANT_HYBRID_PROFILE: MemoryBackendProfile = MemoryBackendProfile 
     optional_dependency: false,
 };
 
+const OPENMEMORY_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "openmemory",
+    label: "OpenMemory — cognitive memory engine with sectors, salience, decay via HTTP API",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: false,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -127,6 +137,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "cortex-mem" | "cortex_mem" | "cortexmem" | "cortex" => MemoryBackendKind::CortexMem,
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
+        "openmemory" | "open-memory" => MemoryBackendKind::OpenMemory,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
@@ -141,6 +152,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::CortexMem => CORTEX_MEM_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
+        MemoryBackendKind::OpenMemory => OPENMEMORY_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,

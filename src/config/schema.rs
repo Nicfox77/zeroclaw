@@ -2706,6 +2706,40 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Configuration for OpenMemory cognitive memory backend (`[memory.openmemory]`).
+/// Used when `[memory].backend = "openmemory"`.
+///
+/// OpenMemory provides advanced cognitive memory features including:
+/// - Multi-sector memory (episodic, semantic, procedural, emotional, reflective)
+/// - Salience scoring and decay
+/// - Waypoint graph for associative recall
+/// - Temporal reasoning
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenMemoryConfig {
+    /// OpenMemory server URL (e.g., "http://localhost:8080").
+    /// Falls back to `OPENMEMORY_URL` env var if not set.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional API key for authentication.
+    /// Falls back to `OPENMEMORY_API_KEY` env var if not set.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional user ID for multi-tenant isolation.
+    /// Falls back to `OPENMEMORY_USER_ID` env var if not set.
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+impl Default for OpenMemoryConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            api_key: None,
+            user_id: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -2806,6 +2840,12 @@ pub struct MemoryConfig {
     /// Used when `backend = "qdrant"` or `backend = "sqlite_qdrant_hybrid"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+
+    // ── OpenMemory backend options ─────────────────────────────
+    /// Configuration for OpenMemory cognitive memory backend.
+    /// Used when `backend = "openmemory"`.
+    #[serde(default)]
+    pub openmemory: OpenMemoryConfig,
 }
 
 fn default_sqlite_journal_mode() -> String {
@@ -2881,6 +2921,7 @@ impl Default for MemoryConfig {
             sqlite_open_timeout_secs: None,
             sqlite_journal_mode: default_sqlite_journal_mode(),
             qdrant: QdrantConfig::default(),
+            openmemory: OpenMemoryConfig::default(),
         }
     }
 }
