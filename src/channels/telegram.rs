@@ -4967,29 +4967,14 @@ mod tests {
             *cache = Some("mybot".to_string());
         }
 
-        let _update = serde_json::json!({
-            "update_id": 100,
-            "message": {
-                "message_id": 1,
-                "photo": [
-                    {"file_id": "photo_id", "file_size": 1_000}
-                ],
-                "from": {
-                    "id": 555,
-                    "username": "alice"
-                },
-                "chat": {
-                    "id": -100_200_300,
-                    "type": "group"
-                }
-            }
+        let group_message = serde_json::json!({
+            "chat": { "type": "group" }
         });
 
-        // Photo without caption in group chat with mention_only=true should be ignored
-        // Note: This test verifies the check is in place, but the async function needs
-        // a workspace_dir to be set for full parsing. The key check happens before download.
-        // For unit testing purposes, we verify the logic path exists.
-        assert!(ch.mention_only);
+        assert!(
+            !ch.passes_mention_only_gate(&group_message, Some("555"), None),
+            "group attachments without caption/mention must be ignored"
+        );
     }
 
     #[test]
@@ -5000,60 +4985,44 @@ mod tests {
             *cache = Some("mybot".to_string());
         }
 
-        // Photo with caption that doesn't mention the bot
-        let _update = serde_json::json!({
-            "update_id": 101,
-            "message": {
-                "message_id": 2,
-                "photo": [
-                    {"file_id": "photo_id", "file_size": 1_000}
-                ],
-                "caption": "Look at this image",
-                "from": {
-                    "id": 555,
-                    "username": "alice"
-                },
-                "chat": {
-                    "id": -100_200_300,
-                    "type": "group"
-                }
-            }
+        let group_message = serde_json::json!({
+            "chat": { "type": "group" }
         });
 
-        // The mention_only check should reject this since caption doesn't contain @mybot
-        assert!(ch.mention_only);
+        assert!(
+            !ch.passes_mention_only_gate(&group_message, Some("555"), Some("Look at this image")),
+            "group attachment captions without bot mention must be ignored"
+        );
+        assert!(
+            ch.passes_mention_only_gate(
+                &group_message,
+                Some("555"),
+                Some("@mybot look at this image")
+            ),
+            "group attachment captions with bot mention should pass"
+        );
     }
 
     #[test]
     fn telegram_mention_only_private_chat_photo_still_works() {
-        // Private chats should still work regardless of mention_only setting
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], true, true);
         {
             let mut cache = ch.bot_username.lock();
             *cache = Some("mybot".to_string());
         }
 
-        let _update = serde_json::json!({
-            "update_id": 102,
-            "message": {
-                "message_id": 3,
-                "photo": [
-                    {"file_id": "photo_id", "file_size": 1_000}
-                ],
-                "from": {
-                    "id": 555,
-                    "username": "alice"
-                },
-                "chat": {
-                    "id": 123_456,
-                    "type": "private"
-                }
-            }
+        let private_message = serde_json::json!({
+            "chat": { "type": "private" }
         });
 
-        // Private chat should work even with mention_only=true
-        // The is_group_message check should return false for private chats
-        assert!(ch.mention_only);
+        assert!(
+            ch.passes_mention_only_gate(&private_message, Some("555"), None),
+            "private non-text messages should not require mention"
+        );
+        assert!(
+            ch.passes_mention_only_gate(&private_message, Some("555"), Some("Look at this image")),
+            "private captions should pass regardless of mention_only setting"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
