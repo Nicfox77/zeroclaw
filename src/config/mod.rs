@@ -5,16 +5,17 @@ pub mod traits;
 pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, default_model_fallback_for_provider,
-    resolve_default_model_id, runtime_proxy_config, set_runtime_proxy_config, AgentConfig,
-    AgentSessionBackend, AgentSessionConfig, AgentSessionStrategy, AgentsIpcConfig, AuditConfig,
-    AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
-    ClassificationRule, ComposioConfig, Config,
-    CoordinationConfig, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig,
-    DockerRuntimeConfig, EconomicConfig, EconomicTokenPricing, EmbeddingRouteConfig, EstopConfig,
-    FeishuConfig, GatewayConfig, GroupReplyConfig, GroupReplyMode, HardwareConfig,
-    HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig,
-    HttpRequestCredentialProfile, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
+    resolve_default_model_id, runtime_proxy_config, set_runtime_proxy_config,
+    AckReactionChannelsConfig, AckReactionChatType, AckReactionConfig, AckReactionRuleAction,
+    AckReactionRuleConfig, AckReactionStrategy, AgentConfig, AgentSessionBackend,
+    AgentSessionConfig, AgentSessionStrategy, AgentsIpcConfig, AuditConfig, AutonomyConfig,
+    BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
+    ClassificationRule, ComposioConfig, Config, CoordinationConfig, CostConfig, CronConfig,
+    DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EconomicConfig, EconomicTokenPricing,
+    EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig, GroupReplyConfig,
+    GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
+    HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig, IdentityConfig, LarkConfig,
+    MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
     NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpChallengeDelivery, OtpConfig,
     OtpMethod, OutboundLeakGuardAction, OutboundLeakGuardConfig, PeripheralBoardConfig,
     PeripheralsConfig, PerplexityFilterConfig, PluginEntryConfig, PluginsConfig, ProviderConfig,
@@ -112,15 +113,20 @@ mod tests {
     }
 
     #[test]
-    fn reexported_http_request_credential_profile_is_constructible() {
-        let profile = HttpRequestCredentialProfile {
-            header_name: "Authorization".into(),
-            env_var: "OPENROUTER_API_KEY".into(),
-            value_prefix: "Bearer ".into(),
+    fn reexported_http_request_config_is_constructible() {
+        let cfg = HttpRequestConfig {
+            enabled: true,
+            allowed_domains: vec!["api.openai.com".into()],
+            max_response_size: 256_000,
+            timeout_secs: 10,
+            user_agent: "zeroclaw-test".into(),
+            credential_profiles: std::collections::HashMap::new(),
         };
 
-        assert_eq!(profile.header_name, "Authorization");
-        assert_eq!(profile.env_var, "OPENROUTER_API_KEY");
-        assert_eq!(profile.value_prefix, "Bearer ");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.allowed_domains, vec!["api.openai.com"]);
+        assert_eq!(cfg.max_response_size, 256_000);
+        assert_eq!(cfg.timeout_secs, 10);
+        assert_eq!(cfg.user_agent, "zeroclaw-test");
     }
 }

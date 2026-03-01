@@ -21,6 +21,7 @@ pub mod auth_profile;
 pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
+pub mod channel_ack_config;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -88,6 +89,7 @@ pub use bg_run::{
 };
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use channel_ack_config::ChannelAckConfigTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -151,6 +153,7 @@ pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool, SwitchProvi
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
+use crate::plugins;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -205,6 +208,43 @@ pub fn add_bg_tools(tools: Vec<Box<dyn Tool>>) -> (Vec<Box<dyn Tool>>, BgJobStor
     extended.push(Arc::new(bg_run));
     extended.push(Arc::new(bg_status));
     (boxed_registry_from_arcs(extended), bg_job_store)
+}
+
+#[derive(Clone)]
+struct PluginManifestTool {
+    spec: ToolSpec,
+}
+
+impl PluginManifestTool {
+    fn new(spec: ToolSpec) -> Self {
+        Self { spec }
+    }
+}
+
+#[async_trait]
+impl Tool for PluginManifestTool {
+    fn name(&self) -> &str {
+        self.spec.name.as_str()
+    }
+
+    fn description(&self) -> &str {
+        self.spec.description.as_str()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.spec.parameters.clone()
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        Ok(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "plugin tool '{}' is declared but execution runtime is not wired yet",
+                self.spec.name
+            )),
+        })
+    }
 }
 
 /// Create the default tool registry
@@ -319,6 +359,7 @@ pub fn all_tools_with_runtime(
             config.clone(),
             security.clone(),
         )),
+        Arc::new(ChannelAckConfigTool::new(config.clone(), security.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         Arc::new(WebAccessConfigTool::new(config.clone(), security.clone())),
         Arc::new(WebSearchConfigTool::new(config.clone(), security.clone())),
@@ -613,6 +654,18 @@ pub fn all_tools_with_runtime(
                     security.clone(),
                 )));
             }
+        }
+    }
+
+    // Add declared plugin tools from the active plugin registry.
+    if config.plugins.enabled {
+        let registry = plugins::runtime::current_registry();
+        for tool in registry.tools() {
+            tool_arcs.push(Arc::new(PluginManifestTool::new(ToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            })));
         }
     }
 

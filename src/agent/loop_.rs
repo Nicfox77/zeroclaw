@@ -1462,7 +1462,7 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
-        for ((idx, call), outcome) in executable_indices
+        for ((idx, call), mut outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
@@ -1485,11 +1485,30 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {
-                let tool_result_obj = crate::tools::ToolResult {
+                let mut tool_result_obj = crate::tools::ToolResult {
                     success: outcome.success,
                     output: outcome.output.clone(),
-                    error: None,
+                    error: outcome.error_reason.clone(),
                 };
+                match hooks
+                    .run_tool_result_persist(call.name.clone(), tool_result_obj.clone())
+                    .await
+                {
+                    crate::hooks::HookResult::Continue(next) => {
+                        tool_result_obj = next;
+                        outcome.success = tool_result_obj.success;
+                        outcome.output = tool_result_obj.output.clone();
+                        outcome.error_reason = tool_result_obj.error.clone();
+                    }
+                    crate::hooks::HookResult::Cancel(reason) => {
+                        outcome.success = false;
+                        outcome.error_reason = Some(scrub_credentials(&reason));
+                        outcome.output = format!("Tool result blocked by hook: {reason}");
+                        tool_result_obj.success = false;
+                        tool_result_obj.error = Some(reason);
+                        tool_result_obj.output = outcome.output.clone();
+                    }
+                }
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
                     .await;
@@ -1758,6 +1777,10 @@ pub async fn run(
     interactive: bool,
     hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -2027,6 +2050,10 @@ pub async fn run(
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
+    let configured_hooks =
+        crate::hooks::HookRunner::from_config(&config.hooks).map(std::sync::Arc::new);
+    let effective_hooks = hooks.or_else(|| configured_hooks.as_deref());
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
@@ -2103,7 +2130,7 @@ pub async fn run(
                         config.agent.max_tool_iterations,
                         None,
                         None,
-                        hooks,
+                        effective_hooks,
                         &[],
                     ),
                 ),
@@ -2280,7 +2307,7 @@ pub async fn run(
                             config.agent.max_tool_iterations,
                             None,
                             None,
-                            hooks,
+                            effective_hooks,
                             &[],
                         ),
                     ),
@@ -2340,6 +2367,7 @@ pub async fn run(
                 provider.as_ref(),
                 &model_name,
                 config.agent.max_history_messages,
+                effective_hooks,
             )
             .await
             {
@@ -2376,6 +2404,9 @@ pub async fn process_message_with_session(
     message: &str,
     session_id: Option<&str>,
 ) -> Result<String> {
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -2918,6 +2949,60 @@ mod tests {
                 active,
                 max_active,
             }
+        }
+    }
+
+    struct FailingTool;
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            "failing_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Fails deterministically for error-propagation tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("boom".to_string()),
+            })
+        }
+    }
+
+    struct ErrorCaptureHook {
+        seen_errors: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for ErrorCaptureHook {
+        fn name(&self) -> &str {
+            "error-capture"
+        }
+
+        async fn on_after_tool_call(
+            &self,
+            _tool: &str,
+            result: &crate::tools::ToolResult,
+            _duration: Duration,
+        ) {
+            self.seen_errors
+                .lock()
+                .expect("hook error buffer lock should be valid")
+                .push(result.error.clone());
         }
     }
 
@@ -3752,6 +3837,56 @@ mod tests {
             1,
             "the fallback retry should lead to an actual tool execution"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_failed_tool_error_for_after_hook() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"failing_tool","arguments":{}}
+</tool_call>"#,
+            "done",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool)];
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run failing tool"),
+        ];
+
+        let seen_errors = Arc::new(Mutex::new(Vec::new()));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(ErrorCaptureHook {
+            seen_errors: Arc::clone(&seen_errors),
+        }));
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            Some(&hooks),
+            &[],
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(result, "done");
+        let recorded = seen_errors
+            .lock()
+            .expect("hook error buffer lock should be valid");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].as_deref(), Some("boom"));
     }
 
     #[test]
