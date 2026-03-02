@@ -42,6 +42,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const PROFILE_MISMATCH_PREFIX: &str = "Pending login profile mismatch:";
+const ZEROCLAW_BUILD_VERSION: &str = env!("ZEROCLAW_BUILD_VERSION");
 
 #[derive(Debug, Clone, ValueEnum)]
 enum QuotaFormat {
@@ -132,7 +133,7 @@ enum EstopLevelArg {
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version)]
+#[command(version = ZEROCLAW_BUILD_VERSION)]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
@@ -333,15 +334,20 @@ the binary location.
 Examples:
   zeroclaw update              # Update to latest version
   zeroclaw update --check      # Check for updates without installing
+  zeroclaw update --instructions # Show install-method-specific update instructions
   zeroclaw update --force      # Reinstall even if already up to date")]
     Update {
         /// Check for updates without installing
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["force", "instructions"])]
         check: bool,
 
         /// Force update even if already at latest version
-        #[arg(long)]
+        #[arg(long, conflicts_with = "instructions")]
         force: bool,
+
+        /// Show human-friendly update instructions for your installation method
+        #[arg(long, conflicts_with_all = ["check", "force"])]
+        instructions: bool,
     },
 
     /// Engage, inspect, and resume emergency-stop states.
@@ -1016,7 +1022,7 @@ async fn main() -> Result<()> {
         Commands::Status => {
             println!("🦀 ZeroClaw Status");
             println!();
-            println!("Version:     {}", env!("CARGO_PKG_VERSION"));
+            println!("Version:     {}", ZEROCLAW_BUILD_VERSION);
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
@@ -1107,9 +1113,18 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Update { check, force } => {
-            update::self_update(force, check).await?;
-            Ok(())
+        Commands::Update {
+            check,
+            force,
+            instructions,
+        } => {
+            if instructions {
+                update::print_update_instructions()?;
+                Ok(())
+            } else {
+                update::self_update(force, check).await?;
+                Ok(())
+            }
         }
 
         Commands::Estop {
@@ -2629,5 +2644,42 @@ mod tests {
             serde_json::json!(["***REDACTED***"])
         );
         assert_eq!(payload["nested"]["non_secret"], serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn update_help_mentions_instructions_flag() {
+        let cmd = Cli::command();
+        let update_cmd = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "update")
+            .expect("update subcommand must exist");
+
+        let mut output = Vec::new();
+        update_cmd
+            .clone()
+            .write_long_help(&mut output)
+            .expect("help generation should succeed");
+        let help = String::from_utf8(output).expect("help output should be utf-8");
+
+        assert!(help.contains("--instructions"));
+    }
+
+    #[test]
+    fn update_cli_parses_instructions_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "update", "--instructions"])
+            .expect("update --instructions should parse");
+
+        match cli.command {
+            Commands::Update {
+                check,
+                force,
+                instructions,
+            } => {
+                assert!(!check);
+                assert!(!force);
+                assert!(instructions);
+            }
+            other => panic!("expected update command, got {other:?}"),
+        }
     }
 }
