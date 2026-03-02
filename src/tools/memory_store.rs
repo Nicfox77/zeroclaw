@@ -43,6 +43,10 @@ impl Tool for MemoryStoreTool {
                 "category": {
                     "type": "string",
                     "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session scope for memory isolation. Defaults to the currently scoped session when available."
                 }
             },
             "required": ["key", "content"]
@@ -67,6 +71,14 @@ impl Tool for MemoryStoreTool {
             Some(other) => MemoryCategory::Custom(other.to_string()),
         };
 
+        let requested_session_id = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let scoped_session = crate::memory::session_context::current_session_id();
+        let session_scope = requested_session_id.or(scoped_session.as_deref());
+
         if let Err(error) = self
             .security
             .enforce_tool_operation(ToolOperation::Act, "memory_store")
@@ -78,7 +90,11 @@ impl Tool for MemoryStoreTool {
             });
         }
 
-        match self.memory.store(key, content, category, None).await {
+        match self
+            .memory
+            .store(key, content, category, session_scope)
+            .await
+        {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored memory: {key}"),

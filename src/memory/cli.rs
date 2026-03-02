@@ -4,6 +4,7 @@ use super::{
     MemoryBackendKind,
 };
 use crate::config::Config;
+use anyhow::Context;
 #[cfg(feature = "memory-postgres")]
 use anyhow::Context;
 use anyhow::{bail, Result};
@@ -74,6 +75,35 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
         #[cfg(not(feature = "memory-postgres"))]
         MemoryBackendKind::Postgres => {
             bail!("memory backend 'postgres' requires the 'memory-postgres' feature to be enabled");
+        }
+        MemoryBackendKind::OpenMemory => {
+            let url = config
+                .memory
+                .openmemory
+                .url
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("OPENMEMORY_URL").ok())
+                .filter(|s| !s.trim().is_empty())
+                .context(
+                    "OpenMemory backend requires url in [memory.openmemory] or OPENMEMORY_URL env var",
+                )?;
+            let api_key = config
+                .memory
+                .openmemory
+                .api_key
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("OPENMEMORY_API_KEY").ok());
+            let user_id = config
+                .memory
+                .openmemory
+                .user_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("OPENMEMORY_USER_ID").ok());
+            let mem = super::OpenMemoryBackend::new(&url, api_key, user_id);
+            Ok(Box::new(mem))
         }
         _ => create_memory_for_migration(&backend, &config.workspace_dir),
     }

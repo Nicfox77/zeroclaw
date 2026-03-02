@@ -2804,22 +2804,42 @@ async fn build_memory_context(
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
+    current_turn_key: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
+        let is_openmemory = mem.name().eq_ignore_ascii_case("openmemory");
 
-        for entry in entries.iter().filter(|e| match e.score {
-            Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
-        }) {
+        for entry in &entries {
+            let include_for_score = match entry.score {
+                // OpenMemory owns relevance/ranking semantics; do not apply
+                // local numeric thresholds to backend-specific score scales.
+                Some(_) if is_openmemory => true,
+                Some(score) => score >= min_relevance_score,
+                None => true, // keep entries without a score (e.g. non-vector backends)
+            };
+            if !include_for_score {
+                continue;
+            }
+
             if included >= MEMORY_CONTEXT_MAX_ENTRIES {
                 break;
             }
 
             if should_skip_memory_context_entry(&entry.key, &entry.content) {
+                continue;
+            }
+
+            if let Some(turn_key) = current_turn_key {
+                if !turn_key.is_empty() && entry.key == turn_key {
+                    continue;
+                }
+            }
+
+            if entry.content.trim().eq_ignore_ascii_case(user_msg.trim()) {
                 continue;
             }
 
@@ -3445,28 +3465,10 @@ or tune thresholds in config.",
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-        let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
-            .store(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                Some(&history_key),
-            )
-            .await;
-    }
+    let autosave_key = conversation_memory_key(&msg);
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
-
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
 
     // Inject per-message timestamp so the LLM always knows the current time,
     // even in multi-turn conversations where the system prompt may be stale.
@@ -3501,20 +3503,18 @@ or tune thresholds in config.",
                 last_turn.content = timestamped_content.clone();
             }
 
-            // Only enrich with memory context when there is no prior
-            // conversation history. Follow-up turns already include context
-            // from previous messages.
-            if !had_prior_history {
-                let memory_context = build_memory_context(
-                    ctx.memory.as_ref(),
-                    &msg.content,
-                    ctx.min_relevance_score,
-                    Some(&history_key),
-                )
-                .await;
-                if !memory_context.is_empty() {
-                    last_turn.content = format!("{memory_context}{}", last_turn.content);
-                }
+            // Enrich every turn with a compact memory context so prior project
+            // details can come back naturally without a manual memory tool call.
+            let memory_context = build_memory_context(
+                ctx.memory.as_ref(),
+                &msg.content,
+                ctx.min_relevance_score,
+                Some(&history_key),
+                Some(&autosave_key),
+            )
+            .await;
+            if !memory_context.is_empty() {
+                last_turn.content = format!("{memory_context}{}", last_turn.content);
             }
         }
     }
@@ -3668,25 +3668,28 @@ or tune thresholds in config.",
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop_with_reply_target(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                Some(ctx.approval_manager.as_ref()),
-                msg.channel.as_str(),
-                Some(msg.reply_target.as_str()),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                &excluded_tools_snapshot,
-                progress_mode,
+            crate::memory::session_context::scope_session_id(
+                Some(&history_key),
+                run_tool_call_loop_with_reply_target(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    ctx.observer.as_ref(),
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(ctx.approval_manager.as_ref()),
+                    msg.channel.as_str(),
+                    Some(msg.reply_target.as_str()),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx,
+                    ctx.hooks.as_deref(),
+                    &excluded_tools_snapshot,
+                    progress_mode,
+                ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3850,6 +3853,20 @@ or tune thresholds in config.",
                 format!("{tool_summary}\n{delivered_response}")
             };
 
+            // Auto-save user message after response generation so current-turn
+            // retrieval cannot self-hit on just-written content.
+            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                let _ = ctx
+                    .memory
+                    .store(
+                        &autosave_key,
+                        &msg.content,
+                        crate::memory::MemoryCategory::Conversation,
+                        Some(&history_key),
+                    )
+                    .await;
+            }
+
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
@@ -3865,7 +3882,7 @@ or tune thresholds in config.",
                         &assistant_key,
                         &delivered_response,
                         crate::memory::MemoryCategory::Conversation,
-                        None,
+                        Some(&history_key),
                     )
                     .await;
             }
@@ -5305,6 +5322,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
@@ -10723,7 +10741,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0, None).await;
+        let context = build_memory_context(&mem, "age", 0.0, None, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
     }
@@ -10749,7 +10767,8 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
 
-        let session_a_context = build_memory_context(&mem, "age", 0.0, Some("session-a")).await;
+        let session_a_context =
+            build_memory_context(&mem, "age", 0.0, Some("session-a"), None).await;
         assert!(session_a_context.contains("age 45"));
         assert!(!session_a_context.contains("age 31"));
     }

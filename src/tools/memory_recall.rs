@@ -8,11 +8,22 @@ use std::sync::Arc;
 /// Let the agent search its own memory
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
+    default_session_id: Option<String>,
 }
 
 impl MemoryRecallTool {
     pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self { memory }
+        Self {
+            memory,
+            default_session_id: None,
+        }
+    }
+
+    pub fn new_with_session(memory: Arc<dyn Memory>, default_session_id: Option<&str>) -> Self {
+        Self {
+            memory,
+            default_session_id: default_session_id.map(|s| s.to_string()),
+        }
     }
 }
 
@@ -37,6 +48,10 @@ impl Tool for MemoryRecallTool {
                 "limit": {
                     "type": "integer",
                     "description": "Max results to return (default: 5)"
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session scope for recall isolation"
                 }
             },
             "required": ["query"]
@@ -55,7 +70,18 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        match self.memory.recall(query, limit, None).await {
+        let requested_session_id = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let scoped_session = crate::memory::session_context::current_session_id();
+        let session_scope = requested_session_id
+            .or(self.default_session_id.as_deref())
+            .or(scoped_session.as_deref());
+
+        match self.memory.recall(query, limit, session_scope).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found matching that query.".into(),

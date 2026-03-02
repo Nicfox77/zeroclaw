@@ -13,6 +13,7 @@ pub mod openmemory;
 pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
+pub mod session_context;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;

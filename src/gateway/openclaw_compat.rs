@@ -141,15 +141,6 @@ pub async fn handle_api_chat(
         return (StatusCode::BAD_REQUEST, Json(err));
     }
 
-    // ── Auto-save to memory ──
-    if state.auto_save {
-        let key = api_chat_memory_key();
-        let _ = state
-            .mem
-            .store(&key, message, MemoryCategory::Conversation, session_id)
-            .await;
-    }
-
     // ── Build enriched message with optional context ──
     let enriched_message = if chat_body.context.is_empty() {
         message.to_string()
@@ -224,6 +215,14 @@ pub async fn handle_api_chat(
                     tokens_used: None,
                     cost_usd: None,
                 });
+
+            if state.auto_save {
+                let key = api_chat_memory_key();
+                let _ = state
+                    .mem
+                    .store(&key, message, MemoryCategory::Conversation, session_id)
+                    .await;
+            }
 
             let body = serde_json::json!({
                 "reply": safe_response,
@@ -532,15 +531,6 @@ pub async fn handle_v1_chat_completions_with_tools(
     let request_id = format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', ""));
     let created = unix_timestamp();
 
-    // ── Auto-save ──
-    if state.auto_save {
-        let key = api_chat_memory_key();
-        let _ = state
-            .mem
-            .store(&key, &message, MemoryCategory::Conversation, session_id)
-            .await;
-    }
-
     // ── Observability ──
     let provider_label = state
         .config
@@ -605,6 +595,14 @@ pub async fn handle_v1_chat_completions_with_tools(
                     tokens_used: None,
                     cost_usd: None,
                 });
+
+            if state.auto_save {
+                let key = api_chat_memory_key();
+                let _ = state
+                    .mem
+                    .store(&key, &message, MemoryCategory::Conversation, session_id)
+                    .await;
+            }
 
             safe
         }

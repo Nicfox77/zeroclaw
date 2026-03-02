@@ -7,7 +7,7 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -65,6 +65,73 @@ struct QueryFilters {
     user_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FlexibleTimestamp {
+    String(String),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+fn to_rfc3339_from_unix(value: i64) -> Option<String> {
+    // Heuristic: 10+ digits are millis, lower magnitudes are seconds.
+    let millis = if value.abs() >= 10_000_000_000 {
+        value
+    } else {
+        value.saturating_mul(1000)
+    };
+    DateTime::<Utc>::from_timestamp_millis(millis).map(|dt| dt.to_rfc3339())
+}
+
+fn normalize_timestamp_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Utc::now().to_rfc3339();
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return dt.with_timezone(&Utc).to_rfc3339();
+    }
+
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return to_rfc3339_from_unix(value).unwrap_or_else(|| Utc::now().to_rfc3339());
+    }
+
+    trimmed.to_string()
+}
+
+fn deserialize_optional_timestamp<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<FlexibleTimestamp>::deserialize(deserializer)?;
+
+    let normalized = raw.map(|value| match value {
+        FlexibleTimestamp::String(text) => normalize_timestamp_text(&text),
+        FlexibleTimestamp::I64(value) => {
+            to_rfc3339_from_unix(value).unwrap_or_else(|| Utc::now().to_rfc3339())
+        }
+        FlexibleTimestamp::U64(value) => i64::try_from(value)
+            .ok()
+            .and_then(to_rfc3339_from_unix)
+            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        FlexibleTimestamp::F64(value) => {
+            if !value.is_finite() {
+                Utc::now().to_rfc3339()
+            } else {
+                to_rfc3339_from_unix(value.round() as i64)
+                    .unwrap_or_else(|| Utc::now().to_rfc3339())
+            }
+        }
+    });
+
+    Ok(normalized)
+}
+
+
 /// Response from /memory/add
 #[derive(Deserialize)]
 struct AddMemoryResponse {
@@ -86,6 +153,10 @@ struct MemoryMatch {
     primary_sector: Option<String>,
     #[serde(default)]
     salience: Option<f64>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
+    created_at: Option<String>,
 }
 
 /// Response from /memory/query
@@ -109,6 +180,7 @@ struct MemoryListItem {
     tags: Vec<String>,
     #[serde(default)]
     primary_sector: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
     created_at: Option<String>,
     salience: Option<f64>,
 }
@@ -124,6 +196,7 @@ struct GetMemoryResponse {
     tags: Vec<String>,
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
     created_at: Option<String>,
     salience: Option<f64>,
 }
@@ -170,6 +243,44 @@ impl OpenMemoryBackend {
         }
 
         req.header("Content-Type", "application/json")
+    }
+
+    async fn fetch_memory_detail(&self, id: &str) -> Option<GetMemoryResponse> {
+        let mut request = self.request(reqwest::Method::GET, &format!("/memory/{}", id));
+        if let Some(user_id) = self.user_id.as_deref() {
+            request = request.query(&[("user_id", user_id)]);
+        }
+
+        let resp = request.send().await.ok()?;
+
+        if resp.status() == StatusCode::NOT_FOUND {
+            return None;
+        }
+
+        if !resp.status().is_success() {
+            tracing::debug!(
+                id = %id,
+                status = %resp.status(),
+                "OpenMemory detail fetch failed"
+            );
+            return None;
+        }
+
+        resp.json::<GetMemoryResponse>().await.ok()
+    }
+
+    fn extract_zeroclaw_key(metadata: Option<&serde_json::Value>) -> Option<String> {
+        metadata
+            .and_then(|m| m.get("zeroclaw_key"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn extract_zeroclaw_session_id(metadata: Option<&serde_json::Value>) -> Option<String> {
+        metadata
+            .and_then(|m| m.get("zeroclaw_session_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Map ZeroClaw MemoryCategory to OpenMemory sector.
@@ -220,19 +331,30 @@ impl Memory for OpenMemoryBackend {
     ) -> Result<()> {
         self.ensure_initialized().await?;
 
-        let sector = Self::category_to_sector(&category);
-        
-        // Build metadata with ZeroClaw-specific fields
+        let mapped_sector = Self::category_to_sector(&category);
+
+        // Build metadata with ZeroClaw-specific fields.
+        // IMPORTANT: do not set OpenMemory's reserved `metadata.sector` here,
+        // otherwise it bypasses OpenMemory's own pattern-based classifier and
+        // forces every memory to that sector.
         let metadata = serde_json::json!({
             "zeroclaw_key": key,
+            "zeroclaw_turn_id": key,
             "zeroclaw_category": category.to_string(),
             "zeroclaw_session_id": session_id,
-            "sector": sector,
+            "zeroclaw_context_id": session_id,
+            "zeroclaw_mapped_sector": mapped_sector,
         });
+
+        let category_label = category.to_string();
+        let mut tags = vec![format!("zc:category:{}", category_label)];
+        if matches!(&category, MemoryCategory::Conversation) {
+            tags.push("zc:conversation".to_string());
+        }
 
         let body = AddMemoryRequest {
             content: content.to_string(),
-            tags: Some(vec![sector.to_string()]),
+            tags: Some(tags),
             metadata: Some(metadata),
             user_id: self.user_id.clone(),
         };
@@ -252,7 +374,7 @@ impl Memory for OpenMemoryBackend {
 
         tracing::debug!(
             key = %key,
-            sector = %sector,
+            mapped_sector = %mapped_sector,
             "Stored memory in OpenMemory"
         );
 
@@ -273,9 +395,18 @@ impl Memory for OpenMemoryBackend {
             user_id: self.user_id.clone(),
         };
 
+        let requested_limit = limit.max(1);
+        // Keep OpenMemory as ranking authority. We only over-fetch when a strict
+        // client-side session filter is requested.
+        let fetch_limit = if session_id.is_some() {
+            requested_limit.saturating_mul(4).clamp(requested_limit, 100)
+        } else {
+            requested_limit
+        };
+
         let body = QueryMemoryRequest {
             query: query.to_string(),
-            k: limit,
+            k: fetch_limit,
             user_id: self.user_id.clone(),
             filters: Some(filters),
         };
@@ -299,23 +430,68 @@ impl Memory for OpenMemoryBackend {
             .await
             .context("Failed to parse OpenMemory query response")?;
 
-        let entries: Vec<MemoryEntry> = result
-            .matches
-            .into_iter()
-            .map(|m| MemoryEntry {
+        let mut entries = Vec::with_capacity(requested_limit);
+        for m in result.matches {
+            let raw_score = if m.score.is_finite() {
+                Some(m.score)
+            } else {
+                None
+            };
+            let mut key = Self::extract_zeroclaw_key(m.metadata.as_ref()).unwrap_or(m.id.clone());
+            let mut recalled_session_id = Self::extract_zeroclaw_session_id(m.metadata.as_ref());
+            let mut timestamp = m
+                .created_at
+                .clone()
+                .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+            // Query responses can omit metadata depending on OpenMemory version.
+            // Backfill missing fields from detail fetch only when needed.
+            let needs_detail_fetch = key == m.id || recalled_session_id.is_none() || m.created_at.is_none();
+            if needs_detail_fetch {
+                if let Some(detail) = self.fetch_memory_detail(&m.id).await {
+                    if key == m.id {
+                        if let Some(stored_key) = Self::extract_zeroclaw_key(detail.metadata.as_ref()) {
+                            key = stored_key;
+                        }
+                    }
+                    if recalled_session_id.is_none() {
+                        recalled_session_id = Self::extract_zeroclaw_session_id(detail.metadata.as_ref());
+                    }
+                    if m.created_at.is_none() {
+                        if let Some(created_at) = detail.created_at {
+                            timestamp = created_at;
+                        }
+                    }
+                }
+            }
+
+            // Strict session isolation when a session_id is provided.
+            if let Some(expected_session) = session_id {
+                if recalled_session_id.as_deref() != Some(expected_session) {
+                    continue;
+                }
+            }
+
+            let category = m
+                .primary_sector
+                .as_deref()
+                .map(|s| Self::sector_to_category(s))
+                .unwrap_or(MemoryCategory::Core);
+
+            entries.push(MemoryEntry {
                 id: m.id,
-                key: String::new(), // OpenMemory doesn't use keys
+                key,
                 content: m.content,
-                category: m
-                    .primary_sector
-                    .as_deref()
-                    .map(|s| Self::sector_to_category(s))
-                    .unwrap_or(MemoryCategory::Core),
-                timestamp: Utc::now().to_rfc3339(),
-                session_id: session_id.map(|s| s.to_string()),
-                score: Some(m.score),
-            })
-            .collect();
+                category,
+                timestamp,
+                session_id: recalled_session_id,
+                score: raw_score,
+            });
+
+            if entries.len() >= requested_limit {
+                break;
+            }
+        }
 
         Ok(entries)
     }
@@ -326,9 +502,12 @@ impl Memory for OpenMemoryBackend {
         // OpenMemory uses IDs, not keys. We need to search by metadata.
         // For now, we'll try to get by ID if key looks like a UUID.
         if let Ok(_) = Uuid::parse_str(key) {
-            let resp = self
-                .request(reqwest::Method::GET, &format!("/memory/{}", key))
-                .query(&[("user_id", self.user_id.as_deref())])
+            let mut request = self.request(reqwest::Method::GET, &format!("/memory/{}", key));
+            if let Some(user_id) = self.user_id.as_deref() {
+                request = request.query(&[("user_id", user_id)]);
+            }
+
+            let resp = request
                 .send()
                 .await
                 .context("Failed to get memory from OpenMemory")?;
@@ -385,7 +564,7 @@ impl Memory for OpenMemoryBackend {
         self.ensure_initialized().await?;
 
         let mut url = format!("/memory/all?l=1000");
-        
+
         if let Some(ref user_id) = self.user_id {
             url.push_str(&format!("&user_id={}", user_id));
         }
@@ -417,7 +596,8 @@ impl Memory for OpenMemoryBackend {
             .items
             .into_iter()
             .map(|m| {
-                let stored_key = m.tags
+                let stored_key = m
+                    .tags
                     .iter()
                     .find(|t| t.starts_with("key:"))
                     .map(|t| t.strip_prefix("key:").unwrap_or(&m.id).to_string())
@@ -433,7 +613,7 @@ impl Memory for OpenMemoryBackend {
                         .map(|s| Self::sector_to_category(s))
                         .unwrap_or(MemoryCategory::Core),
                     timestamp: m.created_at.unwrap_or_else(|| Utc::now().to_rfc3339()),
-                    session_id: session_id.map(|s| s.to_string()),
+                    session_id: None,
                     score: m.salience,
                 }
             })
@@ -447,9 +627,12 @@ impl Memory for OpenMemoryBackend {
 
         // Try to delete by ID if key looks like a UUID
         if let Ok(_) = Uuid::parse_str(key) {
-            let resp = self
-                .request(reqwest::Method::DELETE, &format!("/memory/{}", key))
-                .query(&[("user_id", self.user_id.as_deref())])
+            let mut request = self.request(reqwest::Method::DELETE, &format!("/memory/{}", key));
+            if let Some(user_id) = self.user_id.as_deref() {
+                request = request.query(&[("user_id", user_id)]);
+            }
+
+            let resp = request
                 .send()
                 .await
                 .context("Failed to delete memory from OpenMemory")?;
@@ -495,10 +678,7 @@ impl Memory for OpenMemoryBackend {
     }
 
     async fn health_check(&self) -> bool {
-        let resp = self
-            .request(reqwest::Method::GET, "/health")
-            .send()
-            .await;
+        let resp = self.request(reqwest::Method::GET, "/health").send().await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
@@ -506,10 +686,7 @@ impl Memory for OpenMemoryBackend {
                 true
             }
             Ok(r) => {
-                tracing::warn!(
-                    "OpenMemory health check failed: status {}",
-                    r.status()
-                );
+                tracing::warn!("OpenMemory health check failed: status {}", r.status());
                 false
             }
             Err(e) => {
@@ -526,19 +703,46 @@ mod tests {
 
     #[test]
     fn category_to_sector_mapping() {
-        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Core), "semantic");
-        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Daily), "episodic");
-        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Conversation), "episodic");
-        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("skill".into())), "procedural");
-        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("emotional".into())), "emotional");
-        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("reflection".into())), "reflective");
+        assert_eq!(
+            OpenMemoryBackend::category_to_sector(&MemoryCategory::Core),
+            "semantic"
+        );
+        assert_eq!(
+            OpenMemoryBackend::category_to_sector(&MemoryCategory::Daily),
+            "episodic"
+        );
+        assert_eq!(
+            OpenMemoryBackend::category_to_sector(&MemoryCategory::Conversation),
+            "episodic"
+        );
+        assert_eq!(
+            OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("skill".into())),
+            "procedural"
+        );
+        assert_eq!(
+            OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("emotional".into())),
+            "emotional"
+        );
+        assert_eq!(
+            OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("reflection".into())),
+            "reflective"
+        );
     }
 
     #[test]
     fn sector_to_category_mapping() {
-        assert!(matches!(OpenMemoryBackend::sector_to_category("semantic"), MemoryCategory::Core));
-        assert!(matches!(OpenMemoryBackend::sector_to_category("episodic"), MemoryCategory::Daily));
-        assert!(matches!(OpenMemoryBackend::sector_to_category("procedural"), MemoryCategory::Custom(_)));
+        assert!(matches!(
+            OpenMemoryBackend::sector_to_category("semantic"),
+            MemoryCategory::Core
+        ));
+        assert!(matches!(
+            OpenMemoryBackend::sector_to_category("episodic"),
+            MemoryCategory::Daily
+        ));
+        assert!(matches!(
+            OpenMemoryBackend::sector_to_category("procedural"),
+            MemoryCategory::Custom(_)
+        ));
     }
 
     #[test]

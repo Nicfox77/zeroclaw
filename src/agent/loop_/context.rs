@@ -14,11 +14,24 @@ pub(super) async fn build_context(
 
     // Pull relevant memories for this message
     if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
+        let is_openmemory = mem.name().eq_ignore_ascii_case("openmemory");
         let relevant: Vec<_> = entries
             .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true,
+            .filter_map(|e| {
+                let include = match e.score {
+                    // OpenMemory owns relevance/ranking semantics; do not apply
+                    // local numeric thresholds to backend-specific score scales.
+                    Some(_) if is_openmemory => true,
+                    Some(score) => score >= min_relevance_score,
+                    None => true,
+                };
+                if !include {
+                    return None;
+                }
+                if e.content.trim().eq_ignore_ascii_case(user_msg.trim()) {
+                    return None;
+                }
+                Some(e)
             })
             .collect();
 
