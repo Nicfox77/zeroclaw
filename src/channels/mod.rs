@@ -36,6 +36,7 @@ pub mod nextcloud_talk;
 pub mod nostr;
 pub mod qq;
 pub mod signal;
+pub mod simplex;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
@@ -68,6 +69,7 @@ pub use nextcloud_talk::NextcloudTalkChannel;
 pub use nostr::NostrChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
+pub use simplex::SimplexChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
@@ -5284,6 +5286,17 @@ fn collect_configured_channels(
             channel: Arc::new(AcpChannel::new(acp.clone())),
         });
     }
+
+    if let Some(ref sx) = config.channels_config.simplex {
+        channels.push(ConfiguredChannel {
+            display_name: "SimpleX",
+            channel: Arc::new(
+                SimplexChannel::new(sx.clone())
+                    .with_workspace_dir(config.workspace_dir.clone()),
+            ),
+        });
+    }
+
     channels
 }
 

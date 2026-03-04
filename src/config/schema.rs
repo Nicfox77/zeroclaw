@@ -4462,6 +4462,8 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
+    /// SimpleX Chat channel configuration.
+    pub simplex: Option<crate::channels::simplex::SimplexConfig>,
     /// ACK emoji reaction policy overrides for channels that support message reactions.
     ///
     /// Use this table to control reaction enable/disable, emoji pools, and conditional rules
@@ -4576,6 +4578,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.simplex.as_ref())),
+                self.simplex.is_some(),
+            ),
         ]
     }
 
@@ -4621,6 +4627,7 @@ impl Default for ChannelsConfig {
             qq: None,
             nostr: None,
             clawdtalk: None,
+            simplex: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
