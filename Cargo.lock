@@ -9239,6 +9239,7 @@ dependencies = [
  "cron",
  "dialoguer",
  "directories",
+ "dirs",
  "fantoccini",
  "fast_html2md",
  "futures-util",
