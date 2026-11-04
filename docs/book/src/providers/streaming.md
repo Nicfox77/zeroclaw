@@ -81,6 +81,11 @@ OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on
 `message_stop`. Servers may keep the HTTP connection open after those events.
 
+OpenAI-compatible APIs may close immediately after a complete `data: [DONE]`
+marker without a trailing newline. ZeroClaw accepts that exact marker at EOF
+when the preceding frame is fully delimited. Partial markers, unfinished JSON,
+invalid UTF-8, and other incomplete frames still fail as truncated responses.
+
 Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
 OpenAI-compatible providers, and 90 seconds for Anthropic. On OpenAI Responses
 and OpenAI-compatible providers, setting `timeout_secs` above 300 on the

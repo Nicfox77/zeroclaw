@@ -421,6 +421,9 @@ async fn compatible_stream_decode_failures_preserve_valid_prefix_and_signed_reas
                 "incomplete_utf8",
                 "unfinished_line",
                 "unfinished_frame",
+                "partial_done",
+                "undelimited_done",
+                "done_without_newline",
                 "split_utf8",
             ] {
                 let h = Harness::new(backend);
@@ -468,6 +471,22 @@ async fn compatible_stream_decode_failures_preserve_valid_prefix_and_signed_reas
                         bytes.extend_from_slice(finish.trim_end_matches('\n').as_bytes());
                         bytes.push(b'\n');
                         vec![bytes]
+                    }
+                    "partial_done" => {
+                        bytes.extend_from_slice(finish.as_bytes());
+                        bytes.extend_from_slice(b"data: [DON");
+                        vec![bytes]
+                    }
+                    "undelimited_done" => {
+                        bytes.extend_from_slice(finish.trim_end_matches('\n').as_bytes());
+                        bytes.extend_from_slice(b"\ndata: [DONE]");
+                        vec![bytes]
+                    }
+                    "done_without_newline" => {
+                        bytes.extend_from_slice(finish.as_bytes());
+                        bytes.extend_from_slice(b"data: [DO");
+                        // The sentinel may cross a transport read boundary.
+                        vec![bytes, b"NE]".to_vec()]
                     }
                     "split_utf8" => {
                         let content = frame(serde_json::json!({"choices":[{"index":7,"delta":{
@@ -540,7 +559,7 @@ async fn compatible_stream_decode_failures_preserve_valid_prefix_and_signed_reas
                     .unwrap()
                 })
                 .await;
-                let success = ending == "split_utf8";
+                let success = matches!(ending, "split_utf8" | "done_without_newline");
                 assert_eq!(
                     output.iter().filter(|event| event.is_err()).count(),
                     usize::from(!success),
@@ -626,7 +645,7 @@ async fn compatible_stream_decode_failures_preserve_valid_prefix_and_signed_reas
                 }
                 assert_eq!(
                     texts,
-                    if success {
+                    if ending == "split_utf8" {
                         "valid prefix\u{4e2d}\u{6587}"
                     } else {
                         "valid prefix"

@@ -128,6 +128,8 @@ previously observed item cannot suppress newly received terminal content.
 Responses parsers accept LF and CRLF framing incrementally. An incomplete
 frame at EOF is a decode error, even when its JSON resembles a completion;
 previously committed complete frames remain available.
+The OpenAI-compatible parser also accepts a complete `data: [DONE]` sentinel
+at EOF without its trailing newline, only after a fully delimited prior frame.
 OpenAI-compatible streams preserve structured content, audio and unknown delta
 extensions before termination. Native legacy text-stream entry points use the
 same structured dispatch and recorder, then project chunks for their callers.

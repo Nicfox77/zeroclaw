@@ -3290,6 +3290,14 @@ fn sse_bytes_to_events_for_contract(
                 .await;
             return;
         }
+        // Some compatible APIs (including Synthetic) close immediately after
+        // the complete [DONE] sentinel without a newline. Accept that exact
+        // terminal marker only between frames; never infer completion from
+        // unfinished JSON, a partial sentinel, or an undelimited prior frame.
+        if !frame_open && buffer.strip_prefix("data:").map(str::trim) == Some("[DONE]") {
+            saw_completion = true;
+            buffer.clear();
+        }
         if frame_open || !buffer.trim().is_empty() {
             let _ = tx
                 .send(Err(StreamError::InvalidSse(
@@ -10158,6 +10166,27 @@ mod tests {
             matches!(events.last(), Some(Ok(StreamEvent::Final))),
             "got: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn eof_after_done_sentinel_without_newline_emits_final() {
+        // Synthetic returns a complete terminal sentinel without a trailing
+        // newline. Earlier response and usage frames are fully delimited.
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\ndata: [DONE]",
+        )
+        .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "complete terminal sentinel must not cause a decode error: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(event,
+            Ok(StreamEvent::TextDelta(chunk)) if chunk.delta == "hi"
+        )));
+        assert!(events.iter().any(|event| matches!(event,
+            Ok(StreamEvent::Usage(usage)) if usage.input_tokens == Some(7) && usage.output_tokens == Some(2)
+        )));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Final))));
     }
 
     #[tokio::test]
