@@ -496,6 +496,16 @@ impl SessionExecutionPort for EngineSession {
             .await
     }
     async fn close(&self, reason_key: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.summary_deck
+                .as_ref()
+                .map(|runtime| runtime.main_session())
+                .transpose()?
+                .flatten()
+                .as_ref()
+                != Some(&self.stream),
+            "main_session_reset_requires_disabling_policy"
+        );
         self.control_close(reason_key).await
     }
     async fn rename(&self, title: &str) -> anyhow::Result<()> {
@@ -537,12 +547,52 @@ impl SessionExecutionPort for EngineSession {
         self.read_context_snapshot(event).await
     }
 
-    async fn prepare_context(&self, context: ContextSnapshot) -> anyhow::Result<ContextSnapshot> {
-        if self.summary_policy().await?.is_none() {
+    async fn prepare_context(
+        &self,
+        mut context: ContextSnapshot,
+    ) -> anyhow::Result<ContextSnapshot> {
+        let main = self.is_active()
+            && self
+                .summary_deck
+                .as_ref()
+                .map(|runtime| runtime.main_session())
+                .transpose()?
+                .flatten()
+                .as_ref()
+                == Some(&self.stream);
+        let mut reason = "summary_deck_working_context";
+        if main {
+            let turn = self.active_turn()?;
+            let owner = self.owner.clone();
+            let stream = self.stream.clone();
+            let prepared = owner.clone().blocking(move || Ok(owner.stream_history(&stream)?.iter().any(|event|
+                event.turn_id == turn && matches!(&event.body.data,
+                    EventData::ContextProjectionCreated {reason_key,..} if reason_key == "main_session_turn_context")))).await?;
+            if !prepared {
+                let tail = context.messages.iter().rposition(|message|
+                    matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "user"))
+                    .ok_or_else(|| anyhow::Error::msg("main_session_current_input_missing"))?;
+                let running = context.messages.split_off(tail);
+                let mut messages: Vec<_> = context.messages.into_iter().filter(|message|
+                    matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "system")).collect();
+                let fresh = self
+                    .read_context_snapshot(self.latest_context().await?)
+                    .await?
+                    .ok_or_else(|| anyhow::Error::msg("main_session_context_missing"))?;
+                messages.extend(fresh.messages.into_iter().filter(|message|
+                    !matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "system")));
+                messages.extend(running);
+                context = ContextSnapshot {
+                    messages,
+                    history_has_trim_breadcrumb: fresh.history_has_trim_breadcrumb,
+                };
+                reason = "main_session_turn_context";
+            }
+        }
+        if !main && self.summary_policy().await?.is_none() {
             return Ok(context);
         }
-        self.replace_context(context.clone(), "summary_deck_working_context")
-            .await?;
+        self.replace_context(context.clone(), reason).await?;
         self.maintain_summary_deck().await?;
         self.read_context_snapshot(self.latest_context().await?)
             .await?

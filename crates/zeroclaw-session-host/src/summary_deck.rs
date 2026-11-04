@@ -10,6 +10,18 @@ pub(super) struct Runtime {
 }
 
 impl SummaryDeckRuntime for Runtime {
+    fn main_session(&self) -> anyhow::Result<Option<SessionId>> {
+        let config = self.config.read();
+        let Some(agent) = config.agent(&self.agent) else {
+            return Ok(None);
+        };
+        if !agent.main_session.enabled {
+            return Ok(None);
+        }
+        Ok(Some(SessionId::parse(
+            zeroclaw_config::main_session::session_id(&self.agent),
+        )?))
+    }
     fn resolve(&self) -> anyhow::Result<Option<ResolvedSummaryDeck>> {
         self.policy(None)
     }

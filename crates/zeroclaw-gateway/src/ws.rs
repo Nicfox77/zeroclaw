@@ -614,7 +614,21 @@ async fn handle_socket(
     let mut gateway_stopping = state.shutdown_tx.subscribe();
 
     // Resolve session ID: use provided or generate a new UUID
-    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let requested_session = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = match crate::session_history::web_family(
+        &state,
+        &agent_alias,
+        auth_subject.as_deref(),
+        &requested_session,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            let frame = serde_json::json!({"type":"error","code":"MAIN_SESSION_UNAUTHORIZED",
+                "message":zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error)});
+            let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            return;
+        }
+    };
     // Persistence, execution and cancellation use one canonical session id.
     let session_key = session_id.clone();
     // Match the sanitized form persisted by memory backend migrations.
@@ -3202,12 +3216,20 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 post(move |Json(request): Json<serde_json::Value>| {
                     let request_seen_tx = request_seen_tx.clone();
                     let mut released_rx = released_rx.clone();
-                    let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    let tail_text = mock_tails
-                        .lock()
-                        .remove(&index)
-                        .unwrap_or_else(parked_stream_tail);
+                    let arrivals = arrivals.clone();
+                    let mock_tails = mock_tails.clone();
                     async move {
+                        if request["stream"].as_bool() != Some(true) {
+                            assert!(request["messages"].to_string().contains("Summarize"), "only the background summary uses nonstreaming inference: {request}");
+                            return Json(serde_json::json!({
+                                "id":"fixture-summary", "type":"message", "role":"assistant", "model":"claude-test",
+                                "content":[{"type":"text", "text":"Retained architecture: permanent originals with a rotating summary deck."}],
+                                "stop_reason":"end_turn", "stop_sequence":null,
+                                "usage":{"input_tokens":120,"output_tokens":20}
+                            })).into_response();
+                        }
+                        let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let tail_text = mock_tails.lock().remove(&index).unwrap_or_else(parked_stream_tail);
                         assert_eq!(
                             request["stream"].as_bool(),
                             Some(true),
@@ -3226,7 +3248,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         (
                             [(header::CONTENT_TYPE, "text/event-stream")],
                             axum::body::Body::from_stream(head.chain(tail)),
-                        )
+                        ).into_response()
                     }
                 }),
             );
@@ -3293,6 +3315,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             }
             adjust(&mut config);
             let mut state = crate::api::tests::test_state(config.clone());
+            if zeroclaw_config::main_session::web_session(&config, "web").is_some() {
+                state.pairing = Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                    config.gateway.require_pairing,
+                    &config.gateway.paired_tokens,
+                    zeroclaw_config::pairing::PairingCodePolicy::default(),
+                ));
+            }
             if let Some((backend, session_id)) = native {
                 state.native_sessions = Some(crate::session_history::tests::Source::new(
                     &workspace, backend, session_id,
@@ -4483,6 +4512,110 @@ data: {\"type\":\"message_stop\"}\n\n",
     #[test]
     fn native_websocket_terminal_write_is_observed_after_execution_settlement() {
         run_ws_regression("native-ws-terminal", native_websocket_terminal_write_inner);
+    }
+
+    #[test]
+    fn main_conversation_reconnects_rotate_summaries_and_preserve_original_history() {
+        run_ws_regression("main-conversation-deck", main_conversation_deck_inner);
+    }
+
+    async fn main_conversation_deck_inner() {
+        for backend in ["sqlite", "jsonl"] {
+            let mut fixture = ParkedTurnFixture::spawn_with(None, None, |config| {
+                config.channels.session_backend = backend.into();
+                config.gateway.require_pairing = true;
+                config.gateway.paired_tokens = vec![
+                    "zc_fixture_history_reader".into(),
+                    "zc_fixture_second_device".into(),
+                ];
+                let policy = &mut config.agents.get_mut("web").expect("agent").main_session;
+                policy.enabled = true;
+                policy.web = true;
+                let profile = config.runtime_profiles.get_mut("fixture").expect("profile");
+                profile.max_history_messages = Some(6);
+                profile.summary_deck.enabled = true;
+            })
+            .await;
+            let key = "main-session-web";
+            for index in 0..9 {
+                let credential = if index % 2 == 0 {
+                    "zc_fixture_history_reader"
+                } else {
+                    "zc_fixture_second_device"
+                };
+                let (mut client, _) = connect_async(format!(
+                    "ws://{}/ws/chat?agent=web&session_id=device-{index}&token={credential}", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+                    fixture.gateway_addr
+                ))
+                .await
+                .expect("paired connection");
+                let frame = next_text_frame(&mut client).await;
+                assert_eq!(frame["type"], "session_start", "{frame}");
+                assert_eq!(frame["session_id"], key);
+                let prompt = format!(
+                    "architecture question {index}: retain original messages and rotate summaries"
+                );
+                let request = fixture.start_parked_turn(&mut client, &prompt).await;
+                let history = request["messages"].to_string();
+                if index == 1 {
+                    assert!(
+                        history.contains("architecture question 0"),
+                        "fresh device recovers prior conversation: {request}"
+                    );
+                    assert!(history.contains(PARKED_TURN_RESPONSE));
+                }
+                if index == 8 {
+                    assert!(
+                        history.contains("Retained architecture:"),
+                        "provider receives the summary deck: {request}"
+                    );
+                    assert!(
+                        !history.contains("architecture question 0"),
+                        "old raw history left the active window"
+                    );
+                }
+                fixture.release_next();
+                loop {
+                    let frame = next_text_frame(&mut client).await;
+                    assert_ne!(frame["type"], "error", "{backend}: {frame}");
+                    if frame["type"] == "done" {
+                        break;
+                    }
+                }
+                fixture.wait_for_turn_to_settle(key).await;
+                drop(client);
+            }
+            let messages = fixture.transcript(key).await;
+            for index in 0..9 {
+                assert!(
+                    messages.iter().any(|message| message.role == "user"
+                        && message
+                            .content
+                            .contains(&format!("architecture question {index}:"))),
+                    "{backend}: original {index} retained"
+                );
+            }
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                "Bearer zc_fixture_history_reader".parse().expect("header"),
+            );
+            let response = crate::api::handle_api_session_delete(
+                State(fixture.state.clone()),
+                headers,
+                axum::extract::Path(key.into()),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            assert_eq!(fixture.transcript(key).await.len(), messages.len());
+            assert!(
+                connect_async(format!("ws://{}/ws/chat?agent=web", fixture.gateway_addr))
+                    .await
+                    .is_err()
+            ); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            fixture.shutdown();
+        }
     }
     async fn native_websocket_terminal_write_inner() {
         for backend in ["sqlite", "jsonl"] {

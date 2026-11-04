@@ -352,6 +352,31 @@ async function unmount(renderer: ReactTestRenderer): Promise<void> {
   await act(async () => { renderer.unmount(); });
 }
 
+test('server-selected main conversation replaces the provisional id and hydrates its original history', async () => {
+  const runtime = new FakeSessionRuntime();
+  const initial = new Deferred<SessionMessagesResponse>();
+  runtime.queueMessages('A', () => initial.promise);
+  runtime.queueMessages('main-session-ops', () => Promise.resolve(
+    messagesResponse('main-session-ops', true, ['Architecture discussed over Telegram']),
+  ));
+  const mounted = await mountChat(runtime);
+  const originalSocket = runtime.sockets[0]!;
+  await act(async () => {
+    originalSocket.emitMessage({ type: 'session_start', session_id: 'main-session-ops' });
+  });
+  assert.equal(mounted.context().sessionId, 'main-session-ops');
+  assert.ok(mounted.context().messages.some((message) => message.content === 'Architecture discussed over Telegram'));
+  assert.equal(originalSocket.disconnectCalls, 1);
+  assert.equal(runtime.sockets[runtime.sockets.length - 1]?.sessionId, 'main-session-ops');
+  await act(async () => {
+    initial.resolve(messagesResponse('A', true, ['obsolete provisional history']));
+    originalSocket.emitMessage({ type: 'session_start', session_id: 'stale-id' });
+  });
+  assert.equal(mounted.context().sessionId, 'main-session-ops');
+  assert.ok(!mounted.context().messages.some((message) => message.content === 'obsolete provisional history'));
+  await unmount(mounted.renderer);
+});
+
 beforeEach(() => {
   storage.clear();
   configPutCalls = [];
@@ -1114,6 +1139,25 @@ test('session switch disconnects both the effect-owned and replacement sockets',
   });
   assert.equal(mounted.context().messages.some((message) =>
     message.content === 'stale replacement'), false);
+  await unmount(mounted.renderer);
+});
+
+test('a protected main conversation keeps its transcript and socket when Clear all is refused', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['Retained architecture discussion'])));
+  runtime.queueDelete('A', () => Promise.reject(new ApiError(409, {
+    code: 'MAIN_SESSION_PROTECTED', message: 'The continuous main conversation cannot be deleted.',
+  })));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().clearAllMessages(); });
+  await settle();
+  assert.equal(mounted.context().sessionId, 'A');
+  assert.ok(mounted.context().messages.some((message) => message.content === 'Retained architecture discussion'));
+  assert.equal(runtime.sockets.length, 1);
+  assert.equal(runtime.sockets[0]!.disconnectCalls, 0);
+  assert.equal(mounted.context().error, 'The continuous main conversation cannot be deleted.');
   await unmount(mounted.renderer);
 });
 

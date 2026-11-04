@@ -953,6 +953,7 @@ const V3_AGENT_FIELDS: &[&str] = &[
     "enabled",
     "identity",
     "knowledge_bundles",
+    "main_session",
     "mcp_bundles",
     "memory",
     "model_provider",

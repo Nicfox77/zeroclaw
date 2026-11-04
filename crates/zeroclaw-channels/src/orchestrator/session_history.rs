@@ -44,6 +44,15 @@ struct ChannelAuthority {
 impl ChannelAuthority {
     fn current(&self) -> Result<(), SessionError> {
         let config = self.ctx.live_config.read();
+        if self.stream.as_str() == zeroclaw_config::main_session::session_id(&self.agent)
+            && zeroclaw_config::main_session::channel_session(&config, &self.agent, &self.message)
+                .as_deref()
+                != Some(self.stream.as_str())
+        {
+            return Err(SessionError::PermissionDenied(
+                "main_session_connection_binding_revoked".into(),
+            ));
+        }
         let channel = channel_key_for_message(&self.message);
         if config.agent_for_channel(&channel) != Some(self.ctx.agent_alias.as_str())
             || config.agent(&self.agent).is_none_or(|agent| !agent.enabled)

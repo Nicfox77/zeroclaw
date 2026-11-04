@@ -1772,6 +1772,13 @@ fn runtime_conversation_history_key(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> String {
+    if let Some(shared) = zeroclaw_config::main_session::channel_session(
+        &ctx.live_config.read(),
+        ctx.agent_alias.as_str(),
+        msg,
+    ) {
+        return shared;
+    }
     if msg.channel == "webhook" && ctx.channels_by_name.contains_key("webhook") {
         conversation_history_key_in_scope(msg, &msg.channel)
     } else {
@@ -4905,6 +4912,30 @@ async fn handle_runtime_command_for_delivery(
 
     let sender_key = runtime_conversation_history_key(ctx, msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
+    if command == ChannelRuntimeCommand::NewSession
+        && zeroclaw_config::main_session::channel_session(
+            &ctx.live_config.read(),
+            ctx.agent_alias.as_str(),
+            msg,
+        )
+        .is_some()
+    {
+        let response = channel_runtime_cli_string("channel-runtime-main-session-protected");
+        if let Err(error) = session_history::send(
+            channel.as_ref(),
+            &SendMessage::reply_to(msg, response).suppress_voice(),
+        )
+        .await
+        {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(serde_json::json!({"error":error.to_string()})),
+                "channel_main_session_notice_failed"
+            );
+        }
+        return true;
+    }
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
     let effort_auto_reset_enabled = defaults_snapshot
         .config
@@ -8934,6 +8965,13 @@ async fn process_channel_message_body(
                 .pending_inputs(route.model_provider, route.model)
                 .await?
             {
+                // Another linked transport owns its accepted inputs.
+                if history_key
+                    == zeroclaw_config::main_session::session_id(ctx.agent_alias.as_str())
+                    && queued.ingress.transport != channel_ingress_context(&msg).transport
+                {
+                    continue;
+                }
                 anyhow::ensure!(
                     !cancellation_token.is_cancelled(),
                     "channel_recovery_cancelled"
@@ -36406,6 +36444,93 @@ BTC is currently around $65,000 based on latest tool output."#
                 calls[1]
                     .iter()
                     .any(|(role, content)| { role == "assistant" && content == "response-1" }),
+                "{backend}: {:?}",
+                calls[1]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn main_telegram_conversation_routes_only_bound_direct_chats_and_preserves_context_on_new()
+     {
+        for backend in ["sqlite", "jsonl"] {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = Arc::new(HistoryCaptureModelProvider::default());
+            let channel = Arc::new(SendMessageRecordingChannel::telegram(false));
+            let mut config = Config {
+                data_dir: directory.path().to_owned(),
+                ..Default::default()
+            };
+            config.channels.session_backend = backend.into();
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["telegram.personal".into()],
+                main_session: zeroclaw_config::main_session::MainSessionConfig {
+                    enabled: true,
+                    web: true,
+                    telegram: HashMap::from([("personal".into(), "10001".into())]),
+                },
+                ..Default::default()
+            };
+            config.agents.insert("test-agent".into(), agent.clone());
+            config.peer_groups.insert(
+                "fixture".into(),
+                peer_group("telegram.personal", &["10001"], false),
+            );
+            let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel.clone(),
+                provider.clone(),
+                config,
+                agent,
+                "test-provider",
+                None,
+            );
+            let inner = Arc::get_mut(&mut ctx).unwrap();
+            inner.workspace_dir = Arc::new(directory.path().to_owned());
+            inner.ack_reactions = false;
+            inner.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                inner.live_config.clone(),
+            )));
+            let mut message = ChannelMessage::new(
+                "first",
+                "10001",
+                "10001",
+                "preserve our architecture discussion",
+                "telegram",
+                1,
+            );
+            message.platform_sender_id = Some("10001".into());
+            message.channel_alias = Some("personal".into());
+            message.explicitly_addressed = true;
+            assert_eq!(
+                runtime_conversation_history_key(&ctx, &message),
+                "main-session-test-agent"
+            );
+            let mut group = message.clone();
+            group.reply_target = "-10099".into();
+            assert_ne!(
+                runtime_conversation_history_key(&ctx, &group),
+                "main-session-test-agent"
+            );
+            process_channel_message(ctx.clone(), message.clone(), CancellationToken::new()).await;
+            message.id = "new-command".into();
+            message.content = "/new".into();
+            process_channel_message(ctx.clone(), message.clone(), CancellationToken::new()).await;
+            assert!(
+                channel
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|reply| reply.content.contains("continuous main conversation"))
+            );
+            message.id = "continuation".into();
+            message.content = "continue that design".into();
+            process_channel_message(ctx.clone(), message.clone(), CancellationToken::new()).await;
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2, "{backend}");
+            assert!(
+                calls[1].iter().any(|(role, content)| role == "user"
+                    && content.contains("preserve our architecture discussion")),
                 "{backend}: {:?}",
                 calls[1]
             );

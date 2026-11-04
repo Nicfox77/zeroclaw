@@ -1876,6 +1876,13 @@ pub async fn handle_api_session_delete(
         return e.into_response();
     }
 
+    if zeroclaw_config::main_session::is_main_session(&state.config.read(), &id) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "message":zeroclaw_runtime::i18n::get_required_cli_string("gateway-main-session-protected"),
+            "code":"MAIN_SESSION_PROTECTED"
+        }))).into_response();
+    }
+
     if state.native_sessions.is_some() {
         return crate::session_history::response(
             async {

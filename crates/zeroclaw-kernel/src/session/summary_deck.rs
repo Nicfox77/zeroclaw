@@ -25,6 +25,10 @@ pub struct ResolvedSummaryDeck {
 /// Host composition resolves live config and constructs inference capabilities.
 /// The kernel retains this resolver, never a configuration or permission copy.
 pub trait SummaryDeckRuntime: Send + Sync {
+    /// A live routing decision, not a cached grant or stored policy snapshot.
+    fn main_session(&self) -> anyhow::Result<Option<SessionId>> {
+        Ok(None)
+    }
     fn resolve(&self) -> anyhow::Result<Option<ResolvedSummaryDeck>>;
     fn executor(&self) -> anyhow::Result<ContextSummaryExecutor<'static>>;
     fn resolve_for_route(

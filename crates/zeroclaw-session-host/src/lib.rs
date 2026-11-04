@@ -339,6 +339,9 @@ impl EngineSessionSource for NativeSessionHub {
         })
         .await??;
         for session_id in sessions {
+            if zeroclaw_config::main_session::is_main_session(&self.config.read(), &session_id) {
+                continue;
+            }
             {
                 let mut owners = self.owners.lock().await;
                 let key = (directory.clone(), session_id.clone());
@@ -376,7 +379,14 @@ impl EngineSessionSource for NativeSessionHub {
                 )
                 .summary(stream.clone())
                 .await?;
-            if !summary.closed && !summary.running && summary.last_activity < before_millis {
+            if !summary.closed
+                && !summary.running
+                && summary.last_activity < before_millis
+                && !zeroclaw_config::main_session::is_main_session(
+                    &self.config.read(),
+                    stream.as_str(),
+                )
+            {
                 let event = SessionEvent::typed(
                     stream.clone(),
                     EventData::SessionClosed {
