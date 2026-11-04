@@ -46,8 +46,9 @@ limit, context preparation waits for the pending job. A failed, empty,
 oversized, unavailable or unauthorized summary never authorizes deleting the
 raw source. A protected turn that cannot fit still fails the normal capacity
 guard; an unlimited logical conversation does not enlarge a model's physical
-context window. Summaries are lower-trust assistant context, never system
-instructions, approvals or long-term-memory writes.
+context window. Summaries are explicitly marked as generated historical data,
+carried in the protected user-role context slot for provider compatibility.
+They are never system instructions, approvals or long-term-memory writes.
 
 Source identities, captured inference output and the installed deck are
 durable session facts. A process crash cancels an unfinished local transform

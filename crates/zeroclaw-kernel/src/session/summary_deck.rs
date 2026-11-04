@@ -211,7 +211,10 @@ pub(super) fn reconcile(
     let begin = boundary
         .unwrap_or(system_count + usize::from(snapshot.history_has_trim_breadcrumb == Some(true)));
     let mut messages = snapshot.messages[..system_count].to_vec();
-    messages.push(ConversationMessage::Chat(ChatMessage::assistant(render(
+    // The protected context capsule starts with user role, like the existing
+    // trim breadcrumb. Strict provider preparation removes a leading assistant
+    // as an orphan; the capsule's text explicitly marks generated provenance.
+    messages.push(ConversationMessage::Chat(ChatMessage::user(render(
         owner.store.as_ref(),
         &input.session_id,
         &deck,
@@ -601,7 +604,7 @@ impl EngineSession {
             if rendered.chars().count().div_ceil(4) + 4 > budget {
                 return Err(SessionError::InvalidAdmission("summary_deck_allocation_too_small".into()));
             }
-            let summary = retry::payload(&started, "deck-message", "session.conversation/v1", &vec![ConversationMessage::Chat(ChatMessage::assistant(rendered))])?;
+            let summary = retry::payload(&started, "deck-message", "session.conversation/v1", &vec![ConversationMessage::Chat(ChatMessage::user(rendered))])?;
             let summary_ref = StoredPayloadRef::from(&summary);
             refs.insert(leading, MessageRef { message_id:MessageId::parse(format!("context-message-{started}-{leading}")).map_err(AppendError::from)?,
                 source:ContextMessageSource::Conversation { payload_ref:summary_ref.clone(), item_index:0 } });
