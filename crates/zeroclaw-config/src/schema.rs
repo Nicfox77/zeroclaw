@@ -14936,6 +14936,9 @@ impl Default for RiskProfileConfig {
 #[prefix = "runtime_profile"]
 #[serde(default)]
 pub struct RuntimeProfileConfig {
+    /// Optional asynchronous summaries over permanent native session history.
+    #[nested]
+    pub summary_deck: crate::summary_deck::SummaryDeckConfig,
     /// Enable agentic (multi-turn tool-call loop) mode.
     pub agentic: bool,
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
@@ -15038,6 +15041,7 @@ pub struct RuntimeProfileConfig {
 impl Default for RuntimeProfileConfig {
     fn default() -> Self {
         Self {
+            summary_deck: crate::summary_deck::SummaryDeckConfig::default(),
             agentic: false,
             max_tool_iterations: 0,
             max_execution_tree_iterations: None,
@@ -24247,6 +24251,24 @@ impl Config {
         self.cost.rates.validate()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
+            profile
+                .summary_deck
+                .validate()
+                .with_context(|| format!("runtime_profiles.{profile_alias}.summary_deck"))?;
+            let summary_provider = profile.summary_deck.provider.trim();
+            if !summary_provider.is_empty() {
+                let (family, alias) = summary_provider.split_once('.').ok_or_else(|| anyhow::Error::msg(format!(
+                    "runtime_profiles.{profile_alias}.summary_deck.provider requires <type>.<alias>")))?;
+                anyhow::ensure!(
+                    self.providers.models.find(family, alias).is_some(),
+                    "runtime_profiles.{profile_alias}.summary_deck.provider references an unknown provider"
+                );
+            }
+            anyhow::ensure!(
+                !profile.summary_deck.enabled
+                    || profile.max_history_messages.is_none_or(|limit| limit >= 4),
+                "runtime_profiles.{profile_alias}.summary_deck requires at least four retained turns"
+            );
             if profile.max_execution_tree_iterations == Some(0) {
                 validation_bail!(
                     InvalidNumericRange,

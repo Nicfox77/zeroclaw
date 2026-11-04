@@ -549,6 +549,7 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     // fails on the target even though the agent never named it.
     if let Some(profile) = config.runtime_profiles.get(runtime_alias) {
         model_provider_refs.push(profile.context_compression.summary_provider.trim());
+        model_provider_refs.push(profile.summary_deck.provider.trim());
     }
     carry_model_provider_closure(
         &mut out,

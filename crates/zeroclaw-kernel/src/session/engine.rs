@@ -212,8 +212,16 @@ pub struct EngineSession {
     pub(super) actor: EventActor,
     pub(super) authority: Arc<dyn EngineSessionAuthority>,
     source: Option<Arc<dyn EngineSessionSource>>,
+    pub(super) summary_deck: Option<Arc<dyn super::summary_deck::SummaryDeckRuntime>>,
 }
 impl EngineSession {
+    pub fn with_summary_deck(
+        mut self,
+        runtime: Arc<dyn super::summary_deck::SummaryDeckRuntime>,
+    ) -> Self {
+        self.summary_deck = Some(runtime);
+        self
+    }
     pub(super) fn is_active(&self) -> bool {
         ACTIVE_ENGINE_SESSION
             .try_with(|(stream, branch)| stream == &self.stream && branch == &self.branch)
@@ -309,6 +317,7 @@ impl EngineSession {
             actor,
             authority,
             source: None,
+            summary_deck: None,
         }
     }
     pub fn query(&self) -> SessionQuery {
@@ -523,8 +532,21 @@ impl SessionExecutionPort for EngineSession {
     }
 
     async fn restore_context(&self) -> anyhow::Result<Option<ContextSnapshot>> {
+        self.maintain_summary_deck().await?;
         let event = self.latest_context().await?;
         self.read_context_snapshot(event).await
+    }
+
+    async fn prepare_context(&self, context: ContextSnapshot) -> anyhow::Result<ContextSnapshot> {
+        if self.summary_policy().await?.is_none() {
+            return Ok(context);
+        }
+        self.replace_context(context.clone(), "summary_deck_working_context")
+            .await?;
+        self.maintain_summary_deck().await?;
+        self.read_context_snapshot(self.latest_context().await?)
+            .await?
+            .ok_or_else(|| anyhow::Error::msg("summary_deck_context_missing"))
     }
 
     async fn summarize_context(
@@ -675,6 +697,7 @@ impl SessionExecutionPort for EngineSession {
             return Err(SharedEngineError(error).into());
         }
         if let Some(output) = executor.output {
+            self.maintain_summary_deck().await?;
             return Ok(output);
         }
         // Retry reads the committed result through the authorized query. It

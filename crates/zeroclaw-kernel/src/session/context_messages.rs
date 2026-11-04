@@ -36,6 +36,7 @@ fn present(
 }
 
 pub(super) struct ContextPlan {
+    pub summary_deck: Option<super::summary_deck::Deck>,
     pub refs: Vec<MessageRef>,
     pub payloads: Vec<PayloadRecord>,
     pub ranges: Vec<SourceRange>,
@@ -347,6 +348,11 @@ impl SessionCoordinator {
             _ => vec![],
         };
         Ok(ContextPlan {
+            summary_deck: if summary_ref.is_some() {
+                super::summary_deck::read_deck(self.store.as_ref(), input)?
+            } else {
+                None
+            },
             refs,
             payloads,
             ranges,

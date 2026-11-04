@@ -1901,6 +1901,25 @@ async fn run_tool_call_loop_inner<'a>(
 
     turn_state.sync_pending();
 
+    // Session-owned maintenance is shared by Web, channel and Agent callers.
+    // Run before recalled memory is injected so it never becomes transcript.
+    if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution() {
+        let prepared = port
+            .prepare_context(zeroclaw_api::session_events::capture::ContextSnapshot {
+                messages: crate::agent::agent::Agent::replay_loop_messages_for_retention(
+                    turn_state.history,
+                ),
+                history_has_trim_breadcrumb: Some(turn_state.crumb_present),
+            })
+            .await?;
+        *turn_state.history = prepared
+            .messages
+            .iter()
+            .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
+            .collect();
+        turn_state.crumb_present = prepared.history_has_trim_breadcrumb.unwrap_or(false);
+    }
+
     let ingress_policy_cfg = IngressPolicy::default();
 
     // Stamp the initiating internal principal into the turn trace, keyed by
