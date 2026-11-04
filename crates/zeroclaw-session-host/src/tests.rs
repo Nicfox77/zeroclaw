@@ -7,6 +7,66 @@ use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 struct Authority(AtomicBool);
 
 #[tokio::test]
+async fn continuous_main_conversation_survives_expiry_and_rejects_close() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        };
+        config.channels.session_backend = backend.into();
+        config.agents.insert(
+            "fixture".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                main_session: zeroclaw_config::main_session::MainSessionConfig {
+                    enabled: true,
+                    web: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let hub = NativeSessionHub::new(live.handle());
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        let open = || {
+            hub.open(
+                "main-session-fixture".into(),
+                "test",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                ContextSnapshot {
+                    messages: vec![ConversationMessage::Chat(ChatMessage::user(
+                        "permanent architecture discussion",
+                    ))],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+        };
+        let port = open().await.expect("main conversation");
+        assert!(
+            port.close("test_delete")
+                .await
+                .expect_err("protected main")
+                .to_string()
+                .contains("main_session_reset_requires_disabling_policy")
+        );
+        drop(port);
+        assert_eq!(
+            hub.archive_stale("test", i64::MAX)
+                .await
+                .expect("expiry scan"),
+            0
+        );
+        let port = open().await.expect("same main conversation");
+        assert!(
+            matches!(&port.restore_context().await.expect("restore").expect("context").messages[0], ConversationMessage::Chat(chat) if chat.content == "permanent architecture discussion")
+        );
+    }
+}
+
+#[tokio::test]
 async fn temporary_copy_restores_shared_context_hides_children_and_disappears_on_close() {
     use zeroclaw_api::session_events::capture::{
         ChildDispatchIntent, EngineInputPart, EngineTurnInput, current_provider_admission,

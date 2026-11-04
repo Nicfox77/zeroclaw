@@ -5,6 +5,7 @@ use zeroclaw_config::summary_deck::SummaryDeckConfig;
 
 #[derive(Clone)]
 struct Runtime {
+    main: Option<SessionId>,
     enabled: Arc<AtomicBool>,
     fail: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
@@ -13,6 +14,7 @@ struct Runtime {
 impl Runtime {
     fn new() -> Self {
         Self {
+            main: None,
             enabled: Arc::new(AtomicBool::new(true)),
             fail: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(AtomicUsize::new(0)),
@@ -21,6 +23,9 @@ impl Runtime {
     }
 }
 impl SummaryDeckRuntime for Runtime {
+    fn main_session(&self) -> anyhow::Result<Option<SessionId>> {
+        Ok(self.main.clone())
+    }
     fn resolve(&self) -> anyhow::Result<Option<ResolvedSummaryDeck>> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Ok(None);
@@ -343,5 +348,62 @@ async fn background_publication_rechecks_live_enablement_and_authority() {
             serde_json::to_value(before).unwrap(),
             serde_json::to_value(after).unwrap()
         );
+    }
+}
+
+#[tokio::test]
+async fn main_conversation_refreshes_stale_connections_inside_the_execution_lane() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (port, _) = session(directory.path(), backend);
+        let mut runtime = Runtime::new();
+        runtime.enabled.store(false, Ordering::SeqCst);
+        runtime.main = Some(port.stream.clone());
+        let port = port.with_summary_deck(Arc::new(runtime));
+        add_turn(&port, 0).await.unwrap();
+        let stale = port
+            .read_context_snapshot(port.latest_context().await.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        for (prompt, reply) in [
+            ("Web architecture follow-up", "Web rationale"),
+            ("Telegram continuation", "Telegram rationale"),
+        ] {
+            let mut incoming = input();
+            incoming.parts = vec![EngineInputPart::Text(prompt.into())];
+            let mut view = stale.clone();
+            view.messages
+                .push(ConversationMessage::Chat(ChatMessage::user(prompt)));
+            let active = port.clone();
+            port.execute(
+                incoming,
+                Box::pin(async move {
+                    let mut selected = active.prepare_context(view).await?;
+                    let context = serde_json::to_string(&selected.messages)?;
+                    if prompt == "Telegram continuation" {
+                        assert!(context.contains("Web architecture follow-up"));
+                        assert!(context.contains("Web rationale"));
+                    }
+                    selected
+                        .messages
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(reply)));
+                    active
+                        .replace_context(selected, "fixture_completed_turn")
+                        .await?;
+                    Ok(reply.into())
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let current = port
+            .read_context_snapshot(port.latest_context().await.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let text = serde_json::to_string(&current.messages).unwrap();
+        assert!(text.contains("Telegram continuation"));
+        assert_eq!(text.matches("Web architecture follow-up").count(), 1);
     }
 }

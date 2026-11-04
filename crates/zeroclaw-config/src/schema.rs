@@ -4209,6 +4209,10 @@ impl<'de> Deserialize<'de> for DelegateTargetConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate_agent"]
 pub struct AliasedAgentConfig {
+    /// Opt-in personal conversation shared by explicitly linked connections.
+    #[serde(default)]
+    #[nested]
+    pub main_session: crate::main_session::MainSessionConfig,
     /// Whether this agent is active. Set false to disable without removing the definition.
     #[tab(General)]
     #[serde(default = "default_true")]
@@ -4409,6 +4413,7 @@ pub struct AliasedAgentConfig {
 impl Default for AliasedAgentConfig {
     fn default() -> Self {
         Self {
+            main_session: crate::main_session::MainSessionConfig::default(),
             enabled: true,
             channels: Vec::new(),
             model_provider: crate::providers::ModelProviderRef::default(),
@@ -24248,6 +24253,9 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        for (alias, agent) in &self.agents {
+            agent.main_session.validate(self, alias)?;
+        }
         self.cost.rates.validate()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {

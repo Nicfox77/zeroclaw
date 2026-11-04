@@ -1,5 +1,58 @@
 # History management
 
+## Optional continuous main conversation
+
+An agent can use one durable main conversation across authenticated dashboard
+connections and explicitly bound Telegram direct chats. Other agents and
+unbound connections retain their normal session isolation. Enable this
+separately from the summary deck:
+
+```toml
+[agents.assistant.main_session]
+enabled = true
+web = true
+
+[agents.assistant.main_session.telegram]
+# Bot alias = owner's numeric Telegram user ID (illustrative value).
+personal = "10001"
+```
+
+Use your configured agent and bot aliases. The agent must already own
+`telegram.personal`, and its existing peer allowlist must admit that user.
+The binding uses Telegram's adapter-stamped numeric identity and only joins
+that user's direct chat; groups, topics, other bots and display usernames do
+not join. Dashboard connections must authenticate as a paired operator or
+administrator. Joining a conversation grants no additional tool permissions.
+All opted-in dashboard operator connections share this agent's main history;
+use a separate agent for a separate person's conversation.
+
+Gateway `require_pairing` must remain enabled for the Web binding. Both gateway
+and channel session persistence must be enabled for their respective bindings.
+They use the existing native session store under the
+same data directory, with the ID `main-session-<agent-alias>`. The daemon
+shares its execution coordinator across transports, so each turn refreshes
+the latest committed context after acquiring its execution lane. Concurrent
+messages are serialized; a stale browser or channel cache cannot replace a
+newer connection's conversation. The dashboard adopts the server's canonical
+session ID and loads its permanent history on reconnect. A Telegram exchange
+is visible on dashboard history reload; this option does not add live
+cross-channel transcript broadcasting.
+
+The main conversation is exempt from automatic idle expiry. Telegram `/new`
+and `/clear`, and dashboard deletion, refuse to reset it while the option is
+enabled. New dashboard session IDs resolve back to the same conversation.
+Summary rotation bounds the model's active context while original history
+continues to grow on disk. This is a continuous logical conversation, not an
+unlimited provider context window.
+
+Configure this on a dedicated personal agent. Existing isolated sessions are
+not merged automatically. Restart the daemon and reconnect clients after
+changing bindings. Disabling `main_session.enabled` restores ordinary routing;
+the main history stays retained and can be rejoined by enabling it again.
+Explicit history erasure and installation backups remain separate operator
+actions. The default is disabled, so existing installations keep their current
+session routing.
+
 ## Optional asynchronous summary deck
 
 Native sessions can retain recent verbatim turns plus a rotating deck of older

@@ -145,6 +145,14 @@ pub(crate) async fn recover_pending(
 ) -> anyhow::Result<()> {
     let (alias, provider, model) = agent.attribution_fields();
     for mut input in port.pending_inputs(provider, model).await? {
+        if family == zeroclaw_config::main_session::session_id(&alias)
+            && matches!(
+                input.ingress.transport,
+                zeroclaw_api::ingress::Transport::Channel { .. }
+            )
+        {
+            continue;
+        }
         if input.agent_alias.as_deref() != Some(&alias) || !proof.validates_recovery(&input) {
             port.reject_pending_input(&input.turn_id, "gateway_recovery_route_unavailable")
                 .await?;
@@ -632,6 +640,25 @@ pub(crate) fn header_subject(
         .map(Some)
         .ok_or_else(|| anyhow::Error::msg("gateway authentication revoked"))
 }
+pub(crate) fn web_family(
+    state: &AppState,
+    alias: &str,
+    subject: Option<&str>,
+    requested: &str,
+) -> anyhow::Result<String> {
+    let Some(shared) = zeroclaw_config::main_session::web_session(&state.config.read(), alias)
+    else {
+        return Ok(requested.to_owned());
+    };
+    anyhow::ensure!(
+        crate::dashboard_session::history_admission().is_some()
+            || subject.is_some_and(|hash| state.pairing.token_hash_is_paired(hash)),
+        "main_session_requires_authenticated_operator"
+    );
+    verify_request_history_subject(state, subject)?;
+    Ok(shared)
+}
+
 pub(crate) async fn open(
     state: &AppState,
     family: &str,
