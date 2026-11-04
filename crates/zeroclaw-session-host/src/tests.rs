@@ -606,6 +606,12 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
             )
             .expect("legacy");
         for family in ["gw_expired", "channel_retained"] {
+            // Retention compares millisecond timestamps. Give the second
+            // fixture a later activity time so the cutoff selects only the
+            // first; back-to-back inserts can share the same millisecond.
+            if family == "channel_retained" {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             legacy
                 .append(family, &ChatMessage::user("historical input"))
                 .expect("history");
