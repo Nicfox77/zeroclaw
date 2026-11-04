@@ -17011,6 +17011,12 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
+    /// Keep the text response alongside a Telegram voice reply. Applies to
+    /// configured voice peers and per-turn voice routing. Default: `false`.
+    /// Explicit text-only routing still suppresses speech.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub send_text_with_voice: bool,
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
@@ -17126,6 +17132,7 @@ impl Default for TelegramConfig {
             bot_token: String::new(),
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::default(),
+            send_text_with_voice: false,
             draft_update_interval_ms: default_draft_update_interval_ms(),
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
@@ -34054,6 +34061,7 @@ auto_save = true
                         bot_token: "123:ABC".into(),
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
+                        send_text_with_voice: false,
                         draft_update_interval_ms: default_draft_update_interval_ms(),
                         multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
@@ -36094,6 +36102,7 @@ default_temperature = 0.7
             bot_token: "123:XYZ".into(),
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
+            send_text_with_voice: true,
             draft_update_interval_ms: 500,
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
@@ -36115,6 +36124,7 @@ default_temperature = 0.7
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
         assert!(parsed.interrupt_on_new_message);
+        assert!(parsed.send_text_with_voice);
     }
 
     #[test]
@@ -36122,6 +36132,7 @@ default_temperature = 0.7
         let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
+        assert!(!parsed.send_text_with_voice);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.api_base_url, "https://api.telegram.org");
@@ -43012,6 +43023,7 @@ high_entropy_tokens = false
                 bot_token: plaintext_token.into(),
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
+                send_text_with_voice: false,
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,

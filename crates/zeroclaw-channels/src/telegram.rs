@@ -991,6 +991,8 @@ pub struct TelegramChannel {
     /// Resolves voice peers from canonical config at call-time.
     /// See AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH" — no cache.
     voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Reads channels.telegram.<alias>.send_text_with_voice from live config.
+    send_text_with_voice_resolver: Arc<dyn Fn() -> bool + Send + Sync>,
     pending_voice:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
@@ -2612,6 +2614,7 @@ impl TelegramChannel {
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+            send_text_with_voice_resolver: Arc::new(|| false),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             #[cfg(test)]
@@ -2650,6 +2653,15 @@ impl TelegramChannel {
         voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         self.voice_peer_resolver = voice_peer_resolver;
+        self
+    }
+
+    /// Resolve whether voice replies retain text from canonical channel config.
+    pub fn with_send_text_with_voice_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.send_text_with_voice_resolver = resolver;
         self
     }
 
@@ -2748,6 +2760,11 @@ impl TelegramChannel {
     /// does not cover.
     fn destination_is_voice_peer(&self, recipient: &str) -> bool {
         (self.voice_peer_resolver)().iter().any(|p| p == recipient)
+    }
+
+    fn voice_reply_is_exclusive(&self, recipient: &str, force_voice: bool) -> bool {
+        !(self.send_text_with_voice_resolver)()
+            && (force_voice || self.destination_is_voice_peer(recipient))
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -2852,8 +2869,9 @@ impl TelegramChannel {
             return Ok(());
         }
 
-        // A voice-configured peer (`output_modality = "voice"`) has opted out of
-        // text streaming: multi_message's permanent per-turn narration is a
+        // Unless send_text_with_voice is enabled, a voice-configured peer
+        // (`output_modality = "voice"`) has opted out of text streaming:
+        // multi_message's permanent per-turn narration is a
         // text-delivery affordance. Such a peer receives its reply as one unit at
         // finalize — a voice note by default, or the complete text if the agent
         // routes this reply to text — never mid-turn permanent narration. This is
@@ -2867,7 +2885,7 @@ impl TelegramChannel {
         // `finalize_multi_message_draft` (which does see `suppress_voice`) delivers
         // the complete text, the accumulated narration and the final answer, to a
         // text-routed voice peer.
-        if self.destination_is_voice_peer(recipient) {
+        if self.voice_reply_is_exclusive(recipient, false) {
             return Ok(());
         }
 
@@ -3007,7 +3025,7 @@ impl TelegramChannel {
         // while narration streams, and narration is published as separate,
         // permanent messages — so it stays text and is not retracted; that route
         // makes only the final answer a voice note (see the `send()` contract).
-        let voice_only = !suppress_voice && self.destination_is_voice_peer(recipient);
+        let voice_only = !suppress_voice && self.voice_reply_is_exclusive(recipient, false);
 
         let key = Self::multi_draft_key(recipient, message_id);
         let flush_lock = {
@@ -8108,7 +8126,7 @@ impl Channel for TelegramChannel {
 
         // Voice-only peers: delete the draft placeholder and let the voice
         // bubble be the sole reply. Bypassed when suppress_voice forces text.
-        if !suppress_voice && self.destination_is_voice_peer(recipient) {
+        if !suppress_voice && self.voice_reply_is_exclusive(recipient, false) {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
                     .http_client()
@@ -8324,13 +8342,13 @@ impl Channel for TelegramChannel {
             self.try_queue_voice_reply(&message.recipient, &content, false, message.force_voice);
         }
 
-        // Voice-only peers (or explicit force_voice): the voice note is the sole
-        // FINAL reply — skip the final text. In multi_message mode, narration
+        // Unless send_text_with_voice is enabled, voice-only peers (or explicit
+        // force_voice) receive the voice note as the sole FINAL reply. In multi_message mode, narration
         // already streamed earlier this turn is delivered as separate, permanent
         // messages that cannot be retracted; a per-turn voice route governs the
         // final answer only and does not convert or delete that narration.
         if !message.suppress_voice
-            && (self.destination_is_voice_peer(&message.recipient) || message.force_voice)
+            && self.voice_reply_is_exclusive(&message.recipient, message.force_voice)
         {
             return Ok(());
         }
@@ -11914,6 +11932,140 @@ mod tests {
             fired,
             "control: suppress_voice=false SHOULD trigger TTS synthesis — proves the setup fires voice"
         );
+    }
+
+    #[tokio::test]
+    async fn voice_reply_can_keep_text_across_delivery_modes_and_live_changes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, OpenAITtsProviderConfig, TelegramConfig, TtsProviderConfig,
+        };
+
+        for mode in [
+            StreamMode::Off,
+            StreamMode::Partial,
+            StreamMode::MultiMessage,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":1}})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/speech"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fixture-opus"))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let mut config = Config::default();
+            config.tts.enabled = true;
+            config
+                .channels
+                .telegram
+                .insert("test".into(), TelegramConfig::default());
+            config.agents.insert(
+                "fixture".into(),
+                AliasedAgentConfig {
+                    tts_provider: "openai.default".into(),
+                    channels: vec!["telegram.test".into()],
+                    ..Default::default()
+                },
+            );
+            config.providers.tts.openai.insert(
+                "default".into(),
+                OpenAITtsProviderConfig {
+                    base: TtsProviderConfig {
+                        api_key: Some("fixture-key".into()),
+                        uri: Some(format!("{}/v1/audio/speech", server.uri())),
+                        ..Default::default()
+                    },
+                },
+            );
+            let live = Arc::new(parking_lot::RwLock::new(config.clone()));
+            let channel = multi_message_test_channel("test", 0)
+                .with_streaming(mode, 0)
+                .with_api_base(server.uri())
+                .with_voice_peer_resolver(Arc::new(|| vec!["123".into()]))
+                .with_send_text_with_voice_resolver(Arc::new({
+                    let live = live.clone();
+                    move || live.read().channels.telegram["test"].send_text_with_voice
+                }))
+                .with_tts(&config);
+            // Change the canonical policy after construction: a channel must
+            // not retain its initial false value through a long-lived handle.
+            live.write()
+                .channels
+                .telegram
+                .get_mut("test")
+                .unwrap()
+                .send_text_with_voice = true;
+            let answer =
+                "Here is the complete answer, retained as both readable text and a voice note.";
+            if mode == StreamMode::Off {
+                // Sender-driven routing supplies force_voice for voice peers.
+                channel
+                    .send(&SendMessage::new(answer, "123").force_voice())
+                    .await
+                    .unwrap();
+            } else {
+                let id = channel
+                    .send_draft(&SendMessage::new("...", "123"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                channel.update_draft("123", &id, answer).await.unwrap();
+                channel
+                    .finalize_draft("123", &id, answer, false)
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let requests = server.received_requests().await.unwrap();
+                    if requests
+                        .iter()
+                        .any(|r| r.url.path().ends_with("/sendVoice"))
+                    {
+                        assert!(
+                            requests.iter().any(|r| {
+                                (r.url.path().ends_with("/sendMessage")
+                                    || r.url.path().ends_with("/editMessageText"))
+                                    && String::from_utf8_lossy(&r.body).contains(answer)
+                            }),
+                            "text must accompany voice in {mode:?}"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("voice upload must complete");
+            let tts_before = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/audio/speech")
+                .count();
+            channel
+                .send(&SendMessage::new(answer, "123").suppress_voice())
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                tts_before,
+                requests
+                    .iter()
+                    .filter(|r| r.url.path() == "/v1/audio/speech")
+                    .count(),
+                "explicit text-only routing must still suppress speech"
+            );
+        }
     }
 
     /// Regression: an UNSUPPRESSED voice-only peer in MultiMessage mode must

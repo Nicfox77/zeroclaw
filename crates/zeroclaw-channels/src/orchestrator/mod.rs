@@ -13395,6 +13395,18 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
             };
             let workspace_dir = one_shot_channel_workspace_dir(&config, "telegram", &alias);
+            let send_text_with_voice_resolver = {
+                let config = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    config
+                        .read()
+                        .channels
+                        .telegram
+                        .get(&alias)
+                        .is_some_and(|channel| channel.send_text_with_voice)
+                })
+            };
             let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
@@ -13408,6 +13420,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_voice_peer_resolver(voice_peer_resolver)
+                .with_send_text_with_voice_resolver(send_text_with_voice_resolver)
                 .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
@@ -14977,6 +14990,18 @@ fn collect_configured_channels_with_authority(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let send_text_with_voice_resolver = {
+            let config = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                config
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&alias)
+                    .is_some_and(|channel| channel.send_text_with_voice)
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -14989,6 +15014,7 @@ fn collect_configured_channels_with_authority(
                         tg.mention_only,
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
+                    .with_send_text_with_voice_resolver(send_text_with_voice_resolver)
                     .with_persistence_authority(authority.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
@@ -52622,6 +52648,7 @@ This is an example JSON object for profile settings."#;
                 bot_token: "test-token".to_string(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
+                send_text_with_voice: false,
                 draft_update_interval_ms: 1000,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
@@ -52655,6 +52682,7 @@ This is an example JSON object for profile settings."#;
                 bot_token: "test-token".to_string(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
+                send_text_with_voice: false,
                 draft_update_interval_ms: 1000,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,

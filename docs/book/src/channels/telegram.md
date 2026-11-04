@@ -30,6 +30,23 @@ There is no `allowed_users` field under `[channels.telegram.<alias>]`.
 Authorization lives in [Peer Groups](./peer-groups.md); that page is the
 canonical reference for peer-group fields, matching, and multi-agent behavior.
 
+## Voice replies with text
+
+For a peer group with `output_modality = "voice"`, Telegram normally sends the
+voice note as the sole final reply. To keep the readable text alongside speech,
+enable this option on the Telegram alias:
+
+```toml
+[channels.telegram.home]
+send_text_with_voice = true
+```
+
+The agent must already have a working `tts_provider` with `[tts].enabled = true`.
+This option applies to ordinary replies, streaming replies, and per-turn voice
+routing. It is read from live channel configuration and defaults to `false`.
+Explicit text-only routing still suppresses speech. Other peers' authorization
+and voice-selection rules remain unchanged.
+
 ## 1. Create a Telegram bot
 
 1. Open [@BotFather](https://t.me/BotFather) in Telegram.
