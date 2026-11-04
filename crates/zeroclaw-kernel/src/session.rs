@@ -14,6 +14,7 @@ mod children;
 mod context;
 mod context_messages;
 mod context_summary;
+pub mod summary_deck;
 pub use context::ContextMaintenanceCommand;
 mod authority;
 mod controls;
@@ -147,6 +148,8 @@ impl EffectIntent {
 /// A coordinator owns the durable writer and only ephemeral serialization
 /// guards.  The guard map is not a second history or status source.
 pub struct SessionCoordinator {
+    /// Coordination only; durable transforms and provider results own job facts.
+    summary_deck_jobs: Mutex<HashMap<BranchId, Arc<summary_deck::SummaryJob>>>,
     store: Arc<dyn SessionEventStore>,
     search: Option<Arc<dyn zeroclaw_api::session_events::search::SessionSearchPort>>,
     stream_locks: Mutex<HashMap<SessionId, std::sync::Weak<Mutex<()>>>>,
@@ -187,6 +190,7 @@ impl SessionCoordinator {
     #[must_use]
     pub fn new(store: Arc<dyn SessionEventStore>) -> Self {
         Self {
+            summary_deck_jobs: Mutex::new(HashMap::new()),
             store,
             search: None,
             stream_locks: Mutex::new(HashMap::new()),

@@ -297,6 +297,9 @@ impl ContextSnapshot {
 
 #[async_trait::async_trait]
 pub trait ContextTransformPort: Send + Sync {
+    fn started_event_id(&self) -> Option<EventId> {
+        None
+    }
     async fn complete(&self, messages: Vec<ChatMessage>) -> anyhow::Result<()>;
     async fn complete_snapshot(&self, context: ContextSnapshot) -> anyhow::Result<()> {
         self.complete(context.chat_projection()).await
@@ -685,6 +688,12 @@ pub trait SessionExecutionPort: Send + Sync {
     /// embedding has no persisted context; corruption must propagate as Err.
     async fn restore_context(&self) -> anyhow::Result<Option<ContextSnapshot>> {
         Ok(None)
+    }
+    /// Reconcile a working projection with committed summaries before provider
+    /// dispatch. Native owners may wait for background inference at capacity.
+    /// Embeddings without a persistent session retain their existing behavior.
+    async fn prepare_context(&self, context: ContextSnapshot) -> anyhow::Result<ContextSnapshot> {
+        Ok(context)
     }
     /// Freeze input under the foreground lane, capture one maintenance provider
     /// call, and return the committed projection before releasing the lane.

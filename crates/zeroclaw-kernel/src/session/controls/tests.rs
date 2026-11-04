@@ -6,6 +6,9 @@ use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_api::session_events::capture::*;
 
+#[path = "summary_deck_tests.rs"]
+mod summary_deck_tests;
+
 struct Authority(AtomicBool);
 impl SessionAccessPolicy for Authority {
     fn authorize_actor(

@@ -376,6 +376,9 @@ impl Transform {
 }
 #[async_trait::async_trait]
 impl ContextTransformPort for Transform {
+    fn started_event_id(&self) -> Option<EventId> {
+        Some(self.started.clone())
+    }
     async fn complete(&self, messages: Vec<ChatMessage>) -> anyhow::Result<()> {
         self.complete_snapshot(ContextSnapshot {
             messages: messages
@@ -394,23 +397,24 @@ impl ContextTransformPort for Transform {
         let input_id = self.input.clone();
         let creation = self.started.clone();
         let turn = self.turn.clone();
-        let messages = snapshot.messages;
-        let (plan, preceding) = self
+        let mut snapshot = snapshot;
+        let (plan, preceding, deck, crumb) = self
             .owner
             .blocking(move || {
                 let input = owner
                     .store
                     .read_event(&input_id)?
                     .ok_or_else(|| SessionError::StaleTarget("transform input missing".into()))?;
+                let deck = super::summary_deck::reconcile(&owner, &branch, &input, &creation, &mut snapshot)?;
                 let mut plan =
-                    owner.plan_context(&branch, &input, &creation, &messages, &[], &[])?;
+                    owner.plan_context(&branch, &input, &creation, &snapshot.messages, &[], &[])?;
                 let preceding = if let Some(turn) = turn {
                     owner
                         .record_context_assistants(&stream, &branch, &turn, &creation, &mut plan)?
                 } else {
                     vec![]
                 };
-                Ok((plan, preceding))
+                Ok((plan, preceding, deck, snapshot.history_has_trim_breadcrumb))
             })
             .await?;
         let context = retry::payload(
@@ -418,7 +422,7 @@ impl ContextTransformPort for Transform {
             "context",
             "session.context/v1",
             &serde_json::json!({
-                "message_refs":plan.refs, "history_has_trim_breadcrumb":snapshot.history_has_trim_breadcrumb,
+                "message_refs":plan.refs, "history_has_trim_breadcrumb":crumb, "summary_deck":deck,
             }),
         )?;
         let mut payloads = plan.payloads;

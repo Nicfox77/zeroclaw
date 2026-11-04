@@ -22,6 +22,8 @@ use zeroclaw_kernel::session::{
 };
 mod execution_context;
 mod seed;
+mod summary_cost;
+mod summary_deck;
 pub use execution_context::execution_context_evidence;
 
 type SessionOwner = Arc<tokio::sync::Mutex<Option<Arc<SessionCoordinator>>>>;
@@ -148,7 +150,12 @@ impl NativeSessionHub {
                 "native owning agent differs"
             );
             return Ok(Arc::new(
-                EngineSession::with_actor(owner, stream, branch, subject, authority)
+                EngineSession::with_actor(owner, stream.clone(), branch, subject, authority)
+                    .with_summary_deck(Arc::new(summary_deck::Runtime {
+                        config: self.config.clone(),
+                        agent: alias,
+                        session: stream,
+                    }))
                     .with_source(Arc::new(self.clone())),
             ));
         }
@@ -156,6 +163,7 @@ impl NativeSessionHub {
         let initialize_session_id = session_id.clone();
         let creation_source = creation_source.to_owned();
         let initialize_stream = stream.clone();
+        let deck_agent = alias.clone();
         let actor = match &subject {
             EventActor::Principal { principal_id } => {
                 match authority.session_owner(&PrincipalId(principal_id.clone())) {
@@ -220,7 +228,12 @@ impl NativeSessionHub {
             .await?;
         *session_owner = Some(Arc::clone(&owner));
         Ok(Arc::new(
-            EngineSession::with_actor(owner, stream, branch, subject, authority)
+            EngineSession::with_actor(owner, stream.clone(), branch, subject, authority)
+                .with_summary_deck(Arc::new(summary_deck::Runtime {
+                    config: self.config.clone(),
+                    agent: deck_agent,
+                    session: stream,
+                }))
                 .with_source(Arc::new(self.clone())),
         ))
     }

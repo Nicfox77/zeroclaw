@@ -1,5 +1,72 @@
 # History management
 
+## Optional asynchronous summary deck
+
+Native sessions can retain recent verbatim turns plus a rotating deck of older
+summaries. This policy is independent of permanent history: original messages,
+tool exchanges, identities and timestamps remain in the append-only session
+store when either raw context or an old summary leaves the provider request.
+
+Enable it on the runtime profile used by your agent:
+
+```toml
+[runtime_profiles.personal.summary_deck]
+enabled = true
+summary_share = 0.15
+trigger_ratio = 0.8
+max_summary_tokens = 1000
+timeout_secs = 60
+# Optional configured model-provider alias; otherwise use the session route.
+# provider = "openai.summarizer"
+```
+
+The default is disabled. Existing `max_context_tokens` and
+`context_compact_ratio` remain the overall budget controls. An explicit zero
+token budget disables automatic deck maintenance as well. Keep
+`max_history_messages` at four or more when enabling the deck.
+
+The implementation reserves 15% of the resolved input target for request
+overhead, then subtracts the current system messages. `summary_share` divides
+the remaining estimated token allowance between summaries and recent history.
+Summarization starts at `trigger_ratio` of the recent-history allowance, or
+the corresponding fraction of the whole-turn limit. Estimates use roughly
+four characters per token; provider capacity enforcement remains authoritative.
+
+One background job per session branch freezes an older range of completed
+turns, preserving the two newest turns and their complete tool exchanges.
+Inference runs without holding a SQLite transaction or the foreground turn
+lane. Oversized source ranges are split into bounded inference chunks without
+discarding their original messages. The generated summary is bounded and
+checked against its captured provider result before publication. The oldest
+cards leave the deck when its token allocation fills. Cards do not recursively
+fold the entire old deck into every new summary.
+
+Normal requests continue while inference runs. At the recent-context or turn
+limit, context preparation waits for the pending job. A failed, empty,
+oversized, unavailable or unauthorized summary never authorizes deleting the
+raw source. A protected turn that cannot fit still fails the normal capacity
+guard; an unlimited logical conversation does not enlarge a model's physical
+context window. Summaries are lower-trust assistant context, never system
+instructions, approvals or long-term-memory writes.
+
+Source identities, captured inference output and the installed deck are
+durable session facts. A process crash cancels an unfinished local transform
+during normal session recovery; originals remain available and a subsequent
+request can schedule fresh summarization. It does not replay a provider or
+tool effect. A completed deck survives restart without regenerating it.
+Live policy and read/effect permissions are rechecked before publication.
+
+Summaries incur additional model calls. Their provider attempts are captured
+in session history and ordinary completed/failed attempt usage is recorded
+against the agent and session in the existing cost ledger. The foreground
+response's context meter still describes that response, not background usage.
+
+Turning the policy off stops new automatic summaries and retains the currently
+committed working context. Original history remains readable. Roll back the
+feature on the same native history foundation; reverting the foundation's
+one-way storage migration requires restoring its pre-migration backup, as
+described in [session events](../architecture/session-events.md).
+
 The runtime keeps conversation history for each agent session and sends a
 provider-facing working history to the model. Two complementary limits operate
 on different representations:

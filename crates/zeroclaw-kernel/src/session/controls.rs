@@ -359,7 +359,7 @@ impl EngineSession {
             .await?;
         let context = PayloadRecord::json(
             "session.context/v1",
-            &serde_json::json!({"message_refs":plan.refs,"history_has_trim_breadcrumb":snapshot.history_has_trim_breadcrumb}),
+            &serde_json::json!({"message_refs":plan.refs,"history_has_trim_breadcrumb":snapshot.history_has_trim_breadcrumb,"summary_deck":plan.summary_deck}),
         )?;
         let mut payloads = plan.payloads;
         payloads.extend([
@@ -653,7 +653,7 @@ impl EngineSession {
         let context = PayloadRecord::json(
             "session.context/v1",
             &serde_json::json!({
-                "message_refs":plan.refs, "history_has_trim_breadcrumb":snapshot.history_has_trim_breadcrumb,
+                "message_refs":plan.refs, "history_has_trim_breadcrumb":snapshot.history_has_trim_breadcrumb, "summary_deck":plan.summary_deck,
             }),
         )?;
         let mut projection = SessionEvent::typed(

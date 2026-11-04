@@ -14558,6 +14558,7 @@ dependencies = [
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-kernel",
+ "zeroclaw-providers",
 ]
 
 [[package]]

@@ -114,6 +114,14 @@ Restoring an old transcript writer is not a rollback. See
 
 ## Backup and restore
 
+The optional runtime-profile `summary_deck` policy stores generated cards and
+their source references in canonical `ContextProjectionCreated` payloads. Its
+in-process single-flight map coordinates workers only; it is neither a second
+history store nor a live-policy cache. `zeroclaw-kernel::session::summary_deck`
+owns selection and publication; `zeroclaw-session-host` supplies live policy and
+provider composition for Web and channel sessions. Native recovery cancels
+unfinished jobs without discarding their original source history.
+
 For a normal single-instance install, back up the whole `<install>` directory.
 At minimum, include:
 
