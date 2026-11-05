@@ -36,6 +36,92 @@ mcp_bundles = ["files"]   # connects to `filesystem`; an agent without this gets
 
 This is the *connection* boundary (which servers an agent talks to at all). The `allowed_tools` / `excluded_tools` controls below are the per-tool *capability* boundary applied on top of whatever a granted server exposes.
 
+## Local configuration control bridge
+
+The optional Unix/Python stdio server at
+`scripts/mcp/config_control.py` lets an explicitly granted agent manage this
+installation through the existing gateway configuration API. It adds no
+runtime configuration writer: the gateway remains responsible for validation,
+atomic commits, encrypted credential persistence, publication and reload status.
+The bridge's connection URL selects the gateway to administer; update that
+argument if the gateway's address or path prefix changes.
+
+The script uses Python's standard library and needs no pip packages. It is
+separate from the Cargo binary: copy it to a stable local application directory,
+or keep its checkout path available, before configuring the MCP command.
+
+It exposes `list`, `get`, `create_alias`, `set`, `patch`, `status` and `reload`, namespaced by
+the MCP server name. Reads use the API's masked property metadata. Mutations
+return saved paths rather than submitted values. `patch` accepts the gateway's
+`add`, `replace`, `remove` and `test` operations, using dotted paths or JSON
+Pointers. A `test` operation can protect a read-modify-write change from a
+concurrent editor. Use `create_alias` to create a named MCP server or another
+entry that requires the gateway's explicit map-key operation before setting
+its fields. Lost mutation responses are reported as uncertain and are
+never retried automatically; read the current value before deciding what to do.
+
+Create a dedicated paired device using the existing gateway pairing controls,
+then store its bearer token in an owner-only regular file outside the repository
+(mode `0600`). Do not paste it into chat, command arguments or the MCP server's
+configuration. Configure the server and grant its bundle only to the intended
+administrative agent; merge the bundle into any existing grants:
+
+```toml
+[[mcp.servers]]
+name = "config_control"
+transport = "stdio"
+command = "python3"
+args = [
+  "/path/to/zeroclaw/scripts/mcp/config_control.py",
+  "--gateway-url", "http://127.0.0.1:42617",
+  "--token-file", "/private/config-control.token",
+  "--state-dir", "/private/config-control-state",
+]
+tool_timeout_secs = 60
+
+[mcp_bundles.config_admin]
+servers = ["config_control"]
+
+[agents.assistant]
+mcp_bundles = ["config_admin"]
+```
+
+The endpoint must use an explicit loopback IP and port; proxy environment
+variables and HTTP redirects are disabled. Token material is read from its
+private file on each API call, so rotating the file does not require a bridge
+restart. The token is an administrative credential: access to this MCP bundle
+grants configuration authority, including the ability to change permissions.
+Omitting the bundle grants no connection, but bounded delegates can inherit
+parent tools. Exclude `config_control__list`, `config_control__get`,
+`config_control__create_alias`, `config_control__set`, `config_control__patch`, `config_control__status` and
+`config_control__reload` from worker risk profiles when the parent has this
+bundle; independent workers
+should also receive no administrative bundle. Tool allowlists/denylists use
+the normal MCP capability rules below.
+
+Saving and applying are separate. `status` reports the gateway's canonical
+application/reload status. `reload` starts a local worker outside the MCP call,
+which waits for all native sessions to remain idle for 15 seconds, then requests
+`POST /admin/reload`. This gives the requesting turn time to finish. Idle
+detection requires native persistent sessions and does not prove that every
+outbound voice delivery has completed; clients can still reconnect during
+reload. Requests fail after five minutes without an idle window. Request
+records in `--state-dir` describe waiting, failure or accepted reload requests;
+they do not assert that every subsystem applied every setting. Workers are not
+resumed automatically after a process or machine restart.
+
+After installing the bridge, reload the daemon and reconnect the affected
+session to initialize its MCP tools. Example requests are "show your current
+context settings" or "set this runtime profile's history limit to 200, read it
+back, and reload after replying." Agent aliases remain operator-defined;
+use `list` to discover the actual paths.
+
+To roll back, remove the bundle from the agent and reload, revoke only this
+bridge's paired device, and remove its local token file. Changes already saved
+through the tool remain saved. Restore individual values through the usual
+config controls if needed. Test the bridge without external services using
+`python3 scripts/mcp/config_control_test.py`.
+
 ## Transports
 
 A server is reached over one of three transports (the `transport` field):
