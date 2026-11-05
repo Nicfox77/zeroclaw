@@ -54,14 +54,15 @@ impl SessionCoordinator {
         creation: &EventId,
         plan: &mut ContextPlan,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        let history = self.stream_history(stream)?;
         let mut provenance_refs = Vec::new();
         let mut provider_parts = Vec::new();
         let mut provider_text = String::new();
-        if let Some(event) = history.iter().rev().find(|event| {
-            event.turn_id.as_ref() == Some(turn)
-                && event.body.kind() == EventKind::ProviderAttemptCompleted
-        }) {
+        if let Some(event) = self.store.read_latest_event(
+            stream,
+            branch,
+            Some(turn),
+            &EventKind::ProviderAttemptCompleted,
+        )? {
             let EventData::ProviderAttemptCompleted { response_ref, .. } = &event.body.data else {
                 return Err(SessionError::InvocationMismatch);
             };
@@ -196,9 +197,26 @@ impl SessionCoordinator {
                 input.sequence,
             ));
         }
-        let mut history = self.stream_history(stream)?;
+        let head = self.store.head(stream)?;
         let lineage =
-            lineage::frozen_lineage(&history, stream, branch, self.store.head(stream)?.sequence)?;
+            lineage::read_frozen_lineage(self.store.as_ref(), stream, branch, head.sequence)?;
+        // The input projection already owns every retained identity. Only
+        // content committed after it can add candidates for this transform.
+        let mut after = EventCursor {
+            session_id: stream.clone(),
+            sequence: input.sequence,
+        };
+        let mut history = Vec::new();
+        loop {
+            let page = self.store.read_page(stream, &after, Some(&head), 256)?;
+            if let Some(last) = page.events.last() {
+                after.sequence = last.sequence;
+            }
+            history.extend(page.events);
+            if !page.has_more {
+                break;
+            }
+        }
         history.extend_from_slice(extra);
         for event in &history {
             if !lineage::includes(&lineage, event)
@@ -278,14 +296,27 @@ impl SessionCoordinator {
         let mut used = HashSet::new();
         let mut refs = Vec::new();
         let mut payloads = Vec::new();
+        let mut matching =
+            std::collections::HashMap::<&[u8], std::collections::VecDeque<&MessageRef>>::new();
+        for (bytes, item, _) in &candidates {
+            matching
+                .entry(bytes.as_slice())
+                .or_default()
+                .push_back(item);
+        }
         for (index, message) in messages.iter().enumerate() {
             let value =
                 serde_json::to_value(message).map_err(|e| ReadError::Corrupt(e.to_string()))?;
             let bytes = canonical_json(&value).map_err(AppendError::from)?;
-            if let Some((_, item, _)) = candidates
-                .iter()
-                .find(|(body, item, _)| *body == bytes && !used.contains(&item.message_id))
-            {
+            let matching_item = matching.get_mut(bytes.as_slice()).and_then(|queue| {
+                while let Some(item) = queue.pop_front() {
+                    if !used.contains(&item.message_id) {
+                        return Some(item);
+                    }
+                }
+                None
+            });
+            if let Some(item) = matching_item {
                 used.insert(item.message_id.clone());
                 refs.push(item.clone());
             } else {
@@ -312,13 +343,13 @@ impl SessionCoordinator {
         // supply several items: mark it included if any item is retained, never
         // emit contradictory dispositions for the same event coordinate.
         let mut coordinates = std::collections::BTreeMap::new();
-        for (_, item, sequence) in candidates {
-            if sequence == 0 {
+        for (_, item, sequence) in &candidates {
+            if *sequence == 0 {
                 continue;
             }
             let included = used.contains(&item.message_id);
             coordinates
-                .entry(sequence)
+                .entry(*sequence)
                 .and_modify(|keep| *keep |= included)
                 .or_insert(included);
         }
