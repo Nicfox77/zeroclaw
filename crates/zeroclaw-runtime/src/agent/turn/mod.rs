@@ -104,78 +104,15 @@ use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
-/// The injector's exact raw-history position, carried through prefix trims.
-#[derive(Clone)]
-pub struct MemoryPreamble {
-    pub preamble: String,
-    pub index: usize,
-}
-
-fn retention_layout(history: &[ChatMessage], crumb: bool) -> (usize, usize, bool) {
-    (
-        history.len(),
-        history
-            .iter()
-            .take_while(|message| message.role == "system")
-            .count(),
-        crumb,
-    )
-}
-
-fn remap_memory_after_trim(
-    injected: &mut Option<MemoryPreamble>,
-    before: (usize, usize, bool),
-    history: &[ChatMessage],
-    crumb: bool,
-) {
-    let inserted = usize::from(crumb && !before.2);
-    let dropped = before
-        .0
-        .saturating_add(inserted)
-        .saturating_sub(history.len());
-    let start = before.1 + usize::from(before.2);
-    if let Some(target) = injected {
-        if (start..start.saturating_add(dropped)).contains(&target.index) {
-            *injected = None;
-        } else if target.index >= start {
-            target.index = target
-                .index
-                .saturating_sub(dropped)
-                .saturating_add(inserted);
-        }
-    }
-}
-
 pub(crate) fn retained_context_snapshot(
-    injected: &Option<MemoryPreamble>,
     history: &[ChatMessage],
     breadcrumb: bool,
-) -> zeroclaw_api::agent::RetainedContextSnapshot {
-    retained_context_snapshot_with_memory(
-        history,
-        breadcrumb,
-        injected
-            .as_ref()
-            .map(|target| (target.preamble.as_str(), target.index)),
-    )
-}
-
-pub(crate) fn retained_context_snapshot_with_memory(
-    history: &[ChatMessage],
-    breadcrumb: bool,
-    injected: Option<(&str, usize)>,
 ) -> zeroclaw_api::agent::RetainedContextSnapshot {
     zeroclaw_api::agent::RetainedContextSnapshot {
         // Reuse the Agent's canonical replay path so native tool calls/results
         // stay typed and the owner-tracked memory provenance is honored by the
         // caller that has it. This is deliberately not a role-only projection.
-        retained_messages: injected
-            .map_or_else(
-                || crate::agent::Agent::replay_loop_messages_for_retention(history),
-                |(preamble, index)| {
-                    crate::agent::Agent::replay_loop_messages_with_memory(history, preamble, index)
-                },
-            )
+        retained_messages: crate::agent::Agent::replay_loop_messages_for_retention(history)
             .into_iter()
             .filter(|message| {
                 !matches!(
@@ -889,18 +826,6 @@ pub struct ToolLoop<'a> {
     /// locale changes for the runtime's lifetime. Trim paths write back any
     /// crumb they insert through this reference.
     pub history_has_trim_breadcrumb: &'a mut bool,
-    /// Out-param the loop writes through when it injects a recalled-memory
-    /// preamble onto the last user message for this turn's provider request
-    /// only: the exact rendered block. Write-back strips that block solely
-    /// from the injected message's position in the mutated history buffer —
-    /// pre-injection canonical clones are replayed with no strip target, so
-    /// a genuine user text starting with the same block survives
-    /// byte-for-byte. The exact string (this turn's literal rendered
-    /// content, never a generic marker pattern) is what confirms the
-    /// recorded position still holds the injected message, following the
-    /// same recorded-not-inferred principle as
-    /// `history_has_trim_breadcrumb`.
-    pub injected_memory_preamble: &'a mut Option<MemoryPreamble>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -1173,7 +1098,6 @@ fn record_dispatch_trim(
 /// actual prepared request. Raw-history estimates cannot decide how many
 /// prepared turns fit, especially after hooks or multimodal expansion.
 async fn capture_oversized_dispatch_trim(
-    injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     crumb_present: &mut bool,
     reported_tokens: u64,
@@ -1197,13 +1121,8 @@ async fn capture_oversized_dispatch_trim(
     } else {
         None
     };
-    let result = surface_oversized_dispatch_if_needed(
-        injected_memory_preamble,
-        history,
-        crumb_present,
-        reported_tokens,
-        budget,
-    );
+    let result =
+        surface_oversized_dispatch_if_needed(history, crumb_present, reported_tokens, budget);
     if let Some(capture) = capture {
         if result.dropped_messages > 0 {
             capture
@@ -1225,13 +1144,11 @@ async fn capture_oversized_dispatch_trim(
 }
 
 fn surface_oversized_dispatch_if_needed(
-    injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     crumb_present: &mut bool,
     measured_population: u64,
     context_token_budget: usize,
 ) -> PreDispatchTrimResult {
-    let before = retention_layout(history, *crumb_present);
     let outcome;
     let mut dropped_messages = 0;
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
@@ -1247,7 +1164,6 @@ fn surface_oversized_dispatch_if_needed(
             outcome = PreDispatchOutcome::Trimmed;
         }
     }
-    remap_memory_after_trim(injected_memory_preamble, before, history, *crumb_present);
     PreDispatchTrimResult {
         outcome,
         dropped_messages,
@@ -1258,7 +1174,6 @@ fn surface_oversized_dispatch_if_needed(
 
 #[allow(clippy::too_many_arguments)]
 async fn enforce_reported_budget(
-    injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
     // Estimated token count of the exact message population that produced
@@ -1315,7 +1230,6 @@ async fn enforce_reported_budget(
         return;
     }
     let pre_trim_estimated = reported_population_estimated;
-    let retention_before = retention_layout(history, *crumb_present);
     let taken_had_crumb = *crumb_present;
     let taken = std::mem::take(history);
     let taken_len = taken.len();
@@ -1478,12 +1392,6 @@ async fn enforce_reported_budget(
             zeroclaw_api::agent::TokenCountSource::Calibrated,
         );
         *history = trimmed;
-        remap_memory_after_trim(
-            injected_memory_preamble,
-            retention_before,
-            history,
-            *crumb_present,
-        );
         if let Some(tx) = event_tx {
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
@@ -1501,11 +1409,7 @@ async fn enforce_reported_budget(
                     tokens_before_source: Some(tokens_before_source),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                     unsatisfiable_floor: None,
-                    retained_context: Some(retained_context_snapshot(
-                        injected_memory_preamble,
-                        history,
-                        *crumb_present,
-                    )),
+                    retained_context: Some(retained_context_snapshot(history, *crumb_present)),
                 })
                 .await;
         }
@@ -1815,7 +1719,7 @@ async fn run_tool_call_loop_inner<'a>(
         exec,
         history: raw_history,
         history_has_trim_breadcrumb,
-        injected_memory_preamble,
+
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -1902,7 +1806,7 @@ async fn run_tool_call_loop_inner<'a>(
     turn_state.sync_pending();
 
     // Session-owned maintenance is shared by Web, channel and Agent callers.
-    // Run before recalled memory is injected so it never becomes transcript.
+    // Previously retained recall observations participate in normal rotation.
     if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution() {
         let prepared = port
             .prepare_context(zeroclaw_api::session_events::capture::ContextSnapshot {
@@ -1979,15 +1883,12 @@ async fn run_tool_call_loop_inner<'a>(
             has_session,
             turn_memory.suppress,
         ) && let Some(last_user_idx) = turn_state.history.iter().rposition(|m| m.role == "user")
-            // Idempotence: a model-switch retry re-enters the engine with the
-            // same history; the preamble must not stack.
-            && !turn_state.history[last_user_idx]
-                .content
-                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+            // A retry reuses the typed observation, never a marker parsed from user text.
+            && turn_state.history[last_user_idx].recalled_memory.is_none()
         {
             let scopes: Vec<Option<&str>> =
                 turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
-            let context = crate::agent::memory_inject::render_memory_context(
+            let context = crate::agent::memory_inject::recall_memory_context(
                 turn_memory.handle,
                 observer,
                 &turn_memory.query,
@@ -2000,15 +1901,26 @@ async fn run_tool_call_loop_inner<'a>(
                     turn_id,
                     channel_name,
                 },
+                turn_state.history,
             )
             .await;
-            if !context.is_empty() {
-                let existing = &turn_state.history[last_user_idx].content;
-                turn_state.history[last_user_idx].content = format!("{context}{existing}");
-                *injected_memory_preamble = Some(MemoryPreamble {
-                    preamble: context,
-                    index: last_user_idx,
-                });
+            if !context.entries.is_empty() {
+                // Keep the canonical current-turn delta and its request view in
+                // sync. Historical messages and earlier recall snapshots are unchanged.
+                if let Some(canonical) = &mut turn_state.canonical
+                    && let Some(current) = canonical
+                        .iter_mut()
+                        .rev()
+                        .find(|message| message.role == "user")
+                {
+                    let input = &turn_state.history[last_user_idx];
+                    anyhow::ensure!(
+                        current.content == input.content && current.timestamp == input.timestamp,
+                        "recalled_memory_input_mismatch"
+                    );
+                    current.recalled_memory = Some(context.clone());
+                }
+                turn_state.history[last_user_idx].recalled_memory = Some(context);
             }
         }
     }
@@ -2217,7 +2129,6 @@ async fn run_tool_call_loop_inner<'a>(
                         None => (None, None),
                     };
                     let summary_result = finish_after_max_iterations(
-                        injected_memory_preamble,
                         model_provider,
                         turn_state.history,
                         provider_name,
@@ -2631,7 +2542,6 @@ async fn run_tool_call_loop_inner<'a>(
         // floor is fatal only when the rebuilt request exceeds model capacity.
         // A newest turn above the proactive target can still be dispatched.
         let mut trim_result = capture_oversized_dispatch_trim(
-            injected_memory_preamble,
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
@@ -2736,7 +2646,6 @@ async fn run_tool_call_loop_inner<'a>(
                 let before_len = turn_state.history.len();
                 let before_crumb = turn_state.crumb_present;
                 trim_result = capture_oversized_dispatch_trim(
-                    injected_memory_preamble,
                     turn_state.history,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
@@ -2782,7 +2691,6 @@ async fn run_tool_call_loop_inner<'a>(
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: exceeds_model_window.then_some(true),
                         retained_context: Some(retained_context_snapshot(
-                            injected_memory_preamble,
                             turn_state.history,
                             turn_state.crumb_present,
                         )),
@@ -2825,7 +2733,6 @@ async fn run_tool_call_loop_inner<'a>(
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: Some(true),
                         retained_context: Some(retained_context_snapshot(
-                            injected_memory_preamble,
                             turn_state.history,
                             turn_state.crumb_present,
                         )),
@@ -3164,7 +3071,6 @@ async fn run_tool_call_loop_inner<'a>(
                 emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
-                    injected_memory_preamble,
                     turn_state.history,
                     &e,
                     iteration,
@@ -3458,7 +3364,6 @@ async fn run_tool_call_loop_inner<'a>(
                 // modifying `before_llm_call` hook merely to estimate a request
                 // that will never be sent.
                 Box::pin(enforce_reported_budget(
-                    injected_memory_preamble,
                     turn_state.history,
                     reported as usize,
                     reported_population_estimated,
@@ -3958,7 +3863,6 @@ async fn run_tool_call_loop_inner<'a>(
         None => (None, None),
     };
     let summary_result = finish_after_max_iterations(
-        injected_memory_preamble,
         model_provider,
         turn_state.history,
         provider_name,
@@ -4887,7 +4791,7 @@ async fn drive_live_sop_actions(
                             // future is built inside the run-attribution scope and
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
-                            let mut nested_memory_preamble: Option<MemoryPreamble> = None;
+
                             let step_result = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
@@ -4972,7 +4876,7 @@ async fn drive_live_sop_actions(
                                     ),
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
-                                    injected_memory_preamble: &mut nested_memory_preamble,
+
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
@@ -5540,7 +5444,6 @@ mod reported_budget_tests {
     // below calls the production function with an explicit turn identity.
     #[allow(clippy::too_many_arguments)]
     async fn enforce_reported_budget(
-        injected_memory_preamble: &mut Option<MemoryPreamble>,
         history: &mut Vec<ChatMessage>,
         reported_input_tokens: usize,
         reported_population_estimated: usize,
@@ -5556,7 +5459,6 @@ mod reported_budget_tests {
         crumb_present: &mut bool,
     ) {
         super::enforce_reported_budget(
-            injected_memory_preamble,
             history,
             reported_input_tokens,
             reported_population_estimated,
@@ -5616,7 +5518,6 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let observer = TrimObserver::default();
         super::enforce_reported_budget(
-            &mut None,
             &mut history,
             estimated * 4,
             estimated,
@@ -5654,7 +5555,6 @@ mod reported_budget_tests {
         let reported = estimated * 4;
         let budget = reported / 2;
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5691,7 +5591,6 @@ mod reported_budget_tests {
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             estimated,
             estimated,
@@ -5721,7 +5620,6 @@ mod reported_budget_tests {
         // model's 100-token context budget and must not trim history.
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             80,
             estimated,
@@ -5750,7 +5648,6 @@ mod reported_budget_tests {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         enforce_reported_budget(
-            &mut None,
             &mut history,
             usize::MAX,
             usize::MAX,
@@ -5778,7 +5675,6 @@ mod reported_budget_tests {
         let budget = reported / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5842,7 +5738,6 @@ mod reported_budget_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5940,7 +5835,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             prepared_estimated,
@@ -6028,7 +5922,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6103,7 +5996,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6172,7 +6064,6 @@ mod reported_budget_tests {
         let budget = estimated / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6249,7 +6140,6 @@ mod reported_budget_tests {
         let taken: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6315,7 +6205,6 @@ mod reported_budget_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut crumb_present = false;
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6462,7 +6351,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6552,7 +6440,6 @@ mod reported_budget_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6645,7 +6532,6 @@ mod trim_budget_tests {
         let mut crumb_present = false;
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         let result = surface_oversized_dispatch_if_needed(
-            &mut None,
             &mut history,
             &mut crumb_present,
             tokens_before as u64,
@@ -6658,7 +6544,6 @@ mod trim_budget_tests {
             "the breadcrumb itself must push the kept history over budget ({final_tokens} > {budget})"
         );
         let floor = surface_oversized_dispatch_if_needed(
-            &mut None,
             &mut history,
             &mut crumb_present,
             final_tokens as u64,
@@ -6790,7 +6675,6 @@ mod active_route_context_tests {
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         assert!(tokens_before < text_limits.context_token_budget);
         let trim = surface_oversized_dispatch_if_needed(
-            &mut None,
             &mut history,
             &mut false,
             tokens_before as u64,
@@ -7227,7 +7111,7 @@ vision_model_provider = "custom.vision"
             ),
             history: &mut history,
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8362,7 +8246,7 @@ mod sop_step_reassembly_tests {
             on_delta: None,
             shared_budget: Some(budget),
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel: None,
             collected_receipts: None,
             event_tx: None,
@@ -10635,7 +10519,7 @@ mod tool_lifecycle_abandonment_tests {
         image_cache: Option<ToolLoopImageState<'_>>,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
-        let mut injected_preamble = None;
+
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -10676,7 +10560,7 @@ mod tool_lifecycle_abandonment_tests {
             },
             history,
             history_has_trim_breadcrumb: &mut crumb_present,
-            injected_memory_preamble: &mut injected_preamble,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token,

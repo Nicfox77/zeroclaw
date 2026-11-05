@@ -1595,6 +1595,7 @@ impl LegacyAcpStore {
                     tool_calls: Vec::new(),
                     tool_result: None,
                     reasoning_content: None,
+                    recalled_memory: None,
                 }));
                 if !outs.is_empty() {
                     out.push(ConversationMessage::ToolResults(outs));
@@ -2023,6 +2024,7 @@ impl LegacyAcpStore {
                         tool_calls: Vec::new(),
                         tool_result: None,
                         reasoning_content: None,
+                        recalled_memory: None,
                         role: SYNTHETIC_INTERRUPTION_ROLE.to_string(),
                         content: chat.content.clone(),
 
@@ -3248,6 +3250,7 @@ impl ProjectedGroup {
                     tool_calls: Vec::new(),
                     tool_result: None,
                     reasoning_content: None,
+                    recalled_memory: None,
                     role: if self.role == SYNTHETIC_INTERRUPTION_ROLE {
                         "system".to_string()
                     } else {
@@ -3270,6 +3273,7 @@ impl ProjectedGroup {
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
+                recalled_memory: None,
                 role: "assistant".to_string(),
                 content: self.content.clone(),
                 attachments: self.attachments.clone(),

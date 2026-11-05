@@ -1047,11 +1047,6 @@ pub async fn agent_turn(
     // instead of being inferred from localized text. Set to true when a trim
     // path inserts a crumb during the turn.
     history_has_trim_breadcrumb: &mut bool,
-    // Out-param the loop writes through when it injects a recalled-memory
-    // preamble onto the last user message: the exact byte length injected,
-    // so the caller can strip precisely that block before persisting —
-    // see `ToolLoop::injected_memory_preamble`.
-    injected_memory_preamble: &mut Option<super::turn::MemoryPreamble>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -1084,7 +1079,6 @@ pub async fn agent_turn(
         model_provider,
         history,
         history_has_trim_breadcrumb,
-        injected_memory_preamble,
         tools_registry,
         observer,
         provider_name,
@@ -1127,7 +1121,6 @@ async fn agent_turn_with_sop_reassembly(
     // Authoritative breadcrumb provenance for `history` — see `agent_turn`.
     history_has_trim_breadcrumb: &mut bool,
     // See `agent_turn`.
-    injected_memory_preamble: &mut Option<super::turn::MemoryPreamble>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -1215,7 +1208,7 @@ async fn agent_turn_with_sop_reassembly(
         sop_reassembly,
         capability_binding,
         history_has_trim_breadcrumb,
-        injected_memory_preamble,
+
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
@@ -1310,8 +1303,8 @@ async fn agent_turn_with_sop_reassembly(
 pub(crate) use super::turn::StreamCancelledAfterOutput;
 pub use super::turn::{
     ContextLimitsResolver, DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior,
-    MemoryPreamble, ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS,
-    ProgressEvent, REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent,
+    REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
     ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
     THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
     is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
@@ -2809,7 +2802,7 @@ async fn run_inner(
                                 ),
                                 history: &mut history,
                                 history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
-                                injected_memory_preamble: &mut None,
+
                                 channel_name,
                                 channel_reply_target: None,
                                 cancellation_token: None,
@@ -3594,7 +3587,7 @@ async fn run_inner(
                                     history: &mut history,
                                     history_has_trim_breadcrumb:
                                         &mut history_has_trim_breadcrumb,
-                                    injected_memory_preamble: &mut None,
+
                                     channel_name,
                                     channel_reply_target: None,
                                     cancellation_token: Some(cancel_token.clone()),
@@ -4855,7 +4848,6 @@ async fn process_message_inner(
                     model_provider.as_ref(),
                     &mut history,
                     &mut history_has_trim_breadcrumb,
-                    &mut None,
                     &tools_registry,
                     observer.as_ref(),
                     &model_provider_ref,
@@ -6823,7 +6815,7 @@ mod tests {
             },
             history: &mut history,
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "sop",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7073,7 +7065,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -7505,7 +7497,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7595,7 +7587,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7713,7 +7705,7 @@ mod tests {
             history: &mut history,
             // Test transcript starts fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7857,7 +7849,7 @@ mod tests {
                 )]);
             let mut history = vec![original.clone()];
             let mut history_has_trim_breadcrumb = false;
-            let mut injected_memory_preamble = None;
+
             let observer = NoopObserver;
             let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
@@ -7902,7 +7894,7 @@ mod tests {
                 },
                 history: &mut history,
                 history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
-                injected_memory_preamble: &mut injected_memory_preamble,
+
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -7997,7 +7989,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8094,7 +8086,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8187,7 +8179,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8272,7 +8264,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8360,7 +8352,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8435,7 +8427,7 @@ mod tests {
                 history: &mut history,
                 // Test transcripts start fresh: no prior trim, no crumb.
                 history_has_trim_breadcrumb: &mut false,
-                injected_memory_preamble: &mut None,
+
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -8586,7 +8578,7 @@ mod tests {
         async fn run_case(
             mem: &dyn zeroclaw_memory::Memory,
             origin: zeroclaw_api::ingress::TurnOrigin,
-        ) -> (String, Vec<(Option<String>, bool)>) {
+        ) -> (ChatMessage, Vec<(Option<String>, bool)>) {
             let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
             let mut history = vec![ChatMessage::user("what server?".to_string())];
             let tools_registry =
@@ -8633,7 +8625,7 @@ mod tests {
                 history: &mut history,
                 // Test transcripts start fresh: no prior trim, no crumb.
                 history_has_trim_breadcrumb: &mut false,
-                injected_memory_preamble: &mut None,
+
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -8662,8 +8654,8 @@ mod tests {
             let user_msg = history
                 .iter()
                 .find(|m| m.role == "user")
-                .map(|m| m.content.clone())
-                .unwrap_or_default();
+                .cloned()
+                .expect("user retained");
             let recalls = observer
                 .recalls
                 .lock()
@@ -8679,9 +8671,13 @@ mod tests {
             zeroclaw_api::ingress::TurnOrigin::Interactive,
         )
         .await;
-        assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN));
-        assert!(msg.contains("remembered: the server is prod-3"));
-        assert!(msg.ends_with("what server?"));
+        assert_eq!(msg.content, "what server?");
+        assert!(
+            msg.recalled_memory
+                .expect("recall annotation")
+                .render()
+                .contains("remembered: the server is prod-3")
+        );
         assert_eq!(recalls.len(), 1);
         assert!(recalls[0].1, "recall event must report success");
 
@@ -8691,7 +8687,8 @@ mod tests {
             zeroclaw_api::ingress::TurnOrigin::SubTurn,
         )
         .await;
-        assert_eq!(msg, "what server?");
+        assert_eq!(msg.content, "what server?");
+        assert!(msg.recalled_memory.is_none());
         assert!(recalls.is_empty(), "sub-turns must not recall memory");
 
         // Failing backend: turn proceeds bare, one failure event.
@@ -8700,7 +8697,8 @@ mod tests {
             zeroclaw_api::ingress::TurnOrigin::Interactive,
         )
         .await;
-        assert_eq!(msg, "what server?");
+        assert_eq!(msg.content, "what server?");
+        assert!(msg.recalled_memory.is_none());
         assert_eq!(recalls.len(), 1);
         assert!(!recalls[0].1, "recall event must report failure");
     }
@@ -8766,7 +8764,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8853,7 +8851,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8945,7 +8943,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9116,7 +9114,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9286,7 +9284,7 @@ mod tests {
             },
             history: &mut history,
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9424,7 +9422,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "agent",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9696,7 +9694,7 @@ mod tests {
             let pacing = zeroclaw_config::schema::PacingConfig::default();
             let knobs = LoopKnobs::default();
             let mut history_has_trim_breadcrumb = false;
-            let mut injected_memory_preamble = None;
+
             let turn = run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 served_route_sink: None,
@@ -9736,7 +9734,7 @@ mod tests {
                 history: &mut history,
                 // Test transcripts start fresh: no prior trim, no crumb.
                 history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
-                injected_memory_preamble: &mut injected_memory_preamble,
+
                 channel_name: "agent",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -9991,7 +9989,6 @@ mod tests {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let knobs = LoopKnobs::default();
         let mut history_has_trim_breadcrumb = false;
-        let mut injected_memory_preamble = None;
 
         let run = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
@@ -10031,7 +10028,7 @@ mod tests {
             },
             history: &mut history,
             history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
-            injected_memory_preamble: &mut injected_memory_preamble,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10187,7 +10184,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10373,7 +10370,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: Some(token.clone()),
@@ -10491,7 +10488,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -10593,7 +10590,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -10687,7 +10684,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "lark",
             channel_reply_target: Some("chat-99"),
             cancellation_token: None,
@@ -10789,7 +10786,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "feishu",
             channel_reply_target: Some("chat-77"),
             cancellation_token: None,
@@ -10894,7 +10891,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11009,7 +11006,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11112,7 +11109,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11299,7 +11296,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -11445,7 +11442,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -11565,7 +11562,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -11667,7 +11664,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11773,7 +11770,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11881,7 +11878,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12007,7 +12004,7 @@ mod tests {
                         },
                         history: &mut history,
                         history_has_trim_breadcrumb: &mut false,
-                        injected_memory_preamble: &mut None,
+
                         channel_name: "cli",
                         channel_reply_target: None,
                         cancellation_token: None,
@@ -12107,7 +12104,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12207,7 +12204,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12300,7 +12297,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12391,7 +12388,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12488,7 +12485,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12612,7 +12609,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12742,7 +12739,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12860,7 +12857,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12971,7 +12968,6 @@ mod tests {
             agent_alias: None,
             turn_id: &turn_id,
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
         })
         .await
         .expect_err("visible stream failure must remain an interruption error");
@@ -13056,7 +13052,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13139,7 +13135,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13223,7 +13219,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13307,7 +13303,7 @@ mod tests {
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13393,7 +13389,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13483,7 +13479,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13585,7 +13581,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13671,7 +13667,7 @@ Done."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13760,7 +13756,7 @@ Done."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13847,7 +13843,7 @@ Done."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -13935,7 +13931,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14080,7 +14076,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14176,7 +14172,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14275,7 +14271,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14399,7 +14395,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14532,7 +14528,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14637,7 +14633,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14753,7 +14749,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15672,7 +15668,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15790,7 +15786,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15903,7 +15899,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -16016,7 +16012,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -16187,7 +16183,7 @@ This is an example, not an invocation."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -16280,7 +16276,6 @@ This is an example, not an invocation."#;
                 &model_provider,
                 &mut history,
                 &mut false,
-                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -16358,7 +16353,6 @@ This is an example, not an invocation."#;
                 &model_provider,
                 &mut history,
                 &mut false,
-                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -16434,7 +16428,6 @@ This is an example, not an invocation."#;
             &model_provider,
             &mut history,
             &mut false,
-            &mut None,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -16511,7 +16504,6 @@ This is an example, not an invocation."#;
             &model_provider,
             &mut history,
             &mut false,
-            &mut None,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -16586,7 +16578,6 @@ This is an example, not an invocation."#;
             &model_provider,
             &mut history,
             &mut false,
-            &mut None,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -16727,7 +16718,6 @@ This is an example, not an invocation."#;
                 &model_provider,
                 &mut history,
                 &mut false,
-                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -16812,7 +16802,6 @@ This is an example, not an invocation."#;
                 &model_provider,
                 &mut history,
                 &mut false,
-                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -19226,7 +19215,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -19423,7 +19412,7 @@ Let me check the result."#;
                     history: &mut history,
                     // Test transcripts start fresh: no prior trim, no crumb.
                     history_has_trim_breadcrumb: &mut false,
-                    injected_memory_preamble: &mut None,
+
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -19563,7 +19552,7 @@ Let me check the result."#;
                     history: &mut history,
                     // Test transcripts start fresh: no prior trim, no crumb.
                     history_has_trim_breadcrumb: &mut false,
-                    injected_memory_preamble: &mut None,
+
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -19780,7 +19769,7 @@ Let me check the result."#;
                     },
                     history: &mut history,
                     history_has_trim_breadcrumb: &mut false,
-                    injected_memory_preamble: &mut None,
+
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -19887,7 +19876,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -20017,7 +20006,7 @@ Let me check the result."#;
                     history: &mut history,
                     // Test transcripts start fresh: no prior trim, no crumb.
                     history_has_trim_breadcrumb: &mut false,
-                    injected_memory_preamble: &mut None,
+
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -20122,7 +20111,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -20223,7 +20212,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -22734,7 +22723,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -22836,7 +22825,7 @@ Let me check the result."#;
                     },
                     history: &mut history,
                     history_has_trim_breadcrumb: &mut false,
-                    injected_memory_preamble: &mut None,
+
                     channel_name: "cli",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -23119,7 +23108,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -23331,7 +23320,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -23442,7 +23431,7 @@ Let me check the result."#;
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -23773,7 +23762,7 @@ Let me check the result."#;
                 },
                 history: &mut history,
                 history_has_trim_breadcrumb: &mut crumb_present,
-                injected_memory_preamble: &mut None,
+
                 channel_name: "test",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -24188,7 +24177,7 @@ Let me check the result."#;
                 },
                 history: &mut history,
                 history_has_trim_breadcrumb: &mut crumb_present,
-                injected_memory_preamble: &mut None,
+
                 channel_name: "test",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -24316,7 +24305,7 @@ Let me check the result."#;
                 },
                 history: &mut history,
                 history_has_trim_breadcrumb: &mut crumb_present,
-                injected_memory_preamble: &mut None,
+
                 channel_name: "test",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -24601,7 +24590,7 @@ Let me check the result."#;
                 },
                 history: &mut history,
                 history_has_trim_breadcrumb: &mut crumb_present,
-                injected_memory_preamble: &mut None,
+
                 channel_name: "test",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -24690,7 +24679,6 @@ Let me check the result."#;
             &model_provider,
             &mut history,
             &mut false,
-            &mut None,
             &tools_registry,
             observer.as_ref(),
             "mock-provider",
@@ -24748,7 +24736,6 @@ Let me check the result."#;
             &model_provider,
             &mut history,
             &mut false,
-            &mut None,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",
@@ -24823,7 +24810,6 @@ Let me check the result."#;
             &model_provider,
             &mut history,
             &mut false,
-            &mut None,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",

@@ -749,3 +749,22 @@ temporary session as their source. Copies and child-agent sessions have ordinary
 session-list rows; forks are branches within one session, selected by `branch_id`.
 Existing branches can be enumerated and resumed after restart using
 `branches` and `resume_branch`, with current authorization checked on use.
+
+## Recalled-memory observations in context
+
+A context `MessageRef` can carry an optional `recalled_memory` payload reference.
+Its message identity and original source remain unchanged. The referenced
+`session.conversation/v1` content leaf holds one empty user carrier with the
+typed observation, without a copy of the user's message. Admission accepts a
+new validated leaf supplied with the transform or the exact association inherited
+from its input projection; an unrelated existing leaf grants no authority.
+Unchanged context reuses the reference rather than rewriting recall content.
+
+Readers join the original message with the observation for model context.
+Transcript readers continue to read original content events. Erasure of the
+observation hides it while leaving the original user text available; dependent
+summaries fail their visibility check. Erasure of the original message still
+hides that message. This uses an existing erasable content codec and adds no
+schema migration. Older context payloads omit the optional field. Older binaries
+ignore the new annotation and therefore lose recalled context on rollback;
+the original conversation remains readable.

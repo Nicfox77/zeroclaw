@@ -1287,6 +1287,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -1323,6 +1324,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,

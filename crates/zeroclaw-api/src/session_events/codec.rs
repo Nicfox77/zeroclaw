@@ -245,6 +245,10 @@ impl EventData {
 pub struct MessageRef {
     pub message_id: MessageId,
     pub source: ContextMessageSource,
+    /// Creates a context-only association with an immutable recall snapshot.
+    /// The original message source and its erasure dependencies stay intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recalled_memory: Option<StoredPayloadRef>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

@@ -4626,6 +4626,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn should_cache_conversation_short() {
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -4635,6 +4636,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 content: "System prompt".to_string(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -4653,6 +4655,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn should_cache_conversation_long() {
         let mut messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -4664,6 +4667,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Add 3 non-system messages
         for i in 0..3 {
             messages.push(ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -4680,6 +4684,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn should_cache_conversation_boundary() {
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -4696,6 +4701,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Add one more to cross boundary (>1)
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -4705,6 +4711,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 content: "Hello".to_string(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5161,6 +5168,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_messages_small_system_prompt_uses_blocks_with_cache() {
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -5192,6 +5200,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn convert_messages_large_system_prompt() {
         let large_content = "a".repeat(3073);
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -5287,6 +5296,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn convert_messages_preserves_multi_turn_history() {
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5296,6 +5306,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 content: "You are helpful.".to_string(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5305,6 +5316,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 content: "gen a 2 sum in golang".to_string(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5314,6 +5326,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 content: "```go\nfunc twoSum(nums []int) {}\n```".to_string(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5616,6 +5629,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_messages_with_image_attachment_data_uri() {
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -5665,6 +5679,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // this fixture used before is not a multiple of four, so it is not
         // canonical base64 and Anthropic's decoder would reject it.
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -5703,6 +5718,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_messages_without_image_marker() {
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -5753,6 +5769,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // followed by two separate tool result messages.
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5762,6 +5779,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 content: "You are helpful.".to_string(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5827,6 +5845,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // synthesize a stub tool_result so the history stays well-formed.
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5844,6 +5863,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 None,
             ),
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5891,6 +5911,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // following message at all. A tool_result message must be appended.
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5929,6 +5950,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // same role, regardless of input ordering.
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -5953,6 +5975,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 attachments: Vec::new(),
             }),
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,

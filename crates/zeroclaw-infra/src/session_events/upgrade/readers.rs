@@ -71,6 +71,7 @@ impl LegacySqliteReader {
                     tool_calls: Vec::new(),
                     tool_result: None,
                     reasoning_content: None,
+                    recalled_memory: None,
                     role: row.get(0)?,
                     content: row.get(1)?,
 

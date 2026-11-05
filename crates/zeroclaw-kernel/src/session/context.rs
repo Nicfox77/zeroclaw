@@ -505,6 +505,7 @@ impl ContextTransformPort for Transform {
                 plan.payloads.retain(|payload| payload.payload_id != payload_ref.payload_id);
             }
             plan.refs[summary_index] = MessageRef {
+                recalled_memory: None,
                 message_id: MessageId::parse(format!("context-message-{started}-{summary_index}")).map_err(AppendError::from)?,
                 source: ContextMessageSource::Conversation {payload_ref:StoredPayloadRef::from(&summary_payload),item_index:0},
             };

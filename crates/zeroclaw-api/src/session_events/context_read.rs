@@ -98,6 +98,71 @@ pub fn resolve_message(
     stream: &SessionId,
     item: &MessageRef,
 ) -> Result<Option<ConversationMessage>, ReadError> {
+    let Some(mut message) = resolve_source(store, stream, item)? else {
+        return Ok(None);
+    };
+    if let Some(reference) = &item.recalled_memory {
+        if reference.codec != "session.conversation/v1" {
+            return Err(ReadError::Corrupt("recall snapshot codec mismatch".into()));
+        }
+        let ConversationMessage::Chat(chat) = &mut message else {
+            return Err(ReadError::Corrupt(
+                "recall snapshot requires a user turn".into(),
+            ));
+        };
+        if chat.role != "user" {
+            return Err(ReadError::Corrupt(
+                "recall snapshot requires a user turn".into(),
+            ));
+        }
+        match store.read_payload(&reference.payload_id)? {
+            PayloadRead::Present(record) if StoredPayloadRef::from(&record) == *reference => {
+                chat.recalled_memory = Some(decode_recall_snapshot(&record.body)?);
+            }
+            PayloadRead::Present(_) => {
+                return Err(ReadError::Corrupt(
+                    "recall snapshot reference mismatch".into(),
+                ));
+            }
+            PayloadRead::ErasurePending | PayloadRead::Redacted => {
+                chat.recalled_memory = None;
+            }
+        }
+    }
+    Ok(Some(message))
+}
+
+/// A recall observation uses a one-item conversation leaf with no copied user
+/// body. Both admission and readers enforce the same representation.
+pub(crate) fn decode_recall_snapshot(
+    body: &[u8],
+) -> Result<crate::model_provider::RecalledMemoryContext, ReadError> {
+    let rows: Vec<ConversationMessage> =
+        serde_json::from_slice(body).map_err(|error| ReadError::Corrupt(error.to_string()))?;
+    let [ConversationMessage::Chat(chat)] = rows.as_slice() else {
+        return Err(ReadError::Corrupt("invalid recall snapshot".into()));
+    };
+    if chat.role != "user"
+        || !chat.content.is_empty()
+        || chat.timestamp.is_some()
+        || !chat.attachments.is_empty()
+        || !chat.tool_calls.is_empty()
+        || chat.tool_result.is_some()
+        || chat.reasoning_content.is_some()
+    {
+        return Err(ReadError::Corrupt("invalid recall snapshot".into()));
+    }
+    chat.recalled_memory
+        .clone()
+        .filter(|context| !context.entries.is_empty())
+        .ok_or_else(|| ReadError::Corrupt("recall snapshot missing".into()))
+}
+
+fn resolve_source(
+    store: &dyn SessionEventStore,
+    stream: &SessionId,
+    item: &MessageRef,
+) -> Result<Option<ConversationMessage>, ReadError> {
     match &item.source {
         ContextMessageSource::Conversation {
             payload_ref,
@@ -235,6 +300,11 @@ pub fn message_available(
     item: &MessageRef,
 ) -> Result<bool, ReadError> {
     use payloads::PayloadDisposition;
+    if let Some(reference) = &item.recalled_memory
+        && store.read_payload_disposition(reference)? != PayloadDisposition::Present
+    {
+        return Ok(false);
+    }
     match &item.source {
         ContextMessageSource::Conversation { payload_ref, .. } => {
             Ok(store.read_payload_disposition(payload_ref)? == PayloadDisposition::Present)
@@ -314,6 +384,7 @@ pub fn context_refs(
                     serde_json::from_slice(&present(store, &content_ref)?.body)
                         .map_err(|error| ReadError::Corrupt(error.to_string()))?;
                 Ok(MessageRef {
+                    recalled_memory: None,
                     message_id: content.message_id,
                     source: ContextMessageSource::Content {
                         content_event_id: event.event_id.clone(),
@@ -354,6 +425,7 @@ pub fn context_refs(
                     .map_err(|error| ReadError::Corrupt(error.to_string()))?
             };
             Ok(MessageRef {
+                recalled_memory: None,
                 message_id,
                 source: ContextMessageSource::Conversation {
                     payload_ref: reference.clone(),

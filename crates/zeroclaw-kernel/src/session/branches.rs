@@ -237,7 +237,7 @@ impl EngineSession {
                         let content_ref = match &replacement.body.data { EventData::UserContentRecorded { content_ref, .. } | EventData::AssistantContentRecorded { content_ref, .. } => content_ref.clone(), _ => return Err(SessionError::InvocationMismatch) };
                         let PayloadRead::Present(content) = owner.store.read_payload(&content_ref.payload_id)? else { return Err(SessionError::StaleTarget("replacement structure missing".into())); };
                         let content: ContentPayload = serde_json::from_slice(&content.body).map_err(|e| ReadError::Corrupt(e.to_string()))?;
-                        let item = MessageRef { message_id:content.message_id,source:ContextMessageSource::Content {content_event_id:replacement.event_id,content_ref} };
+                        let item = MessageRef { message_id:content.message_id, recalled_memory:None, source:ContextMessageSource::Content {content_event_id:replacement.event_id,content_ref} };
                         super::context_messages::resolve_message(owner.store.as_ref(), &stream, &item)?;
                         Some(item)
                     } else { None };

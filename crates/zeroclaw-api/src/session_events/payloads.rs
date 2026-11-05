@@ -875,6 +875,27 @@ fn validate_semantic_payloads(
                     if !ids.insert(&item.message_id) {
                         return Err(invalid("duplicate context message identity"));
                     }
+                    if let Some(reference) = &item.recalled_memory {
+                        if reference.codec != "session.conversation/v1" {
+                            return Err(invalid("recall snapshot codec mismatch"));
+                        }
+                        let inherited = old_refs.iter().any(|old| {
+                            old.message_id == item.message_id
+                                && old.source == item.source
+                                && old.recalled_memory.as_ref() == Some(reference)
+                        });
+                        if !inherited {
+                            let supplied = request
+                                .payloads
+                                .iter()
+                                .find(|payload| StoredPayloadRef::from(*payload) == *reference)
+                                .ok_or_else(|| {
+                                    invalid("recall snapshot must be supplied or inherited")
+                                })?;
+                            super::context_read::decode_recall_snapshot(&supplied.body)
+                                .map_err(|error| invalid(&error.to_string()))?;
+                        }
+                    }
                     match &item.source {
                         ContextMessageSource::Content {
                             content_event_id,
@@ -938,7 +959,9 @@ fn validate_semantic_payloads(
                             if payload_ref.codec != "session.conversation/v1" {
                                 return Err(invalid("context conversation codec mismatch"));
                             }
-                            if old_refs.iter().any(|old| old == item) {
+                            if old_refs.iter().any(|old| {
+                                old.message_id == item.message_id && old.source == item.source
+                            }) {
                                 continue;
                             }
                             // Imported conversation chunks create identities in
@@ -977,7 +1000,10 @@ fn validate_semantic_payloads(
                                 if canonical_origins
                                     .get(&origin)
                                     .and_then(|items| items.get(position))
-                                    == Some(item)
+                                    .is_some_and(|origin| {
+                                        origin.message_id == item.message_id
+                                            && origin.source == item.source
+                                    })
                                 {
                                     continue;
                                 }

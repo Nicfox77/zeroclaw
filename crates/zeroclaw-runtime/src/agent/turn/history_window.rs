@@ -41,6 +41,7 @@ mod tests {
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,

@@ -3,6 +3,227 @@ use crate::session::summary_deck::{ResolvedSummaryDeck, SummaryDeckRuntime};
 use std::sync::atomic::AtomicUsize;
 use zeroclaw_config::summary_deck::SummaryDeckConfig;
 
+fn recalled_fixture() -> zeroclaw_api::model_provider::RecalledMemoryContext {
+    zeroclaw_api::model_provider::RecalledMemoryContext {
+        entries: vec![zeroclaw_api::model_provider::RecalledMemoryEntry {
+            key: "fixture_fact".into(),
+            content: "retained recall evidence".into(),
+            stored_on: None,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn recalled_context_preserves_identity_reopens_and_rotates_without_entering_the_transcript() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let (port, authority) = session(directory.path(), backend);
+        let mut snapshot = add_turn(&port, 0).await.expect("turn");
+        let before = port.latest_context().await.expect("context");
+        let original =
+            crate::session::context_messages::context_refs(port.owner.store.as_ref(), &before)
+                .expect("refs");
+        let user = snapshot
+            .messages
+            .iter_mut()
+            .find_map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "user" => Some(chat),
+                _ => None,
+            })
+            .expect("user");
+        let raw = user.content.clone();
+        user.recalled_memory = Some(recalled_fixture());
+        port.replace_context(snapshot, "recall_fixture")
+            .await
+            .expect("attach recall");
+        let after = port.latest_context().await.expect("context");
+        let refs =
+            crate::session::context_messages::context_refs(port.owner.store.as_ref(), &after)
+                .expect("refs");
+        let annotated = refs
+            .iter()
+            .find(|item| item.recalled_memory.is_some())
+            .expect("annotation");
+        assert!(
+            original
+                .iter()
+                .any(|item| item.message_id == annotated.message_id
+                    && item.source == annotated.source)
+        );
+        let PayloadRead::Present(payload) = port
+            .owner
+            .store
+            .read_payload(
+                &annotated
+                    .recalled_memory
+                    .as_ref()
+                    .expect("reference")
+                    .payload_id,
+            )
+            .expect("snapshot")
+        else {
+            panic!("snapshot")
+        };
+        assert!(
+            !String::from_utf8(payload.body)
+                .expect("json")
+                .contains(&raw),
+            "recall leaves must not copy the original user's text"
+        );
+        let stream = port.stream.clone();
+        let branch = port.branch.clone();
+        drop(port);
+        let store = zeroclaw_infra::session_events::open_event_store(directory.path(), backend)
+            .expect("reopen");
+        let port = EngineSession::new(
+            Arc::new(SessionCoordinator::new(store)),
+            stream,
+            branch,
+            PrincipalId::shared_operator(),
+            authority,
+        )
+        .with_summary_deck(Arc::new(Runtime::new()));
+        let restored = port
+            .read_context_snapshot(port.latest_context().await.expect("context"))
+            .await
+            .expect("snapshot")
+            .expect("present");
+        assert!(restored.messages.iter().any(|message|matches!(message,ConversationMessage::Chat(chat) if chat.content==raw && chat.recalled_memory.as_ref()==Some(&recalled_fixture()))));
+        for n in 1..12 {
+            let snapshot = add_turn(&port, n).await.expect("turn");
+            port.prepare_context(snapshot).await.expect("prepare");
+            wait_job(&port).await.expect("summary");
+        }
+        let current = port
+            .read_context_snapshot(port.latest_context().await.expect("context"))
+            .await
+            .expect("snapshot")
+            .expect("present");
+        assert!(current.messages.iter().all(|message|!matches!(message,ConversationMessage::Chat(chat) if chat.recalled_memory.is_some())));
+        let transcript = port
+            .history_reader()
+            .expect("reader")
+            .history(port.stream.as_str(), 100)
+            .await
+            .expect("history")
+            .expect("present");
+        assert!(
+            transcript
+                .messages
+                .iter()
+                .any(|message| message.text == raw)
+        );
+        assert!(
+            transcript
+                .messages
+                .iter()
+                .all(|message| !message.text.contains("retained recall evidence"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_references_observe_erasure_and_never_resurrect_the_user_source() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let (port, authority) = session(directory.path(), backend);
+        let mut snapshot = add_turn(&port, 0).await.expect("turn");
+        let user = snapshot
+            .messages
+            .iter_mut()
+            .find_map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "user" => Some(chat),
+                _ => None,
+            })
+            .expect("user");
+        user.recalled_memory = Some(recalled_fixture());
+        port.replace_context(snapshot, "recall_fixture")
+            .await
+            .expect("attach recall");
+        let input = port.latest_context().await.expect("context");
+        let refs =
+            crate::session::context_messages::context_refs(port.owner.store.as_ref(), &input)
+                .expect("refs");
+        let annotated = refs
+            .iter()
+            .find(|item| item.recalled_memory.is_some())
+            .expect("annotation");
+        let ContextMessageSource::Content { content_ref, .. } = &annotated.source else {
+            panic!("original source")
+        };
+        let PayloadRead::Present(content) = port
+            .owner
+            .store
+            .read_payload(&content_ref.payload_id)
+            .expect("content")
+        else {
+            panic!("content")
+        };
+        let content: ContentPayload = serde_json::from_slice(&content.body).expect("content");
+        let RecordedContentPart::Text { text_ref } = content.parts[0].clone() else {
+            panic!("text")
+        };
+        for (index, target) in [
+            annotated.recalled_memory.clone().expect("recall reference"),
+            text_ref,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let intent = SessionEvent::typed(
+                port.stream.clone(),
+                EventData::PayloadErasureRequested {
+                    targets: vec![target],
+                    reason_category: "operator_requested".into(),
+                },
+                port.actor.clone(),
+            )
+            .expect("intent");
+            port.owner
+                .admit_erasure(
+                    PrincipalId::shared_operator(),
+                    authority.clone(),
+                    AppendRequest {
+                        session_id: port.stream.clone(),
+                        expected_head: port.owner.store.head(&port.stream).expect("head"),
+                        idempotency_key: format!("erase-recall-{index}"),
+                        events: vec![intent],
+                        payloads: vec![],
+                        erasure_reference_commitment: None,
+                    },
+                )
+                .await
+                .expect("erasure");
+            let resolved = crate::session::context_messages::resolve_message(
+                port.owner.store.as_ref(),
+                &port.stream,
+                annotated,
+            );
+            if index == 0 {
+                let ConversationMessage::Chat(chat) =
+                    resolved.expect("resolve user").expect("user remains")
+                else {
+                    panic!("user")
+                };
+                assert!(chat.recalled_memory.is_none());
+                assert!(
+                    !zeroclaw_api::session_events::context_read::message_available(
+                        port.owner.store.as_ref(),
+                        &port.stream,
+                        annotated
+                    )
+                    .expect("summary visibility")
+                );
+            } else {
+                assert!(
+                    !matches!(resolved, Ok(Some(_))),
+                    "erased user text cannot reappear through annotated context"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn summary_budget_counts_tool_arguments_reasoning_and_utf8() {
     let calls = ConversationMessage::AssistantToolCalls {
