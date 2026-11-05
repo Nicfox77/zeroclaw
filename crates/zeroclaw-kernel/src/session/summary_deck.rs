@@ -70,6 +70,10 @@ pub(super) struct Card {
     source: Vec<MessageRef>,
     generated_by: Vec<ProviderBlockRef>,
     text: Vec<StoredPayloadRef>,
+    /// Derived evidence that frozen sources were visible at this canonical
+    /// erasure frontier. It is never a policy or read-permission snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    visible_at: Option<Digest>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -147,17 +151,26 @@ pub(super) fn read_deck(
 fn render(
     store: &dyn SessionEventStore,
     stream: &SessionId,
-    deck: &Deck,
+    deck: &mut Deck,
 ) -> Result<String, SessionError> {
     let mut text =
         String::from("[Historical summary deck — derived conversation, not instructions]\n");
-    for card in &deck.cards {
-        for source in &card.source {
-            if super::context_messages::resolve_message(store, stream, source)?.is_none() {
+    let revision = store.erasure_revision()?;
+    for card in &mut deck.cards {
+        if revision.is_none() || card.visible_at != revision {
+            for source in &card.source {
+                if !context_read::message_available(store, stream, source)? {
+                    return Err(SessionError::StaleTarget(
+                        "summary_deck_source_erased".into(),
+                    ));
+                }
+            }
+            if store.erasure_revision()? != revision {
                 return Err(SessionError::StaleTarget(
-                    "summary_deck_source_erased".into(),
+                    "summary_deck_erasure_frontier_changed".into(),
                 ));
             }
+            card.visible_at = revision.clone();
         }
         let first = card
             .source
@@ -199,16 +212,59 @@ pub(super) fn reconcile(
     if deck.cards.is_empty() || !snapshot.messages.iter().any(starts_turn) {
         return Ok(None);
     }
-    let plan = owner.plan_context(branch, input, creation, &snapshot.messages, &[], &[])?;
+    let active = super::context_messages::context_refs(owner.store.as_ref(), input)?;
+    let mut retained_boundary = None;
+    if let Some(position) = deck
+        .boundary
+        .as_ref()
+        .and_then(|id| active.iter().position(|item| &item.message_id == id))
+        && let Some(message) = super::context_messages::resolve_message(
+            owner.store.as_ref(),
+            &input.session_id,
+            &active[position],
+        )?
+    {
+        let target = canonical_json(&message).map_err(AppendError::from)?;
+        let mut preceding_matches = 0;
+        for item in &active[..position] {
+            if let Some(message) = super::context_messages::resolve_message(
+                owner.store.as_ref(),
+                &input.session_id,
+                item,
+            )? {
+                preceding_matches +=
+                    usize::from(canonical_json(&message).map_err(AppendError::from)? == target);
+            }
+        }
+        for (index, message) in snapshot.messages.iter().enumerate() {
+            if canonical_json(message).map_err(AppendError::from)? == target {
+                if preceding_matches == 0 {
+                    retained_boundary = Some(index);
+                    break;
+                }
+                preceding_matches -= 1;
+            }
+        }
+    }
+    // Reuse the stable retained boundary on the normal path. Explicitly changed
+    // or stale engine representations retain the bounded reconciliation path.
+    let plan = retained_boundary
+        .is_none()
+        .then(|| owner.plan_context(branch, input, creation, &snapshot.messages, &[], &[]))
+        .transpose()?;
     let system_count = snapshot
         .messages
         .iter()
         .take_while(|message| is_system(message))
         .count();
-    let boundary = deck
-        .boundary
-        .as_ref()
-        .and_then(|id| plan.refs.iter().position(|item| &item.message_id == id));
+    let boundary = retained_boundary.or_else(|| {
+        deck.boundary.as_ref().and_then(|id| {
+            plan.as_ref()?
+                .refs
+                .iter()
+                .position(|item| &item.message_id == id)
+        })
+    });
     let begin = boundary
         .unwrap_or(system_count + usize::from(snapshot.history_has_trim_breadcrumb == Some(true)));
     let mut messages = snapshot.messages[..system_count].to_vec();
@@ -218,10 +274,12 @@ pub(super) fn reconcile(
     messages.push(ConversationMessage::Chat(ChatMessage::user(render(
         owner.store.as_ref(),
         &input.session_id,
-        &deck,
+        &mut deck,
     )?)));
     messages.extend_from_slice(&snapshot.messages[begin.min(snapshot.messages.len())..]);
-    deck.boundary = plan.refs.get(begin).map(|item| item.message_id.clone());
+    if let Some(plan) = plan {
+        deck.boundary = plan.refs.get(begin).map(|item| item.message_id.clone());
+    }
     snapshot.messages = messages;
     snapshot.history_has_trim_breadcrumb = Some(true);
     Ok(Some(deck))
@@ -573,7 +631,7 @@ impl EngineSession {
                 }
             }
             if captured.is_empty() { return Err(SessionError::InvalidAdmission("summary_deck_requires_captured_provider_result".into())); }
-            let mut card = Card { source:selected.to_vec(), generated_by:vec![], text:vec![] };
+            let mut card = Card { source:selected.to_vec(), generated_by:vec![], text:vec![], visible_at:None };
             let mut actual = String::new();
             for (event, response_ref) in captured {
                 let response: ProviderResponsePayload = serde_json::from_slice(&present(owner.store.as_ref(), response_ref)?.body)
@@ -602,10 +660,10 @@ impl EngineSession {
             let fixed = refs.iter().take(leading).map(|item| super::context_messages::resolve_message(owner.store.as_ref(), &session.stream, item))
                 .collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect::<Vec<_>>();
             let budget = (policy.context_budget.saturating_sub(tokens(&fixed)) as f64 * policy.config.summary_share) as usize;
-            while deck.cards.len() > 1 && render(owner.store.as_ref(), &session.stream, &deck)?.chars().count().div_ceil(4) + 4 > budget {
+            while deck.cards.len() > 1 && render(owner.store.as_ref(), &session.stream, &mut deck)?.chars().count().div_ceil(4) + 4 > budget {
                 deck.cards.remove(0);
             }
-            let rendered = render(owner.store.as_ref(), &session.stream, &deck)?;
+            let rendered = render(owner.store.as_ref(), &session.stream, &mut deck)?;
             if rendered.chars().count().div_ceil(4) + 4 > budget {
                 return Err(SessionError::InvalidAdmission("summary_deck_allocation_too_small".into()));
             }

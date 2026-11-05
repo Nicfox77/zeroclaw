@@ -292,6 +292,15 @@ impl SessionEventStore for ScopedEventStore {
     fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
         self.store.read_payload(id)
     }
+    fn read_payload_disposition(
+        &self,
+        reference: &zeroclaw_api::session_events::StoredPayloadRef,
+    ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
+        self.store.read_payload_disposition(reference)
+    }
+    fn erasure_revision(&self) -> Result<Option<Digest>, ReadError> {
+        self.store.erasure_revision()
+    }
     fn erasure_scope(
         &self,
         targets: &[zeroclaw_api::session_events::StoredPayloadRef],

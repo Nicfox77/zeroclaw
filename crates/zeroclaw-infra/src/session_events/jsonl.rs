@@ -797,6 +797,46 @@ fn as_read(error: AppendError) -> ReadError {
     }
 }
 impl SessionEventStore for JsonlEventStore {
+    fn erasure_revision(&self) -> Result<Option<Digest>, ReadError> {
+        let _guard = self.lock().map_err(as_read)?;
+        let snapshot = self.snapshot().map_err(as_read)?;
+        let ids: Vec<_> = snapshot
+            .erasure_targets
+            .keys()
+            .map(EventId::as_str)
+            .collect();
+        Ok(Some(Digest::from_bytes(
+            &canonical_json(&ids).map_err(|error| ReadError::Corrupt(error.to_string()))?,
+        )))
+    }
+
+    fn read_payload_disposition(
+        &self,
+        reference: &zeroclaw_api::session_events::StoredPayloadRef,
+    ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
+        use zeroclaw_api::session_events::payloads::PayloadDisposition;
+        let _guard = self.lock().map_err(as_read)?;
+        let snapshot = self.snapshot().map_err(as_read)?;
+        let meta = snapshot
+            .payloads
+            .get(reference.payload_id.as_str())
+            .ok_or_else(|| ReadError::PayloadMissing(reference.payload_id.to_string()))?;
+        if meta.codec != reference.codec {
+            return Err(ReadError::Corrupt("payload reference mismatch".into()));
+        }
+        let disposition = snapshot
+            .erased
+            .get(&reference.payload_id)
+            .copied()
+            .unwrap_or(PayloadDisposition::Present);
+        if disposition == PayloadDisposition::Present {
+            drop(
+                filesystem::reader(&self.payload_path(&reference.payload_id).map_err(as_read)?)
+                    .map_err(|error| ReadError::StorageUnavailable(error.to_string()))?,
+            );
+        }
+        Ok(disposition)
+    }
     fn read_latest_event(
         &self,
         stream: &SessionId,

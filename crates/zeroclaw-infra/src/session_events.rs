@@ -188,6 +188,39 @@ impl ValidationSnapshot {
 }
 
 impl SqliteEventStore {
+    fn payload_disposition(
+        &self,
+        conn: &Connection,
+        id: &PayloadId,
+    ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
+        let data_version: i64 = conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(read_error)?;
+        let mut cached = self.validation.lock();
+        if cached
+            .as_ref()
+            .is_none_or(|cache| cache.data_version() != data_version)
+        {
+            *cached = Some(ValidationSnapshot::Read {
+                data_version,
+                erasures: Self::verified_history(conn)?
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event.body.data,
+                            zeroclaw_api::session_events::EventData::PayloadErasureRequested { .. }
+                                | zeroclaw_api::session_events::EventData::PayloadRedacted { .. }
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        Ok(cached
+            .as_ref()
+            .ok_or_else(|| ReadError::Corrupt("read snapshot reconstruction missing".into()))?
+            .disposition(id))
+    }
+
     pub fn open(workspace_dir: &Path) -> Result<Self, AppendError> {
         let dir = workspace_dir.join("sessions");
         filesystem::directory(&dir)?;
@@ -807,35 +840,8 @@ impl SessionEventStore for SqliteEventStore {
         let Some((id, codec, body)) = row else {
             return Err(ReadError::PayloadMissing(payload_id.to_string()));
         };
-        let data_version: i64 = conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
-            .map_err(read_error)?;
-        let mut cached = self.validation.lock();
-        if cached
-            .as_ref()
-            .is_none_or(|cache| cache.data_version() != data_version)
-        {
-            // Keep read compatibility with future structural codecs: a read
-            // verifies envelopes, but must not run strict append admission.
-            *cached = Some(ValidationSnapshot::Read {
-                data_version,
-                erasures: Self::verified_history(&conn)?
-                    .into_iter()
-                    .filter(|event| {
-                        matches!(
-                            event.body.data,
-                            zeroclaw_api::session_events::EventData::PayloadErasureRequested { .. }
-                                | zeroclaw_api::session_events::EventData::PayloadRedacted { .. }
-                        )
-                    })
-                    .collect(),
-            });
-        }
-        let snapshot = cached
-            .as_ref()
-            .ok_or_else(|| ReadError::Corrupt("read snapshot reconstruction missing".into()))?;
         use zeroclaw_api::session_events::payloads::PayloadDisposition;
-        match snapshot.disposition(payload_id) {
+        match self.payload_disposition(&conn, payload_id)? {
             PayloadDisposition::ErasurePending => return Ok(PayloadRead::ErasurePending),
             PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
             PayloadDisposition::Present => {}
@@ -852,6 +858,50 @@ impl SessionEventStore for SqliteEventStore {
             .validate()
             .map_err(|error| ReadError::Corrupt(error.to_string()))?;
         Ok(PayloadRead::Present(record))
+    }
+
+    fn read_payload_disposition(
+        &self,
+        reference: &zeroclaw_api::session_events::StoredPayloadRef,
+    ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction().map_err(read_error)?;
+        let row: Option<(String, bool)> = conn
+            .query_row(
+                "SELECT codec,body IS NOT NULL FROM event_payloads WHERE payload_id=?1",
+                params![reference.payload_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(read_error)?;
+        let (codec, present) =
+            row.ok_or_else(|| ReadError::PayloadMissing(reference.payload_id.to_string()))?;
+        if codec != reference.codec {
+            return Err(ReadError::Corrupt("payload reference mismatch".into()));
+        }
+        let disposition = self.payload_disposition(&conn, &reference.payload_id)?;
+        if !present
+            && disposition == zeroclaw_api::session_events::payloads::PayloadDisposition::Present
+        {
+            return Err(ReadError::Corrupt(
+                "body missing without erasure evidence".into(),
+            ));
+        }
+        Ok(disposition)
+    }
+
+    fn erasure_revision(&self) -> Result<Option<Digest>, ReadError> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare("SELECT event_id FROM session_events WHERE json_extract(event_json,'$.kind')='payload_erasure_requested' AND json_extract(event_json,'$.body.codec_version')=1 ORDER BY event_id").map_err(read_error)?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(read_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(read_error)?;
+        Ok(Some(Digest::from_bytes(
+            &zeroclaw_api::session_events::canonical_json(&ids)
+                .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+        )))
     }
 }
 

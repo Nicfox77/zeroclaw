@@ -1,10 +1,28 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
-struct CountedStore {
+pub(super) struct CountedStore {
     inner: Arc<dyn SessionEventStore>,
     read_events: AtomicUsize,
     read_payloads: AtomicUsize,
+    forbidden_payloads: std::sync::Mutex<std::collections::HashSet<PayloadId>>,
+}
+
+impl CountedStore {
+    pub(super) fn new(inner: Arc<dyn SessionEventStore>) -> Self {
+        Self {
+            inner,
+            read_events: AtomicUsize::new(0),
+            read_payloads: AtomicUsize::new(0),
+            forbidden_payloads: Default::default(),
+        }
+    }
+    pub(super) fn forbid(&self, id: PayloadId) {
+        self.forbidden_payloads.lock().expect("lock").insert(id);
+    }
+    pub(super) fn clear_forbidden(&self) {
+        self.forbidden_payloads.lock().expect("lock").clear();
+    }
 }
 
 impl SessionEventStore for CountedStore {
@@ -46,8 +64,22 @@ impl SessionEventStore for CountedStore {
         self.inner.lookup_receipt(stream, key)
     }
     fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
+        if self.forbidden_payloads.lock().expect("lock").contains(id) {
+            return Err(ReadError::Corrupt(
+                "raw summarized source was reread".into(),
+            ));
+        }
         self.read_payloads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_payload(id)
+    }
+    fn erasure_revision(&self) -> Result<Option<Digest>, ReadError> {
+        self.inner.erasure_revision()
+    }
+    fn read_payload_disposition(
+        &self,
+        reference: &StoredPayloadRef,
+    ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
+        self.inner.read_payload_disposition(reference)
     }
     fn erasure_scope(
         &self,
@@ -62,11 +94,7 @@ async fn context_planning_work_is_bounded_by_active_context_and_new_events() {
     for archive_size in [0, 1_000, 10_000] {
         let directory = tempfile::tempdir().expect("directory");
         let (mut port, _) = session(directory.path(), "sqlite");
-        let store = Arc::new(CountedStore {
-            inner: port.owner.store.clone(),
-            read_events: AtomicUsize::new(0),
-            read_payloads: AtomicUsize::new(0),
-        });
+        let store = Arc::new(CountedStore::new(port.owner.store.clone()));
         port.owner = Arc::new(SessionCoordinator::new(store.clone()));
         let title = PayloadRecord::new(
             PayloadId::new(),

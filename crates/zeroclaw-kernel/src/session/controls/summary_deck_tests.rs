@@ -26,6 +26,110 @@ fn summary_budget_counts_tool_arguments_reasoning_and_utf8() {
     );
 }
 
+#[tokio::test]
+async fn retained_summaries_skip_raw_sources_but_observe_new_erasures() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let (mut port, authority) = session(directory.path(), backend);
+        port = port.with_summary_deck(Arc::new(Runtime::new()));
+        for n in 0..10 {
+            let snapshot = add_turn(&port, n).await.expect("turn");
+            port.prepare_context(snapshot).await.expect("prepare");
+            wait_job(&port).await.expect("summary");
+        }
+        let input = port.latest_context().await.expect("projection");
+        let EventData::ContextProjectionCreated { result_ref, .. } = &input.body.data else {
+            panic!("projection");
+        };
+        let PayloadRead::Present(body) = port
+            .owner
+            .store
+            .read_payload(&result_ref.payload_id)
+            .expect("body")
+        else {
+            panic!("present");
+        };
+        let body: serde_json::Value = serde_json::from_slice(&body.body).expect("context");
+        let sources: Vec<MessageRef> =
+            serde_json::from_value(body["summary_deck"]["cards"][0]["source"].clone())
+                .expect("summary sources");
+        let source = sources.first().expect("source");
+        let leaf = match &source.source {
+            ContextMessageSource::Conversation { payload_ref, .. } => payload_ref.clone(),
+            ContextMessageSource::Content { content_ref, .. } => {
+                let PayloadRead::Present(content) = port
+                    .owner
+                    .store
+                    .read_payload(&content_ref.payload_id)
+                    .expect("content")
+                else {
+                    panic!("present");
+                };
+                let content: ContentPayload =
+                    serde_json::from_slice(&content.body).expect("content");
+                let RecordedContentPart::Text { text_ref } = &content.parts[0] else {
+                    panic!("text");
+                };
+                text_ref.clone()
+            }
+        };
+        let mut snapshot = port
+            .read_context_snapshot(input.clone())
+            .await
+            .expect("snapshot")
+            .expect("present");
+        let counted = Arc::new(super::scaling_tests::CountedStore::new(
+            port.owner.store.clone(),
+        ));
+        counted.forbid(leaf.payload_id.clone());
+        port.owner = Arc::new(SessionCoordinator::new(counted.clone()));
+        crate::session::summary_deck::reconcile(
+            &port.owner,
+            &port.branch,
+            &input,
+            &EventId::new(),
+            &mut snapshot,
+        )
+        .expect("render without original bytes");
+        counted.clear_forbidden();
+        let intent = SessionEvent::typed(
+            port.stream.clone(),
+            EventData::PayloadErasureRequested {
+                targets: vec![leaf],
+                reason_category: "operator_requested".into(),
+            },
+            port.actor.clone(),
+        )
+        .expect("intent");
+        port.owner
+            .admit_erasure(
+                PrincipalId::shared_operator(),
+                authority,
+                AppendRequest {
+                    session_id: port.stream.clone(),
+                    expected_head: counted.head(&port.stream).expect("head"),
+                    idempotency_key: "erase-summary-source".into(),
+                    events: vec![intent],
+                    payloads: vec![],
+                    erasure_reference_commitment: None,
+                },
+            )
+            .await
+            .expect("erasure");
+        assert!(
+            crate::session::summary_deck::reconcile(
+                &port.owner,
+                &port.branch,
+                &input,
+                &EventId::new(),
+                &mut snapshot
+            )
+            .is_err(),
+            "a new erasure must invalidate the retained summary"
+        );
+    }
+}
+
 #[derive(Clone)]
 struct Runtime {
     main: Option<SessionId>,

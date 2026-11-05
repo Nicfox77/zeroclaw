@@ -46,7 +46,10 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
              CREATE INDEX IF NOT EXISTS session_index_activity
                ON session_index(deleted, closed, last_activity DESC);
              CREATE INDEX IF NOT EXISTS session_index_filter
-               ON session_index(deleted, category, project, provider, model);",
+               ON session_index(deleted, category, project, provider, model);
+             CREATE INDEX IF NOT EXISTS session_erasure_requests
+               ON session_events(event_id) WHERE json_extract(event_json,'$.kind')='payload_erasure_requested'
+               AND json_extract(event_json,'$.body.codec_version')=1;",
         )
         .map_err(map_sqlite)?;
     Ok(())
