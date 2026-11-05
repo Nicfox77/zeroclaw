@@ -14238,6 +14238,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "portable-atomic",
+ "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",

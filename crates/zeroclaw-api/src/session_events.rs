@@ -887,6 +887,11 @@ pub enum ReadError {
 /// The storage boundary. Implementations must be append-only and must return
 /// the same receipt for a retry with the same commitment.
 pub trait SessionEventStore: Send + Sync {
+    /// A validated no-op-recovery hint at this exact prefix. The coordinator
+    /// must still verify live execution ownership before using a false result.
+    fn recovery_required(&self, _through: &EventCursor) -> Result<Option<bool>, ReadError> {
+        Ok(None)
+    }
     fn load_projection_checkpoint(
         &self,
         _stream: &SessionId,

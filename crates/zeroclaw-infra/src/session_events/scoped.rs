@@ -223,6 +223,9 @@ impl ScopedEventStore {
     }
 }
 impl SessionEventStore for ScopedEventStore {
+    fn recovery_required(&self, through: &EventCursor) -> Result<Option<bool>, ReadError> {
+        self.store.recovery_required(through)
+    }
     fn read_context_projection(
         &self,
         stream: &SessionId,

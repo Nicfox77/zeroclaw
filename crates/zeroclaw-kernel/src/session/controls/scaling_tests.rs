@@ -26,6 +26,9 @@ impl CountedStore {
 }
 
 impl SessionEventStore for CountedStore {
+    fn recovery_required(&self, through: &EventCursor) -> Result<Option<bool>, ReadError> {
+        self.inner.recovery_required(through)
+    }
     fn load_projection_checkpoint(
         &self,
         stream: &SessionId,
@@ -353,5 +356,64 @@ async fn status_and_metadata_resume_checkpoint_and_read_only_new_events() {
             .message_count,
         0,
         "edits must decrement compacted counts without replay"
+    );
+    struct LostOwner(AtomicUsize);
+    impl crate::session::recovery::StreamExecutionLossVerifier for LostOwner {
+        fn verify_stream_loss(
+            &self,
+            _: &SessionId,
+            _: &EventCursor,
+        ) -> Result<PayloadRecord, SessionError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(PayloadRecord::json(
+                "session.evidence/v1",
+                &serde_json::json!({"source":"fixture-owner-stopped"}),
+            )
+            .expect("proof"))
+        }
+    }
+    let reopened = Arc::new(CountedStore::new(
+        zeroclaw_infra::session_events::open_event_store(directory.path(), "sqlite")
+            .expect("reopen settled session"),
+    ));
+    port.owner = Arc::new(SessionCoordinator::new(reopened.clone()));
+    let proof = Arc::new(LostOwner(AtomicUsize::new(0)));
+    port.owner
+        .recover_session(port.stream.clone(), proof.clone())
+        .await
+        .expect("settled recovery");
+    assert_eq!(
+        proof.0.load(Ordering::SeqCst),
+        1,
+        "fast recovery must still verify stopped-writer ownership"
+    );
+    assert_eq!(
+        reopened.read_events.load(Ordering::SeqCst),
+        0,
+        "a settled session must not replay archived pages on restart"
+    );
+    struct MissingProof;
+    impl crate::session::recovery::StreamExecutionLossVerifier for MissingProof {
+        fn verify_stream_loss(
+            &self,
+            _: &SessionId,
+            _: &EventCursor,
+        ) -> Result<PayloadRecord, SessionError> {
+            Ok(PayloadRecord::new(
+                PayloadId::new(),
+                "session.text/v1".into(),
+                b"not ownership evidence".to_vec(),
+            )
+            .expect("payload"))
+        }
+    }
+    assert!(
+        matches!(
+            port.owner
+                .recover_session(port.stream.clone(), Arc::new(MissingProof))
+                .await,
+            Err(SessionError::InvalidAdmission(_))
+        ),
+        "a checkpoint must never replace ownership proof"
     );
 }
