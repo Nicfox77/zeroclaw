@@ -27,6 +27,15 @@ without retaining a turn lease or configuration snapshot. Execution keeps its
 own lease for the actual turn. Idle readers therefore cannot block agent
 deletion, and deleted or closing generations still fail authorization.
 
+SQLite payload reads reuse the connection's disposable event-validation view
+for erasure visibility instead of reparsing the archive for every context item.
+An admitted writer uses its existing payload index; a read-only connection
+retains verified erasure event envelopes without running strict append admission, so
+future structural codecs remain readable. SQLite's transaction and
+`data_version` invalidate this view after a peer commit, and local append
+commits update the admitted index. Events remain canonical; this view contains
+no live permissions or duplicated payload bodies and is discarded on reopen.
+
 The synchronous legacy conversation-binding owner refuses native session
 access without execution admission. It must not acknowledge a cache-only
 exchange that is absent from the event store. Native callers use the session
