@@ -3,6 +3,29 @@ use crate::session::summary_deck::{ResolvedSummaryDeck, SummaryDeckRuntime};
 use std::sync::atomic::AtomicUsize;
 use zeroclaw_config::summary_deck::SummaryDeckConfig;
 
+#[test]
+fn summary_budget_counts_tool_arguments_reasoning_and_utf8() {
+    let calls = ConversationMessage::AssistantToolCalls {
+        text: None,
+        tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+            id: "fixture-call".into(),
+            name: "file_write".into(),
+            arguments: "x".repeat(100_000),
+            extra_content: None,
+        }],
+        reasoning_content: Some("r".repeat(4_000)),
+    };
+    let unicode = ConversationMessage::Chat(ChatMessage::user("架".repeat(4_000)));
+    let expected = calls.chat_messages()[0].estimated_text_tokens()
+        + unicode.chat_messages()[0].estimated_text_tokens();
+    let actual = crate::session::summary_deck::tokens(&[calls, unicode]);
+    assert_eq!(actual, expected);
+    assert!(
+        actual > 29_000,
+        "structured payloads must trigger summarization before the dispatch guard"
+    );
+}
+
 #[derive(Clone)]
 struct Runtime {
     main: Option<SessionId>,

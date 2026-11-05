@@ -260,27 +260,17 @@ impl ChatMessage {
 
     /// Text population used by context budgeting, including typed tool fields.
     pub fn context_text_bytes(&self) -> usize {
-        self.content.len()
+        context_fields_bytes(&self.content, self.reasoning_content.as_deref(), &self.tool_calls,
+            self.tool_result.as_ref().map(|result| (result.tool_call_id.as_str(), result.tool_name.as_str())))
             // Reserve an approximate provider-rendered date envelope while
             // keeping its text out of durable context.
             + if self.role == "user" && self.timestamp.is_some() { 64 } else { 0 }
-            + self.reasoning_content.as_ref().map_or(0, String::len)
-            + self
-                .tool_calls
-                .iter()
-                .map(|call| {
-                    call.id.len()
-                        + call.name.len()
-                        + call.arguments.len()
-                        + call
-                            .extra_content
-                            .as_ref()
-                            .map_or(0, |value| value.to_string().len())
-                })
-                .sum::<usize>()
-            + self.tool_result.as_ref().map_or(0, |result| {
-                result.tool_call_id.len() + result.tool_name.len()
-            })
+    }
+
+    /// Shared fallback estimate, before route-specific usage calibration and
+    /// attachment preparation. Includes structured calls and retained reasoning.
+    pub fn estimated_text_tokens(&self) -> usize {
+        self.context_text_bytes().div_ceil(4) + 4
     }
 
     pub fn with_attachments(mut self, attachments: Vec<crate::media::AttachmentReference>) -> Self {
@@ -570,7 +560,72 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// Conservative fixed image allowance used before provider-specific preparation.
+/// This is an estimate, not a tokenizer result or a provider capacity guarantee.
+pub const CONTEXT_IMAGE_TOKEN_ESTIMATE: usize = 1_600;
+
+fn context_fields_bytes(
+    content: &str,
+    reasoning: Option<&str>,
+    calls: &[ToolCall],
+    result: Option<(&str, &str)>,
+) -> usize {
+    content.len()
+        + reasoning.map_or(0, str::len)
+        + calls
+            .iter()
+            .map(|call| {
+                call.id.len()
+                    + call.name.len()
+                    + call.arguments.len()
+                    + call
+                        .extra_content
+                        .as_ref()
+                        .map_or(0, |value| value.to_string().len())
+            })
+            .sum::<usize>()
+        + result.map_or(0, |(id, name)| id.len() + name.len())
+}
+
 impl ConversationMessage {
+    /// Estimate a retained context item without cloning its payloads. Image
+    /// allowances are conservative; final dispatch owns preparation/calibration.
+    pub fn estimated_context_tokens(&self) -> usize {
+        match self {
+            Self::Chat(chat) => {
+                chat.estimated_text_tokens() + chat.attachments.len() * CONTEXT_IMAGE_TOKEN_ESTIMATE
+            }
+            Self::AssistantToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            } => {
+                context_fields_bytes(
+                    text.as_deref().unwrap_or_default(),
+                    reasoning_content.as_deref(),
+                    tool_calls,
+                    None,
+                )
+                .div_ceil(4)
+                    + 4
+            }
+            Self::ToolResults(results) => results
+                .iter()
+                .map(|result| {
+                    context_fields_bytes(
+                        &result.content,
+                        None,
+                        &[],
+                        Some((&result.tool_call_id, &result.tool_name)),
+                    )
+                    .div_ceil(4)
+                        + 4
+                        + result.attachments.len() * CONTEXT_IMAGE_TOKEN_ESTIMATE
+                })
+                .sum(),
+        }
+    }
+
     /// Runtime projection. Content stays literal; calls/results remain typed.
     pub fn chat_messages(&self) -> Vec<ChatMessage> {
         match self {
