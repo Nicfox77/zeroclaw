@@ -99,21 +99,33 @@ bundle; independent workers
 should also receive no administrative bundle. Tool allowlists/denylists use
 the normal MCP capability rules below.
 
+Channel configuration writes can retire the channel generation that is serving
+the requesting turn. To avoid cancelling their own caller, `set`, `patch` and
+`create_alias` return `queued=true`, `saved=false` while any native session is
+running or an earlier write is waiting. A detached worker waits for 15 seconds
+of idle before calling the gateway. Finish the requesting reply; do not poll or
+wait for the queued write within that turn, since this prevents idle. Check
+`status` and read back in a later turn. Queued patches are validated when they
+run, so rejection can occur after the tool returns. Related edits should use
+one atomic patch, with `test` operations to guard against intervening edits.
+
 Saving and applying are separate. `status` reports the gateway's canonical
-application/reload status. `reload` starts a local worker outside the MCP call,
-which waits for all native sessions to remain idle for 15 seconds, then requests
-`POST /admin/reload`. This gives the requesting turn time to finish. Idle
-detection requires native persistent sessions and does not prove that every
-outbound voice delivery has completed; clients can still reconnect during
-reload. Requests fail after five minutes without an idle window. Request
-records in `--state-dir` describe waiting, failure or accepted reload requests;
-they do not assert that every subsystem applied every setting. Workers are not
-resumed automatically after a process or machine restart.
+application/reload status and recent write/reload requests. `reload` starts a
+local worker outside the MCP call, waits for pending writes and 15 seconds of
+idle, then requests `POST /admin/reload`. Idle detection requires native
+persistent sessions, is a point-in-time check rather than an admission lock,
+and does not prove that every outbound voice delivery has completed. Clients
+can still reconnect during reload. Requests fail after five minutes without
+an idle window. Request records in `--state-dir` contain metadata only; queued
+values pass through an anonymous pipe and remain in worker memory. A `saved`
+record means the gateway acknowledged the write, not that every subsystem
+applied it. Workers are not resumed automatically after a process or machine
+restart; inspect status and read back before resubmitting uncertain changes.
 
 After installing the bridge, reload the daemon and reconnect the affected
 session to initialize its MCP tools. Example requests are "show your current
-context settings" or "set this runtime profile's history limit to 200, read it
-back, and reload after replying." Agent aliases remain operator-defined;
+context settings" or "queue this runtime profile's history limit at 200 and
+reload after replying." Verify queued changes in a subsequent turn. Agent aliases remain operator-defined;
 use `list` to discover the actual paths.
 
 To roll back, remove the bundle from the agent and reload, revoke only this
