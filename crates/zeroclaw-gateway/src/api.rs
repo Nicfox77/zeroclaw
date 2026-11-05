@@ -1992,15 +1992,16 @@ pub async fn handle_api_session_state(
     }
 
     if state.native_sessions.is_some() {
-        return crate::session_history::response(async {
-                use zeroclaw_api::session_events::projection::TurnStatus;
+        return crate::session_history::response(
+            async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let native = crate::session_history::query(&state, &id, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
-                let history = native.query.project_history(native.stream).await?;
-                let active = history.turns.iter().find(|(_, turn)| matches!(turn.status, TurnStatus::Queued|TurnStatus::Running));
-                let unknown = history.turns.values().max_by_key(|turn| turn.accepted_sequence).is_some_and(|turn| turn.status == TurnStatus::Unknown);
-                Ok(serde_json::json!({"session_id":id,"state":if active.is_some(){"running"}else if unknown{"unknown"}else{"idle"},"turn_id":active.map(|(id,_)| id.to_string()),"source_cursor":history.source_cursor}))
-        }.await);
+                let native = crate::session_history::query(&state, &id, subject.as_deref())
+                    .await?
+                    .ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
+                Ok(native.query.current_state(native.stream).await?)
+            }
+            .await,
+        );
     }
 
     (

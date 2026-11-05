@@ -3,20 +3,36 @@ use super::*;
 use zeroclaw_api::session_events::ModelResolution;
 
 impl SessionQuery {
-    pub async fn summary(&self, stream: SessionId) -> Result<SessionSummary, SessionError> {
+    async fn summary_reducer(
+        &self,
+        stream: SessionId,
+    ) -> Result<zeroclaw_api::session_events::catalog::SessionReducer, SessionError> {
         use zeroclaw_api::session_events::catalog::SessionReducer;
-        let mut reducer = SessionReducer::new(stream.clone(), false);
-        let mut after = EventCursor::beginning(stream.clone());
-        let mut through = None;
-        let mut has_copy_seed = false;
+        self.policy
+            .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
+        let store = self.coordinator.store.clone();
+        let scope = stream.clone();
+        let (mut reducer, revision, head) = self
+            .coordinator
+            .blocking(move || {
+                let revision = store.erasure_revision()?;
+                let head = store.head(&scope)?;
+                Ok((
+                    SessionReducer::load_checkpoint(store.as_ref(), &scope, &head)?,
+                    revision,
+                    head,
+                ))
+            })
+            .await?;
+        let mut after = reducer.cursor();
+        let checkpoint_sequence = after.sequence;
+        let mut through = Some(head);
         loop {
             let page = self
                 .read_page(stream.clone(), after, through.clone(), 256)
                 .await?;
             through = Some(page.through.clone());
             for event in &page.events {
-                has_copy_seed |= matches!(&event.body.data,
-                    EventData::ContextProjectionCreated { reason_key, .. } if reason_key == "copy_on_write_seed");
                 let seed_count = if let EventData::ContextProjectionCreated { reason_key, .. } =
                     &event.body.data
                     && (reason_key == "host_seed" || reason_key == "legacy_import")
@@ -49,7 +65,25 @@ impl SessionQuery {
                 } else {
                     None
                 };
-                reducer.apply(event, seed_count)?;
+                let targets = if let EventData::ContentSuperseded {
+                    target_event_ids, ..
+                } = &event.body.data
+                {
+                    let ids = target_event_ids.clone();
+                    let store = self.coordinator.store.clone();
+                    self.coordinator
+                        .blocking(move || {
+                            ids.into_iter()
+                                .map(|id| Ok((id.clone(), store.read_event(&id)?)))
+                                .collect::<Result<std::collections::HashMap<_, _>, SessionError>>()
+                        })
+                        .await?
+                } else {
+                    Default::default()
+                };
+                reducer.apply_indexed(event, seed_count, &|id| {
+                    Ok(targets.get(id).cloned().flatten())
+                })?;
                 if let EventData::TurnAccepted { ingress_ref, .. } = &event.body.data {
                     let reference_index = event
                         .body
@@ -87,6 +121,38 @@ impl SessionQuery {
                 break;
             }
         }
+        reducer.compact();
+        let store = self.coordinator.store.clone();
+        reducer = self
+            .coordinator
+            .blocking(move || {
+                if reducer.cursor().sequence != checkpoint_sequence {
+                    reducer.save_checkpoint(store.as_ref(), revision.as_ref())?;
+                }
+                Ok(reducer)
+            })
+            .await?;
+        Ok(reducer)
+    }
+
+    /// Small current-state projection; reading it never replays tools/providers.
+    pub async fn current_state(
+        &self,
+        stream: SessionId,
+    ) -> Result<serde_json::Value, SessionError> {
+        let reducer = self.summary_reducer(stream.clone()).await?;
+        self.policy
+            .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
+        let active = reducer.active_turn();
+        Ok(
+            serde_json::json!({"session_id":stream,"state":if active.is_some(){"running"}else if reducer.latest_outcome_unknown(){"unknown"}else{"idle"},"turn_id":active,"source_cursor":reducer.cursor()}),
+        )
+    }
+
+    pub async fn summary(&self, stream: SessionId) -> Result<SessionSummary, SessionError> {
+        let mut reducer = self.summary_reducer(stream.clone()).await?;
+        let through = Some(reducer.cursor());
+        let has_copy_seed = reducer.has_copy_seed();
         let pending: Vec<_> = reducer
             .pending_metadata()
             .map(|(field, sequence, reference)| (field.to_owned(), sequence, reference.clone()))
@@ -152,100 +218,125 @@ impl SessionQuery {
             if !visited.insert(stream.clone()) {
                 return Err(ReadError::Corrupt("copy source cycle".into()).into());
             }
-            let mut after = EventCursor::beginning(stream.clone());
-            let mut through = frozen.take();
-            let mut history = Vec::new();
-            loop {
-                let page = self
-                    .read_page(stream.clone(), after.clone(), through.clone(), 256)
-                    .await?;
-                through = Some(page.through.clone());
-                if let Some(last) = page.events.last() {
-                    after.sequence = last.sequence;
-                }
-                history.extend(page.events);
-                if !page.has_more {
-                    break;
-                }
-            }
-            let branch = selected_branch
-                .clone()
-                .or_else(|| {
-                    history
-                        .iter()
-                        .find(|event| {
-                            matches!(
-                                event.body.kind(),
-                                EventKind::SessionStarted | EventKind::DerivedSessionStarted
-                            )
-                        })
-                        .and_then(|event| event.branch_id.clone())
-                })
-                .ok_or_else(|| ReadError::Gap("model selection branch absent".into()))?;
-            let lineage = zeroclaw_api::session_events::lineage::frozen_lineage(
-                &history,
-                &stream,
-                &branch,
-                after.sequence,
-            )?;
-            let applied = history
-                .iter()
-                .rev()
-                .find(|event| {
-                    zeroclaw_api::session_events::lineage::includes(&lineage, event)
-                        && matches!(
-                            event.body.data,
-                            EventData::SessionModelOverrideChanged {
-                                resolution: ModelResolution::Applied { .. }
-                            }
-                        )
-                })
-                .map(|event| {
-                    event
-                        .causation_id
-                        .clone()
-                        .ok_or_else(|| ReadError::Corrupt("model selection origin absent".into()))
-                })
-                .transpose()?;
-            let Some(cause) = applied else {
-                let seed = history.iter().rev().find(|event| {
-                zeroclaw_api::session_events::lineage::includes(&lineage, event)
-                    && matches!(&event.body.data, EventData::ContextProjectionCreated { reason_key, .. } if reason_key == "copy_on_write_seed")
-            });
-                if let Some(seed) = seed
-                    && let EventData::ContextProjectionCreated { result_ref, .. } = &seed.body.data
-                {
-                    self.policy
-                        .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
-                    let store = self.coordinator.store.clone();
-                    let reference = result_ref.clone();
-                    let body = self
-                        .coordinator
-                        .blocking(move || {
-                            let payload = zeroclaw_api::session_events::context_read::present(
-                                store.as_ref(),
-                                &reference,
-                            )?;
-                            let body = serde_json::from_slice(&payload.body)
-                                .map_err(|error| ReadError::Corrupt(error.to_string()))?;
-                            Ok(zeroclaw_api::session_events::context_read::copy_source(
-                                &body,
-                            )?)
-                        })
-                        .await?;
-                    self.policy
-                        .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
-                    if let Some(source) = body {
-                        stream = source.cursor.session_id.clone();
-                        selected_branch = Some(source.branch_id);
-                        frozen = Some(source.cursor);
-                        continue;
+            self.policy
+                .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
+            let scope = stream.clone();
+            let store = self.coordinator.store.clone();
+            let branch = selected_branch.clone();
+            let bound = frozen.take();
+            let (cause, copy) = self
+                .coordinator
+                .blocking(move || {
+                    let actual = store.head(&scope)?;
+                    let through = bound.unwrap_or(actual.sequence);
+                    if through > actual.sequence {
+                        return Err(ReadError::Gap("copy source prefix unavailable".into()).into());
                     }
+                    let branch = match branch {
+                        Some(branch) => branch,
+                        None => store
+                            .read_page(
+                                &scope,
+                                &EventCursor::beginning(scope.clone()),
+                                Some(&EventCursor {
+                                    session_id: scope.clone(),
+                                    sequence: through,
+                                }),
+                                1,
+                            )?
+                            .events
+                            .first()
+                            .and_then(|event| event.branch_id.clone())
+                            .ok_or_else(|| {
+                                ReadError::Gap("model selection branch absent".into())
+                            })?,
+                    };
+                    let lineage = zeroclaw_api::session_events::lineage::read_frozen_lineage(
+                        store.as_ref(),
+                        &scope,
+                        &branch,
+                        through,
+                    )?;
+                    let mut applied: Option<SessionEvent> = None;
+                    let mut seed: Option<SessionEvent> = None;
+                    for (branch, bound) in lineage {
+                        let mut before = bound;
+                        while let Some(event) = store.read_latest_event_before(
+                            &scope,
+                            &branch,
+                            None,
+                            &EventKind::SessionModelOverrideChanged,
+                            before,
+                        )? {
+                            if matches!(
+                                &event.body.data,
+                                EventData::SessionModelOverrideChanged {
+                                    resolution: ModelResolution::Applied { .. }
+                                }
+                            ) {
+                                if applied
+                                    .as_ref()
+                                    .is_none_or(|prior| event.sequence > prior.sequence)
+                                {
+                                    applied = Some(event);
+                                }
+                                break;
+                            }
+                            before = event.sequence.saturating_sub(1);
+                        }
+                        if let Some(event) = store.read_context_projection(
+                            &scope,
+                            &branch,
+                            None,
+                            "copy_on_write_seed",
+                            bound,
+                        )? && seed
+                            .as_ref()
+                            .is_none_or(|prior| event.sequence > prior.sequence)
+                        {
+                            seed = Some(event);
+                        }
+                    }
+                    if let Some(event) = applied {
+                        return Ok((
+                            Some(event.causation_id.ok_or_else(|| {
+                                ReadError::Corrupt("model selection origin absent".into())
+                            })?),
+                            None,
+                        ));
+                    }
+                    let copy = if let Some(event) = seed {
+                        let EventData::ContextProjectionCreated { result_ref, .. } =
+                            &event.body.data
+                        else {
+                            return Err(
+                                ReadError::Corrupt("copy source kind mismatch".into()).into()
+                            );
+                        };
+                        let record = zeroclaw_api::session_events::context_read::present(
+                            store.as_ref(),
+                            result_ref,
+                        )?;
+                        let body = serde_json::from_slice(&record.body)
+                            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                        zeroclaw_api::session_events::context_read::copy_source(&body)?
+                    } else {
+                        None
+                    };
+                    Ok((None, copy))
+                })
+                .await?;
+            self.policy
+                .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
+            let Some(cause) = cause else {
+                if let Some(copy) = copy {
+                    stream = copy.cursor.session_id;
+                    frozen = Some(copy.cursor.sequence);
+                    selected_branch = Some(copy.branch_id);
+                    continue;
                 }
                 return Ok(None);
             };
-            self.policy
-                .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
             let store = self.coordinator.store.clone();
             let control = self
                 .coordinator
@@ -255,8 +346,6 @@ impl SessionQuery {
                         .ok_or_else(|| ReadError::Gap("model selection input absent".into()))?)
                 })
                 .await?;
-            self.policy
-                .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
             if control.session_id != stream
                 || control.body.kind() != EventKind::ControlInputRecorded
             {

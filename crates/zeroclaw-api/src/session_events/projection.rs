@@ -2,7 +2,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnStatus {
     Queued,
     Running,
@@ -11,7 +11,7 @@ pub enum TurnStatus {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InvocationStatus {
     Running,
     Completed,
@@ -20,7 +20,7 @@ pub enum InvocationStatus {
     Unknown,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnView {
     pub accepted_event_id: EventId,
     /// Derived ordering coordinate; EventId and map order are not chronological.
@@ -29,7 +29,7 @@ pub struct TurnView {
     pub status: TurnStatus,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InvocationView {
     pub started_event_id: EventId,
     pub last_event_id: EventId,
@@ -40,7 +40,7 @@ pub struct InvocationView {
     pub background: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContentView {
     pub event_id: EventId,
     pub content_ref: StoredPayloadRef,
@@ -49,7 +49,7 @@ pub struct ContentView {
 
 /// Reconstruct from a contiguous prefix. Unknown events remain visible as
 /// holes in semantic coverage; callers must not treat this as complete context.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryProjection {
     pub source_cursor: EventCursor,
     pub turns: BTreeMap<TurnId, TurnView>,
@@ -140,16 +140,7 @@ impl HistoryProjection {
         Ok(())
     }
 
-    /// Reduce one validated event for consumers that resolve structural
-    /// payloads between events. The caller owns prefix validation.
-    pub(crate) fn apply_event(&mut self, event: &SessionEvent) -> Result<(), ReadError> {
-        self.apply(event)?;
-        self.apply_content(event);
-        self.source_cursor.sequence = event.sequence;
-        Ok(())
-    }
-
-    fn apply_content(&mut self, event: &SessionEvent) {
+    pub(super) fn apply_content(&mut self, event: &SessionEvent) {
         match &event.body.data {
             EventData::UserContentRecorded { content_ref, .. }
             | EventData::AssistantContentRecorded { content_ref, .. } => {
@@ -169,7 +160,7 @@ impl HistoryProjection {
         }
     }
 
-    fn apply(&mut self, event: &SessionEvent) -> Result<(), ReadError> {
+    pub(super) fn apply_turn(&mut self, event: &SessionEvent) -> Result<(), ReadError> {
         let kind = event.body.kind();
         if kind == EventKind::TurnAccepted {
             let id = event
@@ -213,6 +204,12 @@ impl HistoryProjection {
                 turn.last_event_id = event.event_id.clone();
             }
         }
+        Ok(())
+    }
+
+    fn apply(&mut self, event: &SessionEvent) -> Result<(), ReadError> {
+        self.apply_turn(event)?;
+        let kind = event.body.kind();
         if let Some(id) = &event.invocation_id {
             if matches!(
                 kind,

@@ -223,6 +223,42 @@ impl ScopedEventStore {
     }
 }
 impl SessionEventStore for ScopedEventStore {
+    fn read_context_projection(
+        &self,
+        stream: &SessionId,
+        branch: &zeroclaw_api::session_events::BranchId,
+        turn: Option<&zeroclaw_api::session_events::TurnId>,
+        reason: &str,
+        through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        self.store
+            .read_context_projection(stream, branch, turn, reason, through)
+    }
+    fn read_latest_event_before(
+        &self,
+        stream: &SessionId,
+        branch: &zeroclaw_api::session_events::BranchId,
+        turn: Option<&zeroclaw_api::session_events::TurnId>,
+        kind: &zeroclaw_api::session_events::EventKind,
+        through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        self.store
+            .read_latest_event_before(stream, branch, turn, kind, through)
+    }
+    fn load_projection_checkpoint(
+        &self,
+        stream: &SessionId,
+        kind: &str,
+    ) -> Result<Option<zeroclaw_api::session_events::ProjectionCheckpoint>, ReadError> {
+        self.store.load_projection_checkpoint(stream, kind)
+    }
+    fn save_projection_checkpoint(
+        &self,
+        kind: &str,
+        checkpoint: &zeroclaw_api::session_events::ProjectionCheckpoint,
+    ) -> Result<(), ReadError> {
+        self.store.save_projection_checkpoint(kind, checkpoint)
+    }
     fn read_latest_event(
         &self,
         stream: &SessionId,

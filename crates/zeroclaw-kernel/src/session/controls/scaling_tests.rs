@@ -26,6 +26,42 @@ impl CountedStore {
 }
 
 impl SessionEventStore for CountedStore {
+    fn load_projection_checkpoint(
+        &self,
+        stream: &SessionId,
+        kind: &str,
+    ) -> Result<Option<ProjectionCheckpoint>, ReadError> {
+        self.inner.load_projection_checkpoint(stream, kind)
+    }
+    fn save_projection_checkpoint(
+        &self,
+        kind: &str,
+        checkpoint: &ProjectionCheckpoint,
+    ) -> Result<(), ReadError> {
+        self.inner.save_projection_checkpoint(kind, checkpoint)
+    }
+    fn read_latest_event_before(
+        &self,
+        stream: &SessionId,
+        branch: &BranchId,
+        turn: Option<&TurnId>,
+        kind: &EventKind,
+        through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        self.inner
+            .read_latest_event_before(stream, branch, turn, kind, through)
+    }
+    fn read_context_projection(
+        &self,
+        stream: &SessionId,
+        branch: &BranchId,
+        turn: Option<&TurnId>,
+        reason: &str,
+        through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        self.inner
+            .read_context_projection(stream, branch, turn, reason, through)
+    }
     fn append_batch(&self, request: AppendRequest) -> Result<AppendReceipt, AppendError> {
         self.inner.append_batch(request)
     }
@@ -176,4 +212,146 @@ async fn context_planning_work_is_bounded_by_active_context_and_new_events() {
             "unchanged messages reuse canonical payloads"
         );
     }
+}
+
+#[tokio::test]
+async fn status_and_metadata_resume_checkpoint_and_read_only_new_events() {
+    let directory = tempfile::tempdir().expect("directory");
+    let (mut port, authority) = session(directory.path(), "sqlite");
+    let store = Arc::new(CountedStore::new(port.owner.store.clone()));
+    port.owner = Arc::new(SessionCoordinator::new(store.clone()));
+    let title = PayloadRecord::new(
+        PayloadId::new(),
+        "session.text/v1".into(),
+        b"fixture title".to_vec(),
+    )
+    .expect("title");
+    let events = (0..10_000)
+        .map(|_| {
+            SessionEvent::typed(
+                port.stream.clone(),
+                EventData::SessionMetadataChanged {
+                    field: "title".into(),
+                    new_value_ref: StoredPayloadRef::from(&title),
+                },
+                EventActor::default(),
+            )
+            .expect("event")
+        })
+        .collect();
+    store
+        .append_batch(AppendRequest {
+            session_id: port.stream.clone(),
+            expected_head: store.head(&port.stream).expect("head"),
+            idempotency_key: "metadata-archive".into(),
+            events,
+            payloads: vec![title],
+            erasure_reference_commitment: None,
+        })
+        .expect("archive");
+    let initial = port
+        .query()
+        .summary(port.stream.clone())
+        .await
+        .expect("cold projection");
+    assert_eq!(initial.title(), Some("fixture title"));
+    store.read_events.store(0, Ordering::SeqCst);
+    assert_eq!(
+        port.query()
+            .current_state(port.stream.clone())
+            .await
+            .expect("status")["state"],
+        "idle"
+    );
+    assert!(
+        port.query()
+            .model_selection(port.stream.clone())
+            .await
+            .expect("model selection")
+            .is_none()
+    );
+    assert_eq!(
+        store.read_events.load(Ordering::SeqCst),
+        0,
+        "status and model selection must not replay the archive"
+    );
+    let checkpoint = store
+        .load_projection_checkpoint(&port.stream, "session-summary/v1")
+        .expect("checkpoint")
+        .expect("present");
+    assert!(
+        checkpoint.body.len() < 4_096,
+        "ordinary checkpoint size must not grow with archived events"
+    );
+    let reopened = Arc::new(CountedStore::new(
+        zeroclaw_infra::session_events::open_event_store(directory.path(), "sqlite")
+            .expect("reopen"),
+    ));
+    port.owner = Arc::new(SessionCoordinator::new(reopened.clone()));
+    assert_eq!(
+        port.query()
+            .summary(port.stream.clone())
+            .await
+            .expect("reopened summary")
+            .title(),
+        initial.title()
+    );
+    assert!(
+        reopened.read_events.load(Ordering::SeqCst) <= 1,
+        "reopening must resolve only latest metadata references"
+    );
+    authority.0.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        port.query().current_state(port.stream.clone()).await,
+        Err(SessionError::PermissionDenied(_))
+    ));
+    authority.0.store(true, Ordering::SeqCst);
+    let before = reopened.head(&port.stream).expect("head").sequence;
+    port.record_context_input(input(), "new input", "scaling_fixture")
+        .await
+        .expect("input");
+    let after = reopened.head(&port.stream).expect("head").sequence;
+    reopened.read_events.store(0, Ordering::SeqCst);
+    assert_eq!(
+        port.query()
+            .summary(port.stream.clone())
+            .await
+            .expect("tail projection")
+            .message_count,
+        1
+    );
+    assert!(
+        reopened.read_events.load(Ordering::SeqCst) <= (after - before) as usize + 2,
+        "only the newly appended tail and latest metadata may be read"
+    );
+    let page = reopened
+        .read_page(
+            &port.stream,
+            &EventCursor {
+                session_id: port.stream.clone(),
+                sequence: before,
+            },
+            None,
+            100,
+        )
+        .expect("new events");
+    let target = page
+        .events
+        .iter()
+        .find(|event| matches!(event.body.data, EventData::UserContentRecorded { .. }))
+        .expect("new content")
+        .event_id
+        .clone();
+    port.hide_content(target, "fixture_hide")
+        .await
+        .expect("hide compacted content");
+    assert_eq!(
+        port.query()
+            .summary(port.stream.clone())
+            .await
+            .expect("edited summary")
+            .message_count,
+        0,
+        "edits must decrement compacted counts without replay"
+    );
 }
