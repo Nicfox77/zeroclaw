@@ -108,6 +108,9 @@ pub struct ProjectionCheckpoint {
     pub through: EventCursor,
     pub erasure_revision: Digest,
     pub body: Vec<u8>,
+    /// Canonical-table revision captured before materialization, used only as
+    /// a compare-and-save guard. This never snapshots a live permission grant.
+    pub expected_revision: Option<i64>,
 }
 
 impl EventCursor {
@@ -887,6 +890,9 @@ pub enum ReadError {
 /// The storage boundary. Implementations must be append-only and must return
 /// the same receipt for a retry with the same commitment.
 pub trait SessionEventStore: Send + Sync {
+    fn canonical_revision(&self) -> Result<Option<i64>, ReadError> {
+        Ok(None)
+    }
     /// A validated no-op-recovery hint at this exact prefix. The coordinator
     /// must still verify live execution ownership before using a false result.
     fn recovery_required(&self, _through: &EventCursor) -> Result<Option<bool>, ReadError> {
@@ -967,6 +973,54 @@ pub trait SessionEventStore: Send + Sync {
             cursor = after;
         }
         Ok(None)
+    }
+    /// Canonical events caused by one admitted operation, in stream order.
+    fn read_caused_events(
+        &self,
+        stream: &SessionId,
+        cause: &EventId,
+        kind: &EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        let head = self.head(stream)?;
+        let mut after = EventCursor::beginning(stream.clone());
+        let mut events = Vec::new();
+        loop {
+            let page = self.read_page(stream, &after, Some(&head), 256)?;
+            if let Some(last) = page.events.last() {
+                after.sequence = last.sequence;
+            }
+            events.extend(page.events.into_iter().filter(|event| {
+                event.causation_id.as_ref() == Some(cause) && event.body.kind() == *kind
+            }));
+            if !page.has_more {
+                break;
+            }
+        }
+        Ok(events)
+    }
+    /// Canonical events belonging to one invocation, in stream order.
+    fn read_invocation_events(
+        &self,
+        stream: &SessionId,
+        invocation: &InvocationId,
+        kind: &EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        let head = self.head(stream)?;
+        let mut after = EventCursor::beginning(stream.clone());
+        let mut events = Vec::new();
+        loop {
+            let page = self.read_page(stream, &after, Some(&head), 256)?;
+            if let Some(last) = page.events.last() {
+                after.sequence = last.sequence;
+            }
+            events.extend(page.events.into_iter().filter(|event| {
+                event.invocation_id.as_ref() == Some(invocation) && event.body.kind() == *kind
+            }));
+            if !page.has_more {
+                break;
+            }
+        }
+        Ok(events)
     }
     fn read_context_projection(
         &self,

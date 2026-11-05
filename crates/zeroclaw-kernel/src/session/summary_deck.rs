@@ -609,21 +609,12 @@ impl EngineSession {
             session.authority.authorize_context(&session.stream, &session.branch)?;
             let lock = owner.lock_for(&session.stream);
             let _guard = lock.lock().map_err(|_| SessionError::StoreUnhealthy("summary_deck_commit_lock_poisoned".into()))?;
-            let history = owner.stream_history(&session.stream)?;
-            // A foreground transform has an immutable source between admission
-            // and commit. Wait for it to settle instead of racing its CAS.
-            let mut pending = std::collections::HashSet::new();
-            for event in &history {
-                if event.branch_id.as_ref() != Some(&session.branch) { continue; }
-                match &event.body.data {
-                    EventData::ContextTransformStarted { .. } if event.event_id != started => { pending.insert(event.event_id.clone()); }
-                    EventData::ContextTransformFailed { started_event_id, .. }
-                    | EventData::ContextTransformCancelled { started_event_id, .. } => { pending.remove(started_event_id); }
-                    EventData::ContextProjectionCreated { transform_started_event_id:Some(id), .. } => { pending.remove(id); }
-                    _ => {}
-                }
+            // A foreground transform keeps its immutable source until commit.
+            // The shared read model retains only currently open transforms.
+            let state = zeroclaw_api::session_events::catalog::SessionReducer::materialize(owner.store.as_ref(), &session.stream)?;
+            if state.open_transforms().any(|event| event.branch_id.as_ref()==Some(&session.branch) && event.event_id!=started) {
+                return Err(SessionError::StaleTarget("summary_deck_foreground_busy".into()));
             }
-            if !pending.is_empty() { return Err(SessionError::StaleTarget("summary_deck_foreground_busy".into())); }
             let current = owner.latest_context(&session.stream, &session.branch)?;
             let source_refs = super::context_messages::context_refs(owner.store.as_ref(), &input)?;
             let selected = source_refs.get(body..body + end).ok_or_else(|| SessionError::StaleTarget("summary_deck_source_range_missing".into()))?;
@@ -641,17 +632,18 @@ impl EngineSession {
                 return Err(SessionError::StaleTarget("summary_deck_source_changed".into()));
             }
             let mut captured = Vec::new();
-            for event in &history {
-                let EventData::ProviderAttemptCompleted { response_ref, .. } = &event.body.data else { continue; };
-                if history.iter().any(|attempt| attempt.invocation_id == event.invocation_id
-                    && attempt.body.kind() == EventKind::ProviderRequestPrepared && attempt.causation_id.as_ref() == Some(&started)) {
-                    captured.push((event, response_ref));
-                }
+            for prepared in owner.store.read_caused_events(&session.stream, &started, &EventKind::ProviderRequestPrepared)? {
+                let invocation = prepared.invocation_id.as_ref().ok_or_else(|| SessionError::InvalidAdmission("summary_deck_provider_invocation_missing".into()))?;
+                captured.extend(owner.store.read_invocation_events(&session.stream,invocation,&EventKind::ProviderAttemptCompleted)?);
             }
+            captured.sort_by_key(|event|event.sequence);
             if captured.is_empty() { return Err(SessionError::InvalidAdmission("summary_deck_requires_captured_provider_result".into())); }
             let mut card = Card { source:selected.to_vec(), generated_by:vec![], text:vec![], visible_at:None };
             let mut actual = String::new();
-            for (event, response_ref) in captured {
+            for event in captured {
+                let EventData::ProviderAttemptCompleted {response_ref,..}=&event.body.data else {
+                    return Err(SessionError::InvalidAdmission("summary_deck_provider_result_mismatch".into()));
+                };
                 let response: ProviderResponsePayload = serde_json::from_slice(&present(owner.store.as_ref(), response_ref)?.body)
                     .map_err(|error| ReadError::Corrupt(error.to_string()))?;
                 if response.completion != ContentCompletion::Complete {

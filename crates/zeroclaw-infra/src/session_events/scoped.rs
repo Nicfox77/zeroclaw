@@ -223,6 +223,25 @@ impl ScopedEventStore {
     }
 }
 impl SessionEventStore for ScopedEventStore {
+    fn read_caused_events(
+        &self,
+        stream: &SessionId,
+        cause: &EventId,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        self.store.read_caused_events(stream, cause, kind)
+    }
+    fn read_invocation_events(
+        &self,
+        stream: &SessionId,
+        invocation: &zeroclaw_api::session_events::InvocationId,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        self.store.read_invocation_events(stream, invocation, kind)
+    }
+    fn canonical_revision(&self) -> Result<Option<i64>, ReadError> {
+        self.store.canonical_revision()
+    }
     fn recovery_required(&self, through: &EventCursor) -> Result<Option<bool>, ReadError> {
         self.store.recovery_required(through)
     }

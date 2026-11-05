@@ -700,84 +700,71 @@ impl SessionQuery<'_> {
             .map(|branch| self.branch_lineage(stream, &head, branch))
             .transpose()?;
         let checkpointed = !include_context && through.is_none() && branch.is_none();
-        let revision = if checkpointed {
-            self.catalog.store.erasure_revision()?
-        } else {
-            None
-        };
         let mut reducer = if checkpointed {
-            SessionReducer::load_checkpoint(self.catalog.store(), stream, &head)?
+            SessionReducer::materialize(self.catalog.store(), stream)?
         } else {
             SessionReducer::new(stream.clone(), include_context)
         };
         let mut after = reducer.cursor();
-        let checkpoint_sequence = after.sequence;
-        loop {
-            let page = self
-                .catalog
-                .store
-                .read_page(stream, &after, Some(&head), 256)?;
-            for event in &page.events {
-                let include = lineage.as_ref().is_none_or(|lineage| {
-                    event.sequence == 1
-                        || event.branch_id.is_none()
-                        || zeroclaw_api::session_events::lineage::includes(lineage, event)
-                });
-                let seed_count = if include {
-                    if let EventData::ContextProjectionCreated {
-                        reason_key,
-                        result_ref,
-                        ..
-                    } = &event.body.data
-                        && (reason_key == "host_seed" || reason_key == "legacy_import")
-                    {
-                        let payload = zeroclaw_api::session_events::context_read::present(
-                            self.catalog.store(),
+        if !checkpointed {
+            loop {
+                let page = self
+                    .catalog
+                    .store
+                    .read_page(stream, &after, Some(&head), 256)?;
+                for event in &page.events {
+                    let include = lineage.as_ref().is_none_or(|lineage| {
+                        event.sequence == 1
+                            || event.branch_id.is_none()
+                            || zeroclaw_api::session_events::lineage::includes(lineage, event)
+                    });
+                    let seed_count = if include {
+                        if let EventData::ContextProjectionCreated {
+                            reason_key,
                             result_ref,
-                        )?;
-                        let body: serde_json::Value = serde_json::from_slice(&payload.body)
-                            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
-                        Some(
-                            body.get(if reason_key == "host_seed" {
-                                "seed_messages"
-                            } else {
-                                "legacy_messages"
-                            })
-                            .and_then(serde_json::Value::as_array)
-                            .ok_or_else(|| ReadError::Corrupt("seed identities missing".into()))?
-                            .len(),
-                        )
+                            ..
+                        } = &event.body.data
+                            && (reason_key == "host_seed" || reason_key == "legacy_import")
+                        {
+                            let payload = zeroclaw_api::session_events::context_read::present(
+                                self.catalog.store(),
+                                result_ref,
+                            )?;
+                            let body: serde_json::Value = serde_json::from_slice(&payload.body)
+                                .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                            Some(
+                                body.get(if reason_key == "host_seed" {
+                                    "seed_messages"
+                                } else {
+                                    "legacy_messages"
+                                })
+                                .and_then(serde_json::Value::as_array)
+                                .ok_or_else(|| {
+                                    ReadError::Corrupt("seed identities missing".into())
+                                })?
+                                .len(),
+                            )
+                        } else {
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
-                if checkpointed {
-                    reducer.apply_indexed(event, seed_count, &|id| {
-                        self.catalog.store.read_event(id)
-                    })?;
-                } else {
+                    };
                     reducer.apply_scoped(event, seed_count, include)?;
+                    if include && let EventData::TurnAccepted { ingress_ref, .. } = &event.body.data
+                    {
+                        let value = self.metadata_value(ingress_ref)?;
+                        reducer.observe_ingress(&value)?;
+                    }
                 }
-                if include && let EventData::TurnAccepted { ingress_ref, .. } = &event.body.data {
-                    let value = self.metadata_value(ingress_ref)?;
-                    reducer.observe_ingress(&value)?;
+                if !page.has_more {
+                    break;
                 }
-            }
-            if !page.has_more {
-                break;
-            }
-            after.sequence = page
-                .events
-                .last()
-                .ok_or_else(|| ReadError::Gap("empty catalog page".into()))?
-                .sequence;
-        }
-        if checkpointed {
-            reducer.compact();
-            if reducer.cursor().sequence != checkpoint_sequence {
-                reducer.save_checkpoint(self.catalog.store(), revision.as_ref())?;
+                after.sequence = page
+                    .events
+                    .last()
+                    .ok_or_else(|| ReadError::Gap("empty catalog page".into()))?
+                    .sequence;
             }
         }
         let pending: Vec<_> = reducer

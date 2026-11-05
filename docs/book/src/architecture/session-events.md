@@ -29,12 +29,46 @@ deletion, and deleted or closing generations still fail authorization.
 
 SQLite payload reads reuse the connection's disposable event-validation view
 for erasure visibility instead of reparsing the archive for every context item.
-An admitted writer uses its existing payload index; a read-only connection
-retains verified erasure event envelopes without running strict append admission, so
-future structural codecs remain readable. SQLite's transaction and
-`data_version` invalidate this view after a peer commit, and local append
-commits update the admitted index. Events remain canonical; this view contains
-no live permissions or duplicated payload bodies and is discarded on reopen.
+An admitted writer uses its existing payload index; a read-only connection can
+retain verified erasure event envelopes without strict append admission, so future
+structural codecs remain readable. A canonical-table revision counter changes on
+event/payload inserts, updates and deletes, including peer commits. Read-model
+and catalog-index writes do not invalidate admission. No live permissions or
+content-leaf bodies are copied into that view.
+
+Active context planning resolves retained message references and reads the event
+tail after the input projection. Frozen branch origins, effective model changes,
+provider attempts and context markers use indexed canonical coordinates. Summary
+publication uses the same compact open-transform view as session status plus
+indexed captured provider results. Rendering retained summary cards checks their
+frozen sources only when the canonical erasure frontier changes; publication
+still resolves source visibility and verifies captured generated output.
+
+Current session status and catalog metadata share a compact read checkpoint.
+It retains counts, active work, the latest terminal turn and latest metadata
+references; callers resolve those references with current authorization. Canonical
+boundary witnesses, body digests and erasure frontiers validate checkpoints.
+Canonical updates/deletes invalidate them, and publication checks the canonical
+revision captured before reduction so an in-flight reader cannot restore stale
+state after invalidation. Missing or invalid checkpoints rebuild from events.
+Historical and branch-scoped projections retain their full replay path.
+
+Append admission uses a separate rebuildable metadata checkpoint and per-commit
+delta journal in the same transaction as canonical appends. Full snapshots are
+spaced geometrically; ordinary commits write only their admission delta. Reopen
+restores a validated snapshot and journal and reconstructs an uncovered canonical
+tail. Invalid caches fall back to canonical reconstruction. Checkpoints omit
+content-leaf bodies and store no grants, bearer credentials or live policy. The
+canonical event stream, payloads and append receipts remain the source of truth.
+
+A validated quiescent prefix may skip detailed recovery only after a live
+stopped-writer proof and exact-prefix check. Active or uncertain work, child
+sessions, approval histories, erasure histories and unknown events keep the
+conservative recovery path. Admission metadata and full-snapshot restore cost
+still grow with the archive; explicit supersession identities also accumulate.
+These optimizations bound ordinary active-context and status work, not all memory
+or every cold-start path. JSONL and other stores retain safe fallback reads when
+they do not implement persistent checkpoints or coordinate indexes.
 
 The synchronous legacy conversation-binding owner refuses native session
 access without execution admission. It must not acknowledge a cache-only

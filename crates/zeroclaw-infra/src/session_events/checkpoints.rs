@@ -14,6 +14,9 @@ pub(super) fn ensure_schema(conn: &Connection) -> Result<(), AppendError> {
         CREATE TRIGGER IF NOT EXISTS session_checkpoint_payload_update AFTER UPDATE ON event_payloads BEGIN DELETE FROM session_projection_checkpoints; END;
         CREATE TRIGGER IF NOT EXISTS session_checkpoint_payload_delete AFTER DELETE ON event_payloads BEGIN DELETE FROM session_projection_checkpoints; END;
     ").map_err(map_sqlite)?;
+    for coordinate in ["causation_id", "invocation_id"] {
+        conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS session_events_{coordinate}_kind ON session_events(session_id,json_extract(event_json,'$.{coordinate}'),json_extract(event_json,'$.kind'),sequence) WHERE json_extract(event_json,'$.body.codec_version')=1;")).map_err(map_sqlite)?;
+    }
     // This creates the canonical-table change counter. Read-model/index writes
     // do not change it; INSERT, physical erasure and unsupported raw edits do.
     for table in ["session_events", "event_payloads"] {
@@ -82,6 +85,7 @@ impl SqliteEventStore {
             },
             erasure_revision: revision.into(),
             body,
+            expected_revision: None,
         }))
     }
 
@@ -94,6 +98,9 @@ impl SqliteEventStore {
         let conn = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(read_error)?;
+        if checkpoint.expected_revision != Some(canonical_revision(&conn)?) {
+            return Ok(());
+        }
         if erasure_revision(&conn)? != checkpoint.erasure_revision {
             return Ok(());
         }
@@ -136,6 +143,7 @@ mod tests {
                 .expect("revision")
                 .expect("supported"),
             body: b"fixture projection".to_vec(),
+            expected_revision: store.canonical_revision().expect("revision"),
         };
         let revision = canonical_revision(&store.conn.lock()).expect("revision");
         store
@@ -190,5 +198,14 @@ mod tests {
                 .is_none()
         );
         assert!(canonical_revision(&store.conn.lock()).expect("revision") > revision);
+        store
+            .save_projection_checkpoint("fixture/v1", &checkpoint)
+            .expect("stale publication is ignored");
+        assert!(
+            store
+                .load_projection_checkpoint(&stream, "fixture/v1")
+                .expect("load")
+                .is_none()
+        );
     }
 }

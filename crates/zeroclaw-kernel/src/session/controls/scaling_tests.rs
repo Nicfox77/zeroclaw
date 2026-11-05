@@ -3,8 +3,10 @@ use std::sync::atomic::AtomicUsize;
 
 pub(super) struct CountedStore {
     inner: Arc<dyn SessionEventStore>,
-    read_events: AtomicUsize,
+    pub(super) read_events: AtomicUsize,
     read_payloads: AtomicUsize,
+    pub(super) archived_through: AtomicUsize,
+    pub(super) archived_reads: AtomicUsize,
     forbidden_payloads: std::sync::Mutex<std::collections::HashSet<PayloadId>>,
 }
 
@@ -14,6 +16,8 @@ impl CountedStore {
             inner,
             read_events: AtomicUsize::new(0),
             read_payloads: AtomicUsize::new(0),
+            archived_through: AtomicUsize::new(0),
+            archived_reads: AtomicUsize::new(0),
             forbidden_payloads: Default::default(),
         }
     }
@@ -26,6 +30,25 @@ impl CountedStore {
 }
 
 impl SessionEventStore for CountedStore {
+    fn read_caused_events(
+        &self,
+        stream: &SessionId,
+        cause: &EventId,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        self.inner.read_caused_events(stream, cause, kind)
+    }
+    fn read_invocation_events(
+        &self,
+        stream: &SessionId,
+        invocation: &zeroclaw_api::session_events::InvocationId,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        self.inner.read_invocation_events(stream, invocation, kind)
+    }
+    fn canonical_revision(&self) -> Result<Option<i64>, ReadError> {
+        self.inner.canonical_revision()
+    }
     fn recovery_required(&self, through: &EventCursor) -> Result<Option<bool>, ReadError> {
         self.inner.recovery_required(through)
     }
@@ -90,6 +113,17 @@ impl SessionEventStore for CountedStore {
         let page = self.inner.read_page(stream, after, through, limit)?;
         self.read_events
             .fetch_add(page.events.len(), Ordering::SeqCst);
+        let archived = page
+            .events
+            .iter()
+            .filter(|event| event.sequence <= self.archived_through.load(Ordering::SeqCst) as u64)
+            .count();
+        // Point reads authorize a specific payload selector; they are not
+        // archive replay. Count archived pages used for scans separately.
+        if limit > 1 {
+            self.archived_reads.fetch_add(archived, Ordering::SeqCst);
+        }
+
         Ok(page)
     }
     fn head(&self, stream: &SessionId) -> Result<EventCursor, ReadError> {
