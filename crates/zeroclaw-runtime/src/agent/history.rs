@@ -101,7 +101,7 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
 /// (Anthropic high-res up to 4,784; GPT-4o-mini base 2,833; Qwen-VL ~4k per
 /// A4 page): this is a heuristic for trimming, not a ceiling, and
 /// provider-reported usage corrects it after the first successful response.
-pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
+pub use zeroclaw_api::model_provider::CONTEXT_IMAGE_TOKEN_ESTIMATE as IMAGE_TOKEN_ESTIMATE;
 
 /// Estimate the token cost of a single message: the ~4 chars/token heuristic
 /// plus ~4 framing tokens (role, delimiters). Images follow preparation
@@ -116,7 +116,7 @@ pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
 /// plain-text formula. Single-sourced so the history
 /// and system-floor estimates stay in lock-step.
 fn estimate_message_tokens(message: &ChatMessage, disposition: AttachmentDisposition) -> usize {
-    let text_estimate = message.context_text_bytes().div_ceil(4) + 4;
+    let text_estimate = message.estimated_text_tokens();
     if disposition == AttachmentDisposition::Literal {
         return text_estimate;
     }

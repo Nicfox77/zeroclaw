@@ -82,10 +82,7 @@ pub(super) struct Deck {
 pub(super) fn tokens(messages: &[ConversationMessage]) -> usize {
     messages
         .iter()
-        .flat_map(ConversationMessage::chat_messages)
-        .map(|message| {
-            message.content.chars().count().div_ceil(4) + 4 + message.attachments.len() * 1_024
-        })
+        .map(ConversationMessage::estimated_context_tokens)
         .sum()
 }
 
@@ -334,13 +331,17 @@ impl EngineSession {
         let maximum = boundaries[boundaries.len() - 2];
         let mut end = 0;
         let target = (raw_tokens / 2).min(policy.source_budget);
+        let mut prefix_tokens = 0;
+        let mut prefix_end = 0;
         for boundary in boundaries
             .iter()
             .copied()
             .skip(1)
             .take_while(|boundary| *boundary <= maximum)
         {
-            let size = tokens(&raw[..boundary]);
+            prefix_tokens += tokens(&raw[prefix_end..boundary]);
+            prefix_end = boundary;
+            let size = prefix_tokens;
             if size > policy.source_budget {
                 if end == 0 {
                     end = boundary;
