@@ -924,6 +924,27 @@ pub trait SessionEventStore: Send + Sync {
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError>;
     fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError>;
+    /// Check a frozen reference's erasure visibility without loading its content
+    /// leaf. This is not validation/admission of a new reference or a read grant.
+    fn read_payload_disposition(
+        &self,
+        reference: &StoredPayloadRef,
+    ) -> Result<payloads::PayloadDisposition, ReadError> {
+        use payloads::PayloadDisposition;
+        match self.read_payload(&reference.payload_id)? {
+            PayloadRead::Present(record) if StoredPayloadRef::from(&record) == *reference => {
+                Ok(PayloadDisposition::Present)
+            }
+            PayloadRead::Present(_) => Err(ReadError::Corrupt("payload reference mismatch".into())),
+            PayloadRead::ErasurePending => Ok(PayloadDisposition::ErasurePending),
+            PayloadRead::Redacted => Ok(PayloadDisposition::Redacted),
+        }
+    }
+    /// A representation-independent digest of canonical erasure requests.
+    /// None means the backend cannot accelerate frozen-source visibility checks.
+    fn erasure_revision(&self) -> Result<Option<Digest>, ReadError> {
+        Ok(None)
+    }
     /// Freeze all scopes reaching the leaves under the backend snapshot lock.
     fn erasure_scope(
         &self,

@@ -227,6 +227,67 @@ pub fn resolve_message(
     }
 }
 
+/// Recheck erasure visibility of a previously validated, frozen source. This
+/// does not admit a new reference or reconstruct its original content bytes.
+pub fn message_available(
+    store: &dyn SessionEventStore,
+    stream: &SessionId,
+    item: &MessageRef,
+) -> Result<bool, ReadError> {
+    use payloads::PayloadDisposition;
+    match &item.source {
+        ContextMessageSource::Conversation { payload_ref, .. } => {
+            Ok(store.read_payload_disposition(payload_ref)? == PayloadDisposition::Present)
+        }
+        ContextMessageSource::Content {
+            content_event_id,
+            content_ref,
+        } => {
+            let event = store
+                .read_event(content_event_id)?
+                .ok_or_else(|| ReadError::Gap("context content event absent".into()))?;
+            if event.session_id != *stream {
+                return Err(ReadError::Corrupt(
+                    "context reference outside stream".into(),
+                ));
+            }
+            let actual = match &event.body.data {
+                EventData::UserContentRecorded { content_ref, .. }
+                | EventData::AssistantContentRecorded { content_ref, .. } => content_ref,
+                // Legacy import identity validation retains its original path.
+                EventData::ContextProjectionCreated { reason_key, .. }
+                    if reason_key == "legacy_import" =>
+                {
+                    return Ok(resolve_message(store, stream, item)?.is_some());
+                }
+                _ => return Err(ReadError::Corrupt("context content source mismatch".into())),
+            };
+            if actual != content_ref {
+                return Err(ReadError::Corrupt("context reference mismatch".into()));
+            }
+            let content: ContentPayload =
+                serde_json::from_slice(&present(store, content_ref)?.body)
+                    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+            if content.message_id != item.message_id {
+                return Err(ReadError::Corrupt(
+                    "context message identity mismatch".into(),
+                ));
+            }
+            for part in content.parts {
+                let RecordedContentPart::Text { text_ref } = part else {
+                    return Err(ReadError::Corrupt(
+                        "content source requires a complete chat representation".into(),
+                    ));
+                };
+                if store.read_payload_disposition(&text_ref)? != PayloadDisposition::Present {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
 pub fn context_refs(
     store: &dyn SessionEventStore,
     event: &SessionEvent,
