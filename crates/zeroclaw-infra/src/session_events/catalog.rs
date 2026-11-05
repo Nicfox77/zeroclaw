@@ -699,8 +699,19 @@ impl SessionQuery<'_> {
         let lineage = branch
             .map(|branch| self.branch_lineage(stream, &head, branch))
             .transpose()?;
-        let mut reducer = SessionReducer::new(stream.clone(), include_context);
-        let mut after = EventCursor::beginning(stream.clone());
+        let checkpointed = !include_context && through.is_none() && branch.is_none();
+        let revision = if checkpointed {
+            self.catalog.store.erasure_revision()?
+        } else {
+            None
+        };
+        let mut reducer = if checkpointed {
+            SessionReducer::load_checkpoint(self.catalog.store(), stream, &head)?
+        } else {
+            SessionReducer::new(stream.clone(), include_context)
+        };
+        let mut after = reducer.cursor();
+        let checkpoint_sequence = after.sequence;
         loop {
             let page = self
                 .catalog
@@ -742,7 +753,13 @@ impl SessionQuery<'_> {
                 } else {
                     None
                 };
-                reducer.apply_scoped(event, seed_count, include)?;
+                if checkpointed {
+                    reducer.apply_indexed(event, seed_count, &|id| {
+                        self.catalog.store.read_event(id)
+                    })?;
+                } else {
+                    reducer.apply_scoped(event, seed_count, include)?;
+                }
                 if include && let EventData::TurnAccepted { ingress_ref, .. } = &event.body.data {
                     let value = self.metadata_value(ingress_ref)?;
                     reducer.observe_ingress(&value)?;
@@ -756,6 +773,12 @@ impl SessionQuery<'_> {
                 .last()
                 .ok_or_else(|| ReadError::Gap("empty catalog page".into()))?
                 .sequence;
+        }
+        if checkpointed {
+            reducer.compact();
+            if reducer.cursor().sequence != checkpoint_sequence {
+                reducer.save_checkpoint(self.catalog.store(), revision.as_ref())?;
+            }
         }
         let pending: Vec<_> = reducer
             .pending_metadata()

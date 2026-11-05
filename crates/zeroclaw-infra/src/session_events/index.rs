@@ -49,7 +49,9 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
                ON session_index(deleted, category, project, provider, model);
              CREATE INDEX IF NOT EXISTS session_erasure_requests
                ON session_events(event_id) WHERE json_extract(event_json,'$.kind')='payload_erasure_requested'
-               AND json_extract(event_json,'$.body.codec_version')=1;",
+               AND json_extract(event_json,'$.body.codec_version')=1;
+             CREATE INDEX IF NOT EXISTS session_context_reason ON session_events(session_id,json_extract(event_json,'$.branch_id'),json_extract(event_json,'$.body.fields.reason_key'),sequence DESC)
+               WHERE json_extract(event_json,'$.kind')='context_projection_created' AND json_extract(event_json,'$.body.codec_version')=1;",
         )
         .map_err(map_sqlite)?;
     Ok(())
@@ -123,8 +125,8 @@ where
     // derived metadata cannot be decoded, rebuild the projection from the
     // canonical event streams instead of making the session store unusable.
     let existing = rebuildable(load_sqlite_records(&connection))?;
-    let tx = connection.unchecked_transaction().map_err(map_sqlite)?;
     let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
     for stream in streams {
         seen.insert(stream.as_str().to_owned());
         let head = store
@@ -136,7 +138,13 @@ where
         {
             continue;
         }
-        let Some(record) = project(stream).map_err(append_read_error)? else {
+        changes.push((stream, project(stream).map_err(append_read_error)?));
+    }
+    // Projection can materialize a read checkpoint through another connection.
+    // Do that work before opening the index publication transaction.
+    let tx = connection.unchecked_transaction().map_err(map_sqlite)?;
+    for (stream, record) in changes {
+        let Some(record) = record else {
             tx.execute(
                 "DELETE FROM session_index WHERE session_id=?1",
                 params![stream.as_str()],

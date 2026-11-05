@@ -797,6 +797,33 @@ fn as_read(error: AppendError) -> ReadError {
     }
 }
 impl SessionEventStore for JsonlEventStore {
+    fn read_latest_event_before(
+        &self,
+        stream: &SessionId,
+        branch: &zeroclaw_api::session_events::BranchId,
+        turn: Option<&zeroclaw_api::session_events::TurnId>,
+        kind: &zeroclaw_api::session_events::EventKind,
+        through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        let _guard = self.lock().map_err(as_read)?;
+        let snapshot = self.snapshot().map_err(as_read)?;
+        let event = snapshot
+            .rows
+            .get(stream.as_str())
+            .into_iter()
+            .flat_map(|rows| rows.iter().rev())
+            .filter_map(|(_, id)| snapshot.history.get_event(id))
+            .find(|event| {
+                event.sequence <= through
+                    && event.branch_id.as_ref() == Some(branch)
+                    && turn.is_none_or(|turn| event.turn_id.as_ref() == Some(turn))
+                    && event.body.kind() == *kind
+            })
+            .cloned();
+        self.verify_events(&snapshot, event.iter())
+            .map_err(as_read)?;
+        Ok(event)
+    }
     fn erasure_revision(&self) -> Result<Option<Digest>, ReadError> {
         let _guard = self.lock().map_err(as_read)?;
         let snapshot = self.snapshot().map_err(as_read)?;

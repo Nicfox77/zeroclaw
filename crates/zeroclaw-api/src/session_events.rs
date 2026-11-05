@@ -102,6 +102,14 @@ pub struct EventCursor {
     pub sequence: u64,
 }
 
+/// Disposable read-model bytes bound to a canonical prefix and erasure frontier.
+/// These bytes never authorize execution, replay effects, or cache live policy.
+pub struct ProjectionCheckpoint {
+    pub through: EventCursor,
+    pub erasure_revision: Digest,
+    pub body: Vec<u8>,
+}
+
 impl EventCursor {
     #[must_use]
     pub fn beginning(session_id: SessionId) -> Self {
@@ -879,6 +887,20 @@ pub enum ReadError {
 /// The storage boundary. Implementations must be append-only and must return
 /// the same receipt for a retry with the same commitment.
 pub trait SessionEventStore: Send + Sync {
+    fn load_projection_checkpoint(
+        &self,
+        _stream: &SessionId,
+        _kind: &str,
+    ) -> Result<Option<ProjectionCheckpoint>, ReadError> {
+        Ok(None)
+    }
+    fn save_projection_checkpoint(
+        &self,
+        _kind: &str,
+        _checkpoint: &ProjectionCheckpoint,
+    ) -> Result<(), ReadError> {
+        Ok(())
+    }
     fn append_batch(&self, request: AppendRequest) -> Result<AppendReceipt, AppendError>;
     /// Resolve immutable event relationships from their canonical source.
     /// This internal lookup does not authorize a viewer or expose a writer.
@@ -907,6 +929,60 @@ pub trait SessionEventStore: Send + Sync {
                 return Ok(Some(event));
             }
             through = after;
+        }
+        Ok(None)
+    }
+    /// Frozen indexed lookup. A fallback backend may scan only the bounded
+    /// prefix; SQLite and JSONL implement their existing coordinate indexes.
+    fn read_latest_event_before(
+        &self,
+        stream: &SessionId,
+        branch: &BranchId,
+        turn: Option<&TurnId>,
+        kind: &EventKind,
+        through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        let mut cursor = EventCursor {
+            session_id: stream.clone(),
+            sequence: through,
+        };
+        while cursor.sequence > 0 {
+            let after = EventCursor {
+                session_id: stream.clone(),
+                sequence: cursor.sequence.saturating_sub(256),
+            };
+            let page = self.read_page(stream, &after, Some(&cursor), 256)?;
+            if let Some(event) = page.events.into_iter().rev().find(|event| {
+                event.branch_id.as_ref() == Some(branch)
+                    && turn.is_none_or(|turn| event.turn_id.as_ref() == Some(turn))
+                    && event.body.kind() == *kind
+            }) {
+                return Ok(Some(event));
+            }
+            cursor = after;
+        }
+        Ok(None)
+    }
+    fn read_context_projection(
+        &self,
+        stream: &SessionId,
+        branch: &BranchId,
+        turn: Option<&TurnId>,
+        reason: &str,
+        mut through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        while let Some(event) = self.read_latest_event_before(
+            stream,
+            branch,
+            turn,
+            &EventKind::ContextProjectionCreated,
+            through,
+        )? {
+            if matches!(&event.body.data,EventData::ContextProjectionCreated {reason_key,..} if reason_key==reason)
+            {
+                return Ok(Some(event));
+            }
+            through = event.sequence.saturating_sub(1);
         }
         Ok(None)
     }

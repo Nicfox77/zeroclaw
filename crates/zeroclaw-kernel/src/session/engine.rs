@@ -565,9 +565,22 @@ impl SessionExecutionPort for EngineSession {
             let turn = self.active_turn()?;
             let owner = self.owner.clone();
             let stream = self.stream.clone();
-            let prepared = owner.clone().blocking(move || Ok(owner.stream_history(&stream)?.iter().any(|event|
-                event.turn_id == turn && matches!(&event.body.data,
-                    EventData::ContextProjectionCreated {reason_key,..} if reason_key == "main_session_turn_context")))).await?;
+            let branch = self.branch.clone();
+            let prepared = owner
+                .clone()
+                .blocking(move || {
+                    Ok(owner
+                        .store
+                        .read_context_projection(
+                            &stream,
+                            &branch,
+                            turn.as_ref(),
+                            "main_session_turn_context",
+                            owner.store.head(&stream)?.sequence,
+                        )?
+                        .is_some())
+                })
+                .await?;
             if !prepared {
                 let tail = context.messages.iter().rposition(|message|
                     matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "user"))

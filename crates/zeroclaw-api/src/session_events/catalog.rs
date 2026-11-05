@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     /// Derived streams have no local owner until an attribution event exists.
     /// Their execution authority is resolved from the committed parent request.
@@ -75,7 +75,7 @@ impl Session {
 }
 
 /// Details attach a context reference without duplicating session metadata.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionDetail {
     pub session: Session,
     pub context: Option<SessionEvent>,
@@ -90,6 +90,7 @@ impl std::ops::Deref for SessionDetail {
 
 /// Storage-independent reduction of a contiguous event prefix. Only the last
 /// effective value of each metadata field is resolved, avoiding repeated plan/body reads.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionReducer {
     stream: SessionId,
     record: Option<SessionDetail>,
@@ -101,9 +102,54 @@ pub struct SessionReducer {
     sequence: u64,
     history: projection::HistoryProjection,
     imported_messages: usize,
+    compacted_content: usize,
+    compacted_through: u64,
+    superseded: std::collections::HashSet<EventId>,
+    has_copy_seed: bool,
+    last_terminal: Option<(TurnId, projection::TurnView)>,
 }
 
 impl SessionReducer {
+    /// Restore a disposable summary prefix. An invalid/missing checkpoint is
+    /// rebuilt from events; historical/branch-scoped views never use this path.
+    pub fn load_checkpoint(
+        store: &dyn SessionEventStore,
+        stream: &SessionId,
+        through: &EventCursor,
+    ) -> Result<Self, ReadError> {
+        if let Some(checkpoint) = store.load_projection_checkpoint(stream, "session-summary/v1")?
+            && checkpoint.through.sequence <= through.sequence
+            && let Ok(reducer) = serde_json::from_slice::<Self>(&checkpoint.body)
+            && reducer.cursor() == checkpoint.through
+            && !reducer.include_context
+        {
+            return Ok(reducer);
+        }
+        Ok(Self::new(stream.clone(), false))
+    }
+
+    pub fn save_checkpoint(
+        &self,
+        store: &dyn SessionEventStore,
+        revision: Option<&Digest>,
+    ) -> Result<(), ReadError> {
+        if self.sequence == 0 {
+            return Ok(());
+        }
+        if let Some(revision) = revision {
+            store.save_projection_checkpoint(
+                "session-summary/v1",
+                &ProjectionCheckpoint {
+                    through: self.cursor(),
+                    erasure_revision: revision.clone(),
+                    body: serde_json::to_vec(self)
+                        .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn new(stream: SessionId, include_context: bool) -> Self {
         Self {
             history: projection::HistoryProjection::empty(stream.clone()),
@@ -116,6 +162,11 @@ impl SessionReducer {
             last_activity_sequence: 0,
             channel_sequence: 0,
             sequence: 0,
+            compacted_content: 0,
+            compacted_through: 0,
+            superseded: Default::default(),
+            has_copy_seed: false,
+            last_terminal: None,
         }
     }
 
@@ -205,6 +256,7 @@ impl SessionReducer {
                 algorithm_version,
                 ..
             } => {
+                self.has_copy_seed |= reason_key == "copy_on_write_seed";
                 if self.include_context {
                     detail.context = Some(event.clone());
                 }
@@ -236,7 +288,22 @@ impl SessionReducer {
             }
             _ => {}
         }
-        self.history.apply_event(event)?;
+        self.history.apply_turn(event)?;
+        if let Some(id) = &event.turn_id
+            && let Some(turn) = self.history.turns.get(id)
+            && !matches!(
+                turn.status,
+                projection::TurnStatus::Queued | projection::TurnStatus::Running
+            )
+            && self
+                .last_terminal
+                .as_ref()
+                .is_none_or(|(_, prior)| prior.accepted_sequence <= turn.accepted_sequence)
+        {
+            self.last_terminal = Some((id.clone(), turn.clone()));
+        }
+        self.history.apply_content(event);
+        self.history.source_cursor.sequence = event.sequence;
         self.sequence = event.sequence;
         state.head.sequence = event.sequence;
         Ok(())
@@ -270,6 +337,87 @@ impl SessionReducer {
         self.metadata
             .iter()
             .map(|(field, (sequence, reference, _))| (field.as_str(), *sequence, reference))
+    }
+
+    /// Update a compact summary using canonical identities for rare edits of
+    /// old content. No archived message body is needed to count a supersession.
+    pub fn apply_indexed(
+        &mut self,
+        event: &SessionEvent,
+        seed_count: Option<usize>,
+        resolve: &dyn Fn(&EventId) -> Result<Option<SessionEvent>, ReadError>,
+    ) -> Result<(), ReadError> {
+        if let EventData::ContentSuperseded {
+            target_event_ids, ..
+        } = &event.body.data
+        {
+            for id in target_event_ids {
+                if self.superseded.contains(id) {
+                    continue;
+                }
+                let target = resolve(id)?
+                    .ok_or_else(|| ReadError::Gap("superseded content missing".into()))?;
+                if target.session_id != self.stream {
+                    return Err(ReadError::Corrupt("supersession outside stream".into()));
+                }
+                if matches!(
+                    target.body.data,
+                    EventData::UserContentRecorded { .. }
+                        | EventData::AssistantContentRecorded { .. }
+                ) {
+                    if target.sequence <= self.compacted_through {
+                        self.compacted_content =
+                            self.compacted_content.checked_sub(1).ok_or_else(|| {
+                                ReadError::Corrupt("compacted message count underflow".into())
+                            })?;
+                    }
+                    self.superseded.insert(id.clone());
+                }
+            }
+        }
+        self.apply(event, seed_count)
+    }
+
+    /// Materialize only counts, current metadata references and active turns.
+    /// Completed turns and archived content do not enlarge ordinary reads.
+    pub fn compact(&mut self) {
+        self.compacted_content += self.history.content.len();
+        self.history.content.clear();
+        self.history.unknown_event_ids.clear();
+        self.history.turns.retain(|_, turn| {
+            matches!(
+                turn.status,
+                projection::TurnStatus::Queued | projection::TurnStatus::Running
+            )
+        });
+        self.compacted_through = self.sequence;
+    }
+    pub fn cursor(&self) -> EventCursor {
+        EventCursor {
+            session_id: self.stream.clone(),
+            sequence: self.sequence,
+        }
+    }
+    pub fn has_copy_seed(&self) -> bool {
+        self.has_copy_seed
+    }
+    pub fn active_turn(&self) -> Option<TurnId> {
+        self.history
+            .turns
+            .iter()
+            .filter(|(_, turn)| {
+                matches!(
+                    turn.status,
+                    projection::TurnStatus::Queued | projection::TurnStatus::Running
+                )
+            })
+            .min_by_key(|(_, turn)| turn.accepted_sequence)
+            .map(|(id, _)| id.clone())
+    }
+    pub fn latest_outcome_unknown(&self) -> bool {
+        self.last_terminal
+            .as_ref()
+            .is_some_and(|(_, turn)| turn.status == projection::TurnStatus::Unknown)
     }
 
     /// Channel attribution is derived from accepted ingress, without another
@@ -365,7 +513,8 @@ impl SessionReducer {
         if let Some(detail) = self.record.as_mut() {
             detail.session.message_count = self
                 .imported_messages
-                .checked_add(self.history.content.len())
+                .checked_add(self.compacted_content)
+                .and_then(|count| count.checked_add(self.history.content.len()))
                 .ok_or_else(|| ReadError::Corrupt("session message count overflow".into()))?;
             detail.session.running = self.history.turns.values().any(|turn| {
                 matches!(

@@ -157,20 +157,20 @@ pub struct SqliteEventStore {
 // invalidates them; append admission replaces that view with its richer index.
 enum ValidationSnapshot {
     Read {
-        data_version: i64,
+        revision: i64,
         erasures: Vec<SessionEvent>,
     },
     Admission {
-        data_version: i64,
+        revision: i64,
         history: Box<zeroclaw_api::session_events::rules::HistoryIndex>,
         payloads: Box<zeroclaw_api::session_events::payloads::PayloadIndex>,
     },
 }
 
 impl ValidationSnapshot {
-    fn data_version(&self) -> i64 {
+    fn revision(&self) -> i64 {
         match self {
-            Self::Read { data_version, .. } | Self::Admission { data_version, .. } => *data_version,
+            Self::Read { revision, .. } | Self::Admission { revision, .. } => *revision,
         }
     }
 
@@ -193,16 +193,14 @@ impl SqliteEventStore {
         conn: &Connection,
         id: &PayloadId,
     ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
-        let data_version: i64 = conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
-            .map_err(read_error)?;
+        let revision = checkpoints::canonical_revision(conn)?;
         let mut cached = self.validation.lock();
         if cached
             .as_ref()
-            .is_none_or(|cache| cache.data_version() != data_version)
+            .is_none_or(|cache| cache.revision() != revision)
         {
             *cached = Some(ValidationSnapshot::Read {
-                data_version,
+                revision,
                 erasures: Self::verified_history(conn)?
                     .into_iter()
                     .filter(|event| {
@@ -285,6 +283,7 @@ impl SqliteEventStore {
         .map_err(map_sqlite)?;
         }
         index::ensure_sqlite_schema(&conn)?;
+        checkpoints::ensure_schema(&conn)?;
         // SQLite inherits the database mode for newly created sidecars; also
         // repair pre-existing files without following substituted links.
         for suffix in ["-wal", "-shm"] {
@@ -408,28 +407,72 @@ impl SqliteEventStore {
 }
 
 impl SessionEventStore for SqliteEventStore {
-    fn read_latest_event(
+    fn read_context_projection(
+        &self,
+        stream: &SessionId,
+        branch: &zeroclaw_api::session_events::BranchId,
+        turn: Option<&zeroclaw_api::session_events::TurnId>,
+        reason: &str,
+        through: u64,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        let bound = i64::try_from(through)
+            .map_err(|_| ReadError::Gap("event cursor exceeds SQLite range".into()))?;
+        let id: Option<String> = {
+            let conn = self.conn.lock();
+            let query = "SELECT event_id FROM session_events WHERE session_id=?1 AND json_extract(event_json,'$.branch_id')=?2 AND json_extract(event_json,'$.body.fields.reason_key')=?3 AND sequence<=?4 AND json_extract(event_json,'$.kind')='context_projection_created' AND json_extract(event_json,'$.body.codec_version')=1";
+            if let Some(turn) = turn {
+                conn.query_row(&format!("{query} AND json_extract(event_json,'$.turn_id')=?5 ORDER BY sequence DESC LIMIT 1"),params![stream.as_str(),branch.as_str(),reason,bound,turn.as_str()],|row|row.get(0)).optional().map_err(read_error)?
+            } else {
+                conn.query_row(
+                    &format!("{query} ORDER BY sequence DESC LIMIT 1"),
+                    params![stream.as_str(), branch.as_str(), reason, bound],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(read_error)?
+            }
+        };
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let id = EventId::parse(id).map_err(|error| ReadError::Corrupt(error.to_string()))?;
+        let event = self
+            .read_event(&id)?
+            .ok_or_else(|| ReadError::Gap("context lookup missing".into()))?;
+        if event.session_id != *stream
+            || event.branch_id.as_ref() != Some(branch)
+            || turn.is_some_and(|turn| event.turn_id.as_ref() != Some(turn))
+            || event.sequence > through
+            || !matches!(&event.body.data,zeroclaw_api::session_events::EventData::ContextProjectionCreated {reason_key,..} if reason_key==reason)
+        {
+            return Err(ReadError::Corrupt("context index mismatch".into()));
+        }
+        Ok(Some(event))
+    }
+    fn read_latest_event_before(
         &self,
         stream: &SessionId,
         branch: &zeroclaw_api::session_events::BranchId,
         turn: Option<&zeroclaw_api::session_events::TurnId>,
         kind: &zeroclaw_api::session_events::EventKind,
+        through: u64,
     ) -> Result<Option<SessionEvent>, ReadError> {
-        let kind_tag =
+        let tag =
             serde_json::to_value(kind).map_err(|error| ReadError::Corrupt(error.to_string()))?;
-        let kind_tag = kind_tag
+        let tag = tag
             .as_str()
             .ok_or_else(|| ReadError::Corrupt("event kind is not a string".into()))?;
+        let bound = i64::try_from(through)
+            .map_err(|_| ReadError::Gap("event cursor exceeds SQLite range".into()))?;
         let id: Option<String> = {
             let conn = self.conn.lock();
-
-            let common = "SELECT event_id FROM session_events WHERE session_id=?1 AND json_extract(event_json, '$.branch_id')=?2 AND json_extract(event_json, '$.kind')=?3 AND json_extract(event_json, '$.body.codec_version')=1";
+            let common = "SELECT event_id FROM session_events WHERE session_id=?1 AND json_extract(event_json,'$.branch_id')=?2 AND json_extract(event_json,'$.kind')=?3 AND json_extract(event_json,'$.body.codec_version')=1 AND sequence<=?4";
             if let Some(turn) = turn {
-                conn.query_row(&format!("{common} AND json_extract(event_json, '$.turn_id')=?4 ORDER BY sequence DESC LIMIT 1"), params![stream.as_str(),branch.as_str(),kind_tag,turn.as_str()], |row|row.get(0)).optional().map_err(read_error)?
+                conn.query_row(&format!("{common} AND json_extract(event_json,'$.turn_id')=?5 ORDER BY sequence DESC LIMIT 1"), params![stream.as_str(),branch.as_str(),tag,bound,turn.as_str()], |row|row.get(0)).optional().map_err(read_error)?
             } else {
                 conn.query_row(
                     &format!("{common} ORDER BY sequence DESC LIMIT 1"),
-                    params![stream.as_str(), branch.as_str(), kind_tag],
+                    params![stream.as_str(), branch.as_str(), tag, bound],
                     |row| row.get(0),
                 )
                 .optional()
@@ -447,10 +490,34 @@ impl SessionEventStore for SqliteEventStore {
             || event.branch_id.as_ref() != Some(branch)
             || turn.is_some_and(|turn| event.turn_id.as_ref() != Some(turn))
             || event.body.kind() != *kind
+            || event.sequence > through
         {
             return Err(ReadError::Corrupt("latest event index mismatch".into()));
         }
         Ok(Some(event))
+    }
+    fn load_projection_checkpoint(
+        &self,
+        stream: &SessionId,
+        kind: &str,
+    ) -> Result<Option<zeroclaw_api::session_events::ProjectionCheckpoint>, ReadError> {
+        self.load_projection(stream, kind)
+    }
+    fn save_projection_checkpoint(
+        &self,
+        kind: &str,
+        checkpoint: &zeroclaw_api::session_events::ProjectionCheckpoint,
+    ) -> Result<(), ReadError> {
+        self.save_projection(kind, checkpoint)
+    }
+    fn read_latest_event(
+        &self,
+        stream: &SessionId,
+        branch: &zeroclaw_api::session_events::BranchId,
+        turn: Option<&zeroclaw_api::session_events::TurnId>,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Option<SessionEvent>, ReadError> {
+        self.read_latest_event_before(stream, branch, turn, kind, i64::MAX as u64)
     }
     fn read_event(&self, event_id: &EventId) -> Result<Option<SessionEvent>, ReadError> {
         let position: Option<(String, u64)> = {
@@ -520,11 +587,10 @@ impl SessionEventStore for SqliteEventStore {
                 current: head_seq,
             });
         }
-        let data_version: i64 = tx
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
-            .map_err(map_sqlite)?;
+        let revision = checkpoints::canonical_revision(&tx)
+            .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
         let mut cached = self.validation.lock();
-        if !matches!(cached.as_ref(), Some(ValidationSnapshot::Admission { data_version: version, .. }) if *version == data_version)
+        if !matches!(cached.as_ref(), Some(ValidationSnapshot::Admission { revision: version, .. }) if *version == revision)
         {
             let history = Self::verified_history(&tx)
                 .map_err(|error| AppendError::Corrupt(error.to_string()))?;
@@ -571,7 +637,7 @@ impl SessionEventStore for SqliteEventStore {
                 },
             )?;
             *cached = Some(ValidationSnapshot::Admission {
-                data_version,
+                revision,
                 history: Box::new(facts),
                 payloads: Box::new(payloads),
             });
@@ -667,12 +733,17 @@ impl SessionEventStore for SqliteEventStore {
         }
         #[cfg(test)]
         crash_tests::crash_boundary("sqlite_before_commit");
+        let next_revision = checkpoints::canonical_revision(&tx)
+            .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
         if let Err(error) = tx.commit() {
             *cached = None;
             return Err(AppendError::CommitOutcomeUnknown(error.to_string()));
         }
         history.commit(history_delta, &committed_events);
         payloads.commit(payload_delta);
+        if let Some(ValidationSnapshot::Admission { revision, .. }) = cached.as_mut() {
+            *revision = next_revision;
+        }
         if erased {
             checkpoint_erasure(&conn)?;
         }
@@ -892,19 +963,11 @@ impl SessionEventStore for SqliteEventStore {
 
     fn erasure_revision(&self) -> Result<Option<Digest>, ReadError> {
         let conn = self.conn.lock();
-        let mut statement = conn.prepare("SELECT event_id FROM session_events WHERE json_extract(event_json,'$.kind')='payload_erasure_requested' AND json_extract(event_json,'$.body.codec_version')=1 ORDER BY event_id").map_err(read_error)?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(read_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(read_error)?;
-        Ok(Some(Digest::from_bytes(
-            &zeroclaw_api::session_events::canonical_json(&ids)
-                .map_err(|error| ReadError::Corrupt(error.to_string()))?,
-        )))
+        Ok(Some(checkpoints::erasure_revision(&conn)?))
     }
 }
 
+mod checkpoints;
 pub mod cli_state;
 mod filesystem;
 pub mod import;
