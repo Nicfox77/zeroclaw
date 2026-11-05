@@ -193,7 +193,7 @@ pub async fn maybe_run_skill_review(
                 // The review fork owns a fresh transcript: no prior trim ran,
                 // so no crumb exists and none can outlive this scoped loop.
                 history_has_trim_breadcrumb: &mut fork_crumb_present,
-                injected_memory_preamble: &mut None,
+
                 // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,
@@ -385,6 +385,7 @@ mod tests {
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,

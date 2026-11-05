@@ -356,6 +356,7 @@ impl ImportWriter<'_> {
                     seeds.push(serde_json::json!({"source_index":item_index,"message_id":message_id,"role":chat.role}));
                 }
                 let reference = MessageRef {
+                    recalled_memory: None,
                     message_id,
                     source: ContextMessageSource::Conversation {
                         payload_ref: StoredPayloadRef::from(&conversation),

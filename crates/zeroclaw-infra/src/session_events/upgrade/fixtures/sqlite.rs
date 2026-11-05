@@ -308,6 +308,7 @@ impl SessionBackend for SqliteSessionBackend {
         let rows = statement
             .query_map(params![session_key], |row| {
                 Ok(ChatMessage {
+                    recalled_memory: None,
                     timestamp: None,
                     tool_calls: Vec::new(),
                     tool_result: None,
@@ -333,6 +334,7 @@ impl SessionBackend for SqliteSessionBackend {
 
         let rows = match stmt.query_map(params![session_key], |row| {
             Ok(ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -373,6 +375,7 @@ impl SessionBackend for SqliteSessionBackend {
                 .map(|dt| dt.with_timezone(&Utc));
             Ok(TimestampedMessage {
                 message: ChatMessage {
+                    recalled_memory: None,
                     timestamp: None,
                     tool_calls: Vec::new(),
                     tool_result: None,

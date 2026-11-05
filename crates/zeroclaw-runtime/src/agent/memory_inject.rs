@@ -1,11 +1,10 @@
-//! Unified memory-context injection: ONE policy and ONE renderer for the
-//! memory preamble, applied at the turn engine.
+//! Shared recall policy and retained observations applied at the turn engine.
 //!
 //! Replaces the per-path inline renderers (the three `loop_` sites, the
 //! channel orchestrator's budgeted renderer, the agent-direct loader, and
 //! the cron/daemon pre-prompt blocks). The injection decision is keyed on
 //! [`TurnOrigin`] (who initiated the turn), resolved by
-//! [`resolve_inject_policy`]; the pipeline in [`render_memory_context`] is
+//! [`resolve_inject_policy`]; the pipeline in [`recall_memory_context`] is
 //! the uniform superset of the legacy renderers' behavior. Divergences from
 //! any individual legacy path are deliberate and documented on the PR that
 //! wires this module (uniform rigour: a per-path difference is an error
@@ -17,19 +16,19 @@
 //! replacing decay on that arm) -> relevance filter -> skip set (autosave
 //! keys/content, `*_history` keys, `<tool_result`
 //! blocks, optional Conversation-category exclusion) -> budget caps (entry
-//! count, per-entry chars, total chars) -> `[Memory context]` wrapper.
+//! count, per-entry chars, total chars) -> typed observation. Unchanged active
+//! observations are skipped before consuming those budgets; providers render
+//! the observation as a `[Memory context]` block at physical dispatch.
 //! Exactly one `MemoryRecall` observer event is emitted per render,
 //! covering all recalls.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
 use zeroclaw_api::ingress::TurnOrigin;
-use zeroclaw_memory::{
-    self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, MemoryEntry, decay,
-    rerank,
-};
+use zeroclaw_api::model_provider::{ChatMessage, RecalledMemoryContext, RecalledMemoryEntry};
+use zeroclaw_memory::{self, Memory, MemoryCategory, MemoryEntry, decay, rerank};
 
 use super::loop_::make_query_summary;
 use crate::agent::TurnMeta;
@@ -271,6 +270,31 @@ pub async fn render_memory_context(
     exclude_conversation: bool,
     turn: TurnMeta<'_>,
 ) -> String {
+    recall_memory_context(
+        mem,
+        observer,
+        user_msg,
+        sessions,
+        cfg,
+        exclude_conversation,
+        turn,
+        &[],
+    )
+    .await
+    .render()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn recall_memory_context(
+    mem: &dyn Memory,
+    observer: &dyn Observer,
+    user_msg: &str,
+    sessions: &[Option<&str>],
+    cfg: &MemoryInjectConfig,
+    exclude_conversation: bool,
+    turn: TurnMeta<'_>,
+    retained: &[ChatMessage],
+) -> RecalledMemoryContext {
     let backend = mem.name().to_string();
     let query_summary = make_query_summary(user_msg);
 
@@ -347,7 +371,19 @@ pub async fn render_memory_context(
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
     }
 
-    let mut context = String::new();
+    // Derived only from active context. The newest observation of a key wins,
+    // including when a memory changes back to an older value.
+    let prior: HashMap<&str, &RecalledMemoryEntry> = retained
+        .iter()
+        .filter_map(|message| message.recalled_memory.as_ref())
+        .flat_map(|context| {
+            context
+                .entries
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry))
+        })
+        .collect();
+    let mut selected = Vec::new();
     let mut included = 0usize;
     let mut used_chars = 0usize;
 
@@ -384,48 +420,26 @@ pub async fn render_memory_context(
             None => writeln!(line, "- {}: {}", entry.key, content),
         };
         let line_chars = line.chars().count();
+        let snapshot = RecalledMemoryEntry {
+            key: entry.key.clone(),
+            content,
+            stored_on: stamp.map(str::to_owned),
+        };
+        if prior
+            .get(entry.key.as_str())
+            .is_some_and(|previous| **previous == snapshot)
+        {
+            continue;
+        }
         if used_chars + line_chars > cfg.max_total_chars {
             break;
         }
-
-        if included == 0 {
-            context.push_str(MEMORY_CONTEXT_OPEN);
-            context.push('\n');
-        }
-        context.push_str(&line);
+        selected.push(snapshot);
         used_chars += line_chars;
         included += 1;
     }
 
-    if included > 0 {
-        context.push_str(MEMORY_CONTEXT_CLOSE);
-        context.push_str("\n\n");
-    }
-
-    context
-}
-
-/// Strip a `render_memory_context` preamble off the front of `content`.
-/// `preamble` is the exact block the injecting call recorded rendering
-/// (`run_tool_call_loop`'s `injected_memory_preamble` out-param) — never a
-/// generic marker pattern, since a genuine user message can legitimately
-/// start with the same marker text. Matching the exact rendered string (the
-/// specific recalled entries, not just the wrapper) is also what makes this
-/// safe to call on a buffer the injection never touched at all: a
-/// pre-injection clone of the message (the ordinary no-trim write-back path
-/// keeps one, separate from the buffer the injector actually mutated) simply
-/// won't start with that exact string, so `strip_prefix` is a no-op there.
-/// `None`, or a preamble that isn't an exact prefix of `content`, is a
-/// no-op: the preamble is provider-only per-turn context that must never be
-/// persisted into durable/canonical history (trim write-back, session
-/// storage), only sent to the provider for the turn that recalled it.
-pub(crate) fn strip_memory_context_preamble<'a>(
-    content: &'a str,
-    preamble: Option<&str>,
-) -> &'a str {
-    preamble
-        .and_then(|p| content.strip_prefix(p))
-        .unwrap_or(content)
+    RecalledMemoryContext { entries: selected }
 }
 
 #[cfg(test)]
@@ -434,6 +448,7 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
+    use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
     fn entry(
         key: &str,
@@ -599,6 +614,149 @@ mod tests {
         fn alias(&self) -> &str {
             "FixtureMemory"
         }
+    }
+
+    #[tokio::test]
+    async fn retained_recall_deduplicates_latest_observations_and_can_return_after_rotation() {
+        let observer = crate::observability::NoopObserver;
+        let cfg = MemoryInjectConfig {
+            date_stamp: false,
+            ..Default::default()
+        };
+        let turn = || TurnMeta {
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: "fixture",
+            channel_name: "test",
+        };
+        let original = || {
+            FixtureMemory::with(vec![entry(
+                "decision",
+                "version one",
+                MemoryCategory::Core,
+                Some(1.0),
+            )])
+        };
+        let mut retained = vec![];
+        let first = recall_memory_context(
+            &original(),
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            turn(),
+            &retained,
+        )
+        .await;
+        assert_eq!(first.entries.len(), 1);
+        let mut user = ChatMessage::user("original question");
+        user.recalled_memory = Some(first);
+        retained.push(user);
+        let again = recall_memory_context(
+            &original(),
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            turn(),
+            &retained,
+        )
+        .await;
+        assert!(again.entries.is_empty());
+        let changed = FixtureMemory::with(vec![entry(
+            "decision",
+            "version two",
+            MemoryCategory::Core,
+            Some(1.0),
+        )]);
+        let update = recall_memory_context(
+            &changed,
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            turn(),
+            &retained,
+        )
+        .await;
+        assert_eq!(update.entries[0].content, "version two");
+        let mut user = ChatMessage::user("next question");
+        user.recalled_memory = Some(update);
+        retained.push(user);
+        // A reversion is a new observation after the latest value, even though
+        // an earlier copy of that content remains in the conversation.
+        let reverted = recall_memory_context(
+            &original(),
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            turn(),
+            &retained,
+        )
+        .await;
+        assert_eq!(reverted.entries.len(), 1);
+        retained.clear();
+        assert_eq!(
+            recall_memory_context(
+                &original(),
+                &observer,
+                "query",
+                &[],
+                &cfg,
+                false,
+                turn(),
+                &retained
+            )
+            .await
+            .entries
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_duplicates_do_not_spend_the_new_recall_entry_budget() {
+        let observer = crate::observability::NoopObserver;
+        let cfg = MemoryInjectConfig {
+            max_entries: 1,
+            date_stamp: false,
+            ..Default::default()
+        };
+        let memory = FixtureMemory::with(vec![
+            entry("a", "already here", MemoryCategory::Core, Some(1.0)),
+            entry("b", "new fact", MemoryCategory::Core, Some(1.0)),
+        ]);
+        let mut user = ChatMessage::user("earlier question");
+        user.recalled_memory = Some(RecalledMemoryContext {
+            entries: vec![RecalledMemoryEntry {
+                key: "a".into(),
+                content: "already here".into(),
+                stored_on: None,
+            }],
+        });
+        let result = recall_memory_context(
+            &memory,
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: "fixture",
+                channel_name: "test",
+            },
+            &[user],
+        )
+        .await;
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].key, "b");
     }
 
     /// Records MemoryRecall events: (num_entries, success).
@@ -1796,55 +1954,6 @@ mod tests {
         memory.candidate_multiplier = 0;
         let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
         assert_eq!(cfg.candidate_multiplier, 1);
-    }
-
-    #[test]
-    fn strip_memory_context_preamble_recovers_the_original_user_content() {
-        let existing = "what's the weather like";
-        let preamble =
-            format!("{MEMORY_CONTEXT_OPEN}\n- k: some recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n");
-        let with_preamble = format!("{preamble}{existing}");
-        assert_eq!(
-            strip_memory_context_preamble(&with_preamble, Some(&preamble)),
-            existing,
-            "must recover exactly the pre-injection user content"
-        );
-    }
-
-    #[test]
-    fn strip_memory_context_preamble_is_a_no_op_without_a_recorded_preamble() {
-        let plain = "no memory preamble here";
-        assert_eq!(strip_memory_context_preamble(plain, None), plain);
-
-        // A user message that happens to start with the marker text is left
-        // untouched when the caller never recorded injecting a preamble on
-        // it — provenance comes from the caller's own record, not the text.
-        let looks_like_a_preamble = format!(
-            "{MEMORY_CONTEXT_OPEN}\n- k: a user-authored fact\n{MEMORY_CONTEXT_CLOSE}\n\nplease keep this text"
-        );
-        assert_eq!(
-            strip_memory_context_preamble(&looks_like_a_preamble, None),
-            looks_like_a_preamble
-        );
-    }
-
-    #[test]
-    fn strip_memory_context_preamble_is_a_no_op_when_the_recorded_preamble_is_not_an_exact_prefix()
-    {
-        // A pre-injection clone of the message (the ordinary no-trim
-        // write-back path keeps one, separate from the buffer the injector
-        // actually mutated) never carries the preamble at all, even though a
-        // preamble was recorded for *some* message this turn. The exact
-        // string match, not a generic marker match, is what keeps this a
-        // no-op instead of chewing into unrelated content.
-        let clean = "short reply";
-        let unrelated_preamble = format!(
-            "{MEMORY_CONTEXT_OPEN}\n- k: some other turn's recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n"
-        );
-        assert_eq!(
-            strip_memory_context_preamble(clean, Some(&unrelated_preamble)),
-            clean
-        );
     }
 
     /// Regression: a high-scoring but render-ineligible entry must not consume

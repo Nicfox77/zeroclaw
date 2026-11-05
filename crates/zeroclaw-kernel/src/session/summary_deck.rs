@@ -680,6 +680,7 @@ impl EngineSession {
             let summary = retry::payload(&started, "deck-message", "session.conversation/v1", &vec![ConversationMessage::Chat(ChatMessage::user(rendered))])?;
             let summary_ref = StoredPayloadRef::from(&summary);
             refs.insert(leading, MessageRef { message_id:MessageId::parse(format!("context-message-{started}-{leading}")).map_err(AppendError::from)?,
+                recalled_memory: None,
                 source:ContextMessageSource::Conversation { payload_ref:summary_ref.clone(), item_index:0 } });
             let context = retry::payload(&started, "deck-context", "session.context/v1", &serde_json::json!({
                 "message_refs":refs, "history_has_trim_breadcrumb":true, "summary_deck":deck,

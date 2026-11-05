@@ -67,6 +67,68 @@ pub struct ChatMessage {
     pub tool_result: Option<ToolResultMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// The immutable recall observation supplied with this turn. This is
+    /// context, not user-authored text; it leaves with the containing turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recalled_memory: Option<RecalledMemoryContext>,
+}
+
+pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
+pub const MEMORY_CONTEXT_CLOSE: &str = "[/Memory context]";
+
+/// Creates the historical fact of which memory snippets a turn received.
+/// The memory backend still owns current knowledge and access policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecalledMemoryContext {
+    pub entries: Vec<RecalledMemoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecalledMemoryEntry {
+    pub key: String,
+    /// Exact bounded content selected at recall time, never refreshed in place.
+    pub content: String,
+    pub stored_on: Option<String>,
+}
+
+impl RecalledMemoryContext {
+    pub fn rendered_bytes(&self) -> usize {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        MEMORY_CONTEXT_OPEN.len()
+            + MEMORY_CONTEXT_CLOSE.len()
+            + 3
+            + self
+                .entries
+                .iter()
+                .map(|entry| {
+                    2 + entry.key.len()
+                        + 2
+                        + entry.content.len()
+                        + 1
+                        + entry.stored_on.as_ref().map_or(0, |date| 8 + date.len())
+                })
+                .sum::<usize>()
+    }
+
+    pub fn render(&self) -> String {
+        use std::fmt::Write;
+        if self.entries.is_empty() {
+            return String::new();
+        }
+        let mut rendered = format!("{MEMORY_CONTEXT_OPEN}\n");
+        for entry in &self.entries {
+            if let Some(date) = &entry.stored_on {
+                let _ = writeln!(rendered, "- [from {date}] {}: {}", entry.key, entry.content);
+            } else {
+                let _ = writeln!(rendered, "- {}: {}", entry.key, entry.content);
+            }
+        }
+        rendered.push_str(MEMORY_CONTEXT_CLOSE);
+        rendered.push_str("\n\n");
+        rendered
+    }
 }
 
 /// Identity and outcome of a result; its text and attachments belong to the
@@ -171,6 +233,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
+            recalled_memory: None,
         }
     }
 
@@ -183,6 +246,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
+            recalled_memory: None,
         }
     }
 
@@ -195,6 +259,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
+            recalled_memory: None,
         }
     }
 
@@ -223,6 +288,7 @@ impl ChatMessage {
             attachments: result.attachments,
             tool_calls: Vec::new(),
             reasoning_content: None,
+            recalled_memory: None,
         }
     }
 
@@ -265,6 +331,7 @@ impl ChatMessage {
             // Reserve an approximate provider-rendered date envelope while
             // keeping its text out of durable context.
             + if self.role == "user" && self.timestamp.is_some() { 64 } else { 0 }
+            + self.recalled_memory.as_ref().map_or(0, RecalledMemoryContext::rendered_bytes)
     }
 
     /// Shared fallback estimate, before route-specific usage calibration and

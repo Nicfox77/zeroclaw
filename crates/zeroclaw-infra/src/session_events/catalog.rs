@@ -362,6 +362,7 @@ impl SessionQuery<'_> {
                                 first_user_preview = Some(self.preview_content(&content)?);
                             } else {
                                 let reference = zeroclaw_api::session_events::MessageRef {
+                                    recalled_memory: None,
                                     message_id: serde_json::from_value(user["message_id"].clone())
                                         .map_err(|error| ReadError::Corrupt(error.to_string()))?,
                                     source: zeroclaw_api::session_events::ContextMessageSource::Conversation {

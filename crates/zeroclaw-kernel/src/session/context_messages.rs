@@ -1,7 +1,7 @@
 //! Context planning reuses the API's canonical context-reference reader.
 use super::*;
 use std::collections::HashSet;
-use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, RecalledMemoryContext};
 fn context_read_error(error: ReadError) -> SessionError {
     match error {
         ReadError::OriginalPayloadErased(message) => SessionError::StaleTarget(message),
@@ -43,6 +43,20 @@ pub(super) struct ContextPlan {
     pub summary_ref: Option<StoredPayloadRef>,
     pub summary_source_refs: Vec<ProviderBlockRef>,
 }
+// Both values are derived from the current message view; neither is a second
+// durable owner. Recall is matched independently so adding context cannot
+// replace the original message creation source or its erasure dependencies.
+fn candidate_message(
+    mut message: ConversationMessage,
+) -> Result<(Vec<u8>, Option<RecalledMemoryContext>), AppendError> {
+    let memory = if let ConversationMessage::Chat(chat) = &mut message {
+        chat.recalled_memory.take()
+    } else {
+        None
+    };
+    Ok((canonical_json(&message)?, memory))
+}
+
 impl SessionCoordinator {
     /// New assistant chat items create their identity in a content event.
     /// Context projections and final settlement only reference that creation.
@@ -191,11 +205,8 @@ impl SessionCoordinator {
             let Some(message) = resolve_message(self.store.as_ref(), stream, &item)? else {
                 continue;
             };
-            candidates.push((
-                canonical_json(&message).map_err(AppendError::from)?,
-                item,
-                input.sequence,
-            ));
+            let (bytes, memory) = candidate_message(message)?;
+            candidates.push((bytes, item, input.sequence, memory));
         }
         let head = self.store.head(stream)?;
         let lineage =
@@ -271,6 +282,7 @@ impl SessionCoordinator {
             }
             if supported {
                 let message = ConversationMessage::Chat(ChatMessage {
+                    recalled_memory: None,
                     timestamp: (role == "user").then_some(event.occurred_at),
                     tool_calls: Vec::new(),
                     tool_result: None,
@@ -283,6 +295,7 @@ impl SessionCoordinator {
                 candidates.push((
                     canonical_json(&message).map_err(AppendError::from)?,
                     MessageRef {
+                        recalled_memory: None,
                         message_id: content.message_id,
                         source: ContextMessageSource::Content {
                             content_event_id: event.event_id.clone(),
@@ -290,6 +303,7 @@ impl SessionCoordinator {
                         },
                     },
                     event.sequence,
+                    None,
                 ));
             }
         }
@@ -297,53 +311,73 @@ impl SessionCoordinator {
         let mut refs = Vec::new();
         let mut payloads = Vec::new();
         let mut matching =
-            std::collections::HashMap::<&[u8], std::collections::VecDeque<&MessageRef>>::new();
-        for (bytes, item, _) in &candidates {
+            std::collections::HashMap::<&[u8], std::collections::VecDeque<usize>>::new();
+        for (index, (bytes, _, _, _)) in candidates.iter().enumerate() {
             matching
                 .entry(bytes.as_slice())
                 .or_default()
-                .push_back(item);
+                .push_back(index);
         }
         for (index, message) in messages.iter().enumerate() {
-            let value =
-                serde_json::to_value(message).map_err(|e| ReadError::Corrupt(e.to_string()))?;
-            let bytes = canonical_json(&value).map_err(AppendError::from)?;
-            let matching_item = matching.get_mut(bytes.as_slice()).and_then(|queue| {
-                while let Some(item) = queue.pop_front() {
-                    if !used.contains(&item.message_id) {
-                        return Some(item);
+            let (bytes, memory) = candidate_message(message.clone())?;
+            let candidate = matching.get_mut(bytes.as_slice()).and_then(|queue| {
+                while let Some(index) = queue.pop_front() {
+                    if !used.contains(&candidates[index].1.message_id) {
+                        return Some(&candidates[index]);
                     }
                 }
                 None
             });
-            if let Some(item) = matching_item {
-                used.insert(item.message_id.clone());
-                refs.push(item.clone());
+            let mut item = if let Some((_, item, _, _)) = candidate {
+                item.clone()
             } else {
+                // New source bodies contain only their literal message, with
+                // the recall observation stored as its own referenced leaf.
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
                 let payload = super::retry::payload(
                     creation,
                     &format!("message-{index}"),
                     "session.conversation/v1",
                     &vec![value],
                 )?;
-                let message_id = MessageId::parse(format!("context-message-{creation}-{index}"))
-                    .map_err(AppendError::from)?;
-                used.insert(message_id.clone());
-                refs.push(MessageRef {
-                    message_id,
+                let item = MessageRef {
+                    message_id: MessageId::parse(format!("context-message-{creation}-{index}"))
+                        .map_err(AppendError::from)?,
                     source: ContextMessageSource::Conversation {
                         payload_ref: StoredPayloadRef::from(&payload),
                         item_index: 0,
                     },
-                });
+                    recalled_memory: None,
+                };
                 payloads.push(payload);
+                item
+            };
+            if candidate.is_none_or(|(_, _, _, prior)| prior != &memory) {
+                item.recalled_memory = if let Some(memory) = memory {
+                    let mut snapshot = ChatMessage::user("");
+                    snapshot.recalled_memory = Some(memory);
+                    let payload = super::retry::payload(
+                        creation,
+                        &format!("recall-{index}"),
+                        "session.conversation/v1",
+                        &vec![ConversationMessage::Chat(snapshot)],
+                    )?;
+                    let reference = StoredPayloadRef::from(&payload);
+                    payloads.push(payload);
+                    Some(reference)
+                } else {
+                    None
+                };
             }
+            used.insert(item.message_id.clone());
+            refs.push(item);
         }
         // Ranges describe immutable source events. A conversation source may
         // supply several items: mark it included if any item is retained, never
         // emit contradictory dispositions for the same event coordinate.
         let mut coordinates = std::collections::BTreeMap::new();
-        for (_, item, sequence) in &candidates {
+        for (_, item, sequence, _) in &candidates {
             if *sequence == 0 {
                 continue;
             }

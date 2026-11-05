@@ -3053,6 +3053,7 @@ data: [DONE]
     fn build_responses_input_maps_content_types_by_role() {
         let messages = vec![
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -3062,6 +3063,7 @@ data: [DONE]
                 content: "You are helpful.".into(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -3071,6 +3073,7 @@ data: [DONE]
                 content: "Hi".into(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -3080,6 +3083,7 @@ data: [DONE]
                 content: "Hello!".into(),
             },
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -3108,6 +3112,7 @@ data: [DONE]
     #[test]
     fn build_responses_input_uses_default_instructions_without_system() {
         let messages = vec![ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
@@ -3132,6 +3137,7 @@ data: [DONE]
                 attachments: Vec::new(),
             }),
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,

@@ -331,6 +331,7 @@ fn legacy_tool_metadata_survives_storage_upgrade_and_context_reconstruction() {
                 .append(
                     "gw_fixture",
                     &ChatMessage {
+                        recalled_memory: None,
                         timestamp: None,
                         role: "tool".into(),
                         content: serde_json::json!({

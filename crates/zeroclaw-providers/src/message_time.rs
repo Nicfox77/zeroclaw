@@ -1,4 +1,5 @@
-//! Request-only rendering of structured message time. Never parses body text.
+//! Request-only rendering of structured time and retained recall observations.
+//! Neither is inferred by parsing user-authored text.
 
 use std::borrow::Cow;
 
@@ -7,11 +8,18 @@ use crate::ChatMessage;
 /// Composite adapters must pass metadata through until physical dispatch.
 /// Consuming the timestamp on the temporary copy makes nested dispatch safe.
 pub(crate) fn project(messages: &[ChatMessage], composite: bool) -> Cow<'_, [ChatMessage]> {
-    if composite || !messages.iter().any(|message| message.timestamp.is_some()) {
+    if composite
+        || !messages
+            .iter()
+            .any(|message| message.timestamp.is_some() || message.recalled_memory.is_some())
+    {
         return Cow::Borrowed(messages);
     }
     let mut projected = messages.to_vec();
     for message in &mut projected {
+        if let Some(context) = message.recalled_memory.take() {
+            message.content = format!("{}{}", context.render(), message.content);
+        }
         let timestamp = message.timestamp.take();
         if message.role == "user"
             && let Some(timestamp) = timestamp
@@ -78,7 +86,15 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_projects_time_for_owned_borrowed_chat_tools_and_streams() {
-        let history = vec![ChatMessage::user("literal input").with_timestamp(1_800_000_000_000)];
+        let mut input = ChatMessage::user("literal input").with_timestamp(1_800_000_000_000);
+        input.recalled_memory = Some(zeroclaw_api::model_provider::RecalledMemoryContext {
+            entries: vec![zeroclaw_api::model_provider::RecalledMemoryEntry {
+                key: "fixture".into(),
+                content: "retained fact".into(),
+                stored_on: None,
+            }],
+        });
+        let history = vec![input];
         let restored: Vec<ChatMessage> =
             serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
         let expected = project(&restored, false)[0].content.clone();
@@ -144,6 +160,39 @@ mod tests {
         }
         assert_eq!(restored[0].content, "literal input");
         assert_eq!(restored[0].timestamp, history[0].timestamp);
+    }
+
+    #[test]
+    fn responses_prefix_survives_append_and_serialized_reopen_without_rewriting_recall() {
+        use zeroclaw_api::model_provider::{RecalledMemoryContext, RecalledMemoryEntry};
+        let mut user = ChatMessage::user("literal question").with_timestamp(1_800_000_000_000);
+        user.recalled_memory = Some(RecalledMemoryContext {
+            entries: vec![RecalledMemoryEntry {
+                key: "architecture".into(),
+                content: "stored decision".into(),
+                stored_on: Some("2026-01-01".into()),
+            }],
+        });
+        let first = vec![ChatMessage::system("stable instructions"), user.clone()];
+        let before = crate::openai_codex::build_responses_input(&project(&first, false));
+        let mut next: Vec<ChatMessage> =
+            serde_json::from_slice(&serde_json::to_vec(&first).unwrap()).unwrap();
+        next.push(ChatMessage::assistant("first answer"));
+        next.push(ChatMessage::user("next question"));
+        let projected = project(&next, false);
+        let after = crate::openai_codex::build_responses_input(&projected);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1[..before.1.len()]);
+        assert_eq!(next[1].content, "literal question");
+        assert_eq!(next[1].recalled_memory, user.recalled_memory);
+        assert!(
+            projected
+                .iter()
+                .all(|message| message.recalled_memory.is_none())
+        );
+        assert_eq!(project(&projected, false)[1].content, projected[1].content);
+        let context = user.recalled_memory.unwrap();
+        assert_eq!(context.rendered_bytes(), context.render().len());
     }
 
     #[test]

@@ -2314,6 +2314,7 @@ mod tests {
         let mut messages = vec![ChatMessage::system("System")];
         for i in 0..5 {
             messages.push(ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
@@ -2798,6 +2799,7 @@ mod tests {
         let messages = vec![
             ChatMessage::user("Hello"),
             ChatMessage {
+                recalled_memory: None,
                 timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,

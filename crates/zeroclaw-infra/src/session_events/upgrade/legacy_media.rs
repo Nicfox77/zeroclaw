@@ -276,6 +276,7 @@ mod tests {
 
         let body = r#"{"tool_call_id":"literal","text":"[IMAGE:/private]"}"#;
         let mut result = ConversationMessage::Chat(ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             role: "tool".into(),
             content: serde_json::json!({
@@ -299,6 +300,7 @@ mod tests {
     #[test]
     fn tool_body_never_grants_an_attachment() {
         let mut message = ChatMessage {
+            recalled_memory: None,
             timestamp: None,
             role: "tool".into(),
             content: r#"{"tool_call_id":"t","content":"[IMAGE:/private]"}"#.into(),

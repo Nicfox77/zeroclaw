@@ -1310,19 +1310,6 @@ impl AgentBuilder {
     }
 }
 
-/// Identifies the single message in a replayed buffer that actually
-/// received the provider-only recalled-memory preamble. The injector
-/// targets one message (the last user message at injection time); every
-/// other buffer a turn replays is either a pre-injection clone that never
-/// contained the preamble or a slice positioned after it. Callers pass the
-/// target only for the mutated history buffer, at the index the injected
-/// message holds within the exact slice being replayed — never for
-/// uninjected clones, which must replay byte-for-byte.
-struct MemoryPreambleTarget<'a> {
-    preamble: &'a str,
-    index: usize,
-}
-
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -1713,6 +1700,13 @@ impl Agent {
             transcript.push_str(&message.content.len().to_string());
             transcript.push(':');
             transcript.push_str(&message.content);
+            if let Some(context) = &message.recalled_memory {
+                let rendered = context.render();
+                transcript.push_str(";recalled_memory=");
+                transcript.push_str(&rendered.len().to_string());
+                transcript.push(':');
+                transcript.push_str(&rendered);
+            }
             transcript.push('\n');
         }
         transcript
@@ -3699,44 +3693,10 @@ impl Agent {
         })
     }
 
-    fn replay_loop_messages(
-        loop_messages: &[ChatMessage],
-        injected: Option<MemoryPreambleTarget<'_>>,
-    ) -> Vec<ConversationMessage> {
-        // The turn engine injects the recalled-memory preamble onto the last
-        // user message (`turn::mod.rs`'s `memory` handling, which records the
-        // exact rendered block) for this turn's provider request only; it
-        // must never land in durable/canonical history, which every call
-        // site of this function feeds.
-        //
-        // The strip is positional, never content-discovered: only
-        // `injected.index` is considered, and only when that message is
-        // still a user-role message starting with the recorded preamble.
-        // Inferring the target from text instead — scanning every message
-        // for the preamble, even from the end — silently changes genuine
-        // history in two reachable cases. First, the no-trim and streamed
-        // callers replay pre-injection canonical clones alongside the
-        // recorded preamble; when the user's original text starts with that
-        // exact block, any content match strips genuine content from a
-        // buffer the injector never touched (those callers now pass `None`).
-        // Second, steering input appends newer user messages after the
-        // injected one, so a reverse scan can select the steering message,
-        // damaging it while leaving the injected memory in place. An older
-        // genuine message equal to the block is likewise never considered.
-        //
-        // The content confirmation is belt-and-braces, not discovery: it
-        // covers the trim dropping the injected message itself (the preamble
-        // leaves with it, so there is nothing to clean) without touching an
-        // unrelated message that shifted into the recorded position.
-        let strip_at = injected.as_ref().and_then(|target| {
-            loop_messages
-                .get(target.index)
-                .filter(|msg| msg.role == "user" && msg.content.starts_with(target.preamble))
-                .map(|_| target.index)
-        });
-        let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
-        fn push_replayed(replayed: &mut Vec<ConversationMessage>, message: ChatMessage) {
-            match message.into_conversation() {
+    fn replay_loop_messages(loop_messages: &[ChatMessage]) -> Vec<ConversationMessage> {
+        let mut replayed = Vec::with_capacity(loop_messages.len());
+        for message in loop_messages {
+            match message.clone().into_conversation() {
                 ConversationMessage::ToolResults(results) => {
                     if let Some(ConversationMessage::ToolResults(previous)) = replayed.last_mut() {
                         previous.extend(results);
@@ -3747,41 +3707,13 @@ impl Agent {
                 message => replayed.push(message),
             }
         }
-        for (index, msg) in loop_messages.iter().enumerate() {
-            let stripped = if strip_at == Some(index) {
-                crate::agent::memory_inject::strip_memory_context_preamble(
-                    &msg.content,
-                    injected.as_ref().map(|target| target.preamble),
-                )
-            } else {
-                msg.content.as_str()
-            };
-            if stripped.len() == msg.content.len() {
-                push_replayed(&mut replayed, msg.clone());
-            } else {
-                let mut msg = msg.clone();
-                msg.content = stripped.to_string();
-                push_replayed(&mut replayed, msg);
-            }
-        }
         replayed
     }
 
     pub(crate) fn replay_loop_messages_for_retention(
         loop_messages: &[ChatMessage],
     ) -> Vec<ConversationMessage> {
-        Self::replay_loop_messages(loop_messages, None)
-    }
-
-    pub(crate) fn replay_loop_messages_with_memory(
-        loop_messages: &[ChatMessage],
-        preamble: &str,
-        index: usize,
-    ) -> Vec<ConversationMessage> {
-        Self::replay_loop_messages(
-            loop_messages,
-            Some(MemoryPreambleTarget { preamble, index }),
-        )
+        Self::replay_loop_messages(loop_messages)
     }
 
     /// Format the observed error chain for the canonical session diagnostic.
@@ -4022,7 +3954,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
-        let mut loop_injected_memory_preamble: Option<super::turn::MemoryPreamble> = None;
+
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -4096,7 +4028,7 @@ impl Agent {
                         ),
                         history: &mut loop_history,
                         history_has_trim_breadcrumb: &mut loop_history_crumb_present,
-                        injected_memory_preamble: &mut loop_injected_memory_preamble,
+
                         channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: None,
@@ -4218,35 +4150,20 @@ impl Agent {
             // appending `loop_new_messages` a second time — doing so duplicated
             // the current turn (5 messages instead of 3).
             //
-            // This is the mutated history buffer, the only one that can
-            // carry the injected preamble: the current turn's user message
-            // opens the canonical tail, which starts at `new_prefix_len`.
-            // The positional confirmation inside replay still verifies the
-            // message before stripping it.
-            let injected =
-                loop_injected_memory_preamble
-                    .as_ref()
-                    .map(|target| MemoryPreambleTarget {
-                        preamble: &target.preamble,
-                        index: target.index,
-                    });
+            // Typed recall observations move with their user turns. Replay
+            // preserves both literal user text and retained context.
             self.history.clear();
             self.history
-                .extend(Self::replay_loop_messages(&loop_history, injected));
+                .extend(Self::replay_loop_messages(&loop_history));
             self.history_has_trim_breadcrumb = loop_history_crumb_present;
             self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
         } else {
             // No trim: the loop did not change the prefix. Pop the pre-loop
             // enriched user message and replay the canonical (which may be the
             // request-enriched form, not the raw `enriched` we pushed).
-            // `loop_new_messages` is a pre-injection clone the loop's memory
-            // injection never touches (it mutates `loop_history` in place,
-            // and only ever pushes to this buffer, never replaces it), so
-            // no strip target is passed: an uninjected clone must replay
-            // byte-for-byte even when the user's original text starts with
-            // the recorded preamble.
+            // Recall annotates the canonical delta as well as the request view.
             self.history.pop();
-            for replayed in Self::replay_loop_messages(&loop_new_messages, None) {
+            for replayed in Self::replay_loop_messages(&loop_new_messages) {
                 self.history.push(replayed);
             }
         }
@@ -4615,7 +4532,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
-        let mut loop_injected_memory_preamble: Option<super::turn::MemoryPreamble> = None;
+
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         // Track total canonical ChatMessage length so prefix detection is not
         // confused by `sync_pending` which always grows `loop_history` via the
@@ -4788,7 +4705,7 @@ impl Agent {
                             ),
                             history: &mut loop_history,
                             history_has_trim_breadcrumb: &mut loop_history_crumb_present,
-                            injected_memory_preamble: &mut loop_injected_memory_preamble,
+
                             channel_name: &self.channel_name,
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
@@ -4907,13 +4824,8 @@ impl Agent {
                 self.history.pop();
                 new_msgs.pop();
             }
-            // `round_added` is a pre-injection clone the loop's memory
-            // injection never touches (it mutates `loop_history` in place,
-            // once, before round 0, and only ever pushes to the canonical
-            // buffer), so no strip target is passed here either: even the
-            // round-0 user message it carries for a single tool-free
-            // exchange is the clean clone, and must replay byte-for-byte.
-            for replayed in Self::replay_loop_messages(&round_added, None) {
+            // The canonical delta carries the same immutable recall observation.
+            for replayed in Self::replay_loop_messages(&round_added) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
             }
@@ -4931,16 +4843,9 @@ impl Agent {
                 // which already contains the trimmed prefix + canonical. As
                 // above, this is the mutated buffer: the injected message,
                 // when retained, opens the canonical tail at `new_prefix_len`.
-                let injected =
-                    loop_injected_memory_preamble
-                        .as_ref()
-                        .map(|target| MemoryPreambleTarget {
-                            preamble: &target.preamble,
-                            index: target.index,
-                        });
                 self.history.clear();
                 self.history
-                    .extend(Self::replay_loop_messages(&loop_history, injected));
+                    .extend(Self::replay_loop_messages(&loop_history));
                 self.history_has_trim_breadcrumb = loop_history_crumb_present;
                 self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
                 streamed_original_loop_history_len = new_prefix_len;
@@ -5152,7 +5057,7 @@ impl Agent {
                     // assistant output (e.g. a persisted stream partial) when
                     // no prior round committed anything.
                     if committed_response.is_empty() {
-                        for replayed in Self::replay_loop_messages(&round_added, None) {
+                        for replayed in Self::replay_loop_messages(&round_added) {
                             if let ConversationMessage::Chat(message) = &replayed
                                 && message.role == "assistant"
                             {
@@ -5382,7 +5287,7 @@ mod tests {
             attachments: Vec::new(),
         })
         .with_attachments(vec![attachment.clone()]);
-        let replayed = Agent::replay_loop_messages(&[message], None);
+        let replayed = Agent::replay_loop_messages(&[message]);
         let ConversationMessage::ToolResults(results) = &replayed[0] else {
             panic!("typed tool results expected");
         };
@@ -5394,188 +5299,34 @@ mod tests {
     }
 
     #[test]
-    fn replay_loop_messages_strips_the_memory_context_preamble() {
-        let preamble = format!(
-            "{}\n- k: recalled fact\n{}\n\n",
-            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
-            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
-        );
-        let with_preamble = ChatMessage::user(format!("{preamble}what's the weather like"));
-        let assistant = ChatMessage::assistant("it's sunny".to_string());
-        let replayed = Agent::replay_loop_messages(
-            &[with_preamble, assistant],
-            Some(MemoryPreambleTarget {
-                preamble: preamble.as_str(),
-                index: 0,
-            }),
-        );
-
-        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
-            panic!(
-                "expected the user message to replay as Chat, got {:?}",
-                replayed[0]
-            );
+    fn replay_retains_typed_recall_without_changing_literal_user_or_steering_text() {
+        use zeroclaw_api::model_provider::{RecalledMemoryContext, RecalledMemoryEntry};
+        let quoted =
+            "[Memory context]\n- example: literal user text\n[/Memory context]\n\nquestion";
+        let mut message = ChatMessage::user(quoted);
+        message.recalled_memory = Some(RecalledMemoryContext {
+            entries: vec![RecalledMemoryEntry {
+                key: "fixture".into(),
+                content: "recalled evidence".into(),
+                stored_on: Some("2026-01-01".into()),
+            }],
+        });
+        let steering = ChatMessage::user(quoted);
+        let replayed = Agent::replay_loop_messages(&[
+            message.clone(),
+            ChatMessage::assistant("working"),
+            steering,
+        ]);
+        let ConversationMessage::Chat(first) = &replayed[0] else {
+            panic!("user")
         };
-        assert_eq!(user_msg.content, "what's the weather like");
-        assert!(
-            !user_msg
-                .content
-                .contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
-            "durable history must never carry the recalled-memory preamble"
-        );
-    }
-
-    /// Regression: a genuine user message that merely starts with the same
-    /// marker text as a recalled-memory preamble must survive byte-for-byte
-    /// when no length was recorded for it — provenance is the caller's own
-    /// record of what it injected, never a match against the marker text.
-    #[test]
-    fn replay_loop_messages_preserves_a_user_message_that_looks_like_a_preamble() {
-        let looks_like_a_preamble = ChatMessage::user(format!(
-            "{}\n- k: a user-authored fact\n{}\n\nplease keep this text",
-            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
-            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
-        ));
-        let original = looks_like_a_preamble.content.clone();
-        let replayed = Agent::replay_loop_messages(&[looks_like_a_preamble], None);
-
-        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
-            panic!(
-                "expected the user message to replay as Chat, got {:?}",
-                replayed[0]
-            );
+        let ConversationMessage::Chat(last) = &replayed[2] else {
+            panic!("steering")
         };
-        assert_eq!(
-            user_msg.content, original,
-            "a genuine user message must survive byte-for-byte without a recorded preamble length"
-        );
-    }
-
-    /// Regression: the no-trim and streamed callers replay pre-injection
-    /// canonical clones (`loop_new_messages` / `round_added`) that the
-    /// loop's memory injection never touches. Those callers pass no strip
-    /// target, so replay is byte-for-byte even when the user's original
-    /// text starts with the exact recorded preamble — the case that
-    /// content-discovered stripping corrupted.
-    #[test]
-    fn replay_loop_messages_never_strips_an_uninjected_clone_even_when_text_collides() {
-        let preamble = format!(
-            "{}\n- k: recalled fact\n{}\n\n",
-            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
-            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
-        );
-        // The user's genuine text starts with the exact recorded block, in
-        // a buffer the injector never touched.
-        let genuine = ChatMessage::user(format!("{preamble}my original question"));
-        let assistant = ChatMessage::assistant("answer 1".to_string());
-        let original = genuine.content.clone();
-
-        let replayed = Agent::replay_loop_messages(&[genuine, assistant], None);
-
-        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
-            panic!(
-                "expected the user message to replay as Chat, got {:?}",
-                replayed[0]
-            );
-        };
-        assert_eq!(
-            user_msg.content, original,
-            "an uninjected clone must survive intact: clones carry no strip target"
-        );
-    }
-
-    /// Regression: an older genuine user message that happens to equal the
-    /// exact rendered preamble must survive write-back. Replay strips only
-    /// the recorded target position in the mutated history buffer — never a
-    /// content match anywhere else in the buffer.
-    #[test]
-    fn replay_loop_messages_strips_only_the_injected_user_message_when_an_older_one_collides() {
-        let preamble = format!(
-            "{}\n- k: recalled fact\n{}\n\n",
-            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
-            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
-        );
-        // A genuine older turn quoting the exact recalled block verbatim.
-        let older_collision = ChatMessage::user(preamble.clone());
-        let injected = ChatMessage::user(format!("{preamble}current question"));
-        let assistant = ChatMessage::assistant("answer".to_string());
-        let replayed = Agent::replay_loop_messages(
-            &[older_collision, injected, assistant],
-            Some(MemoryPreambleTarget {
-                preamble: preamble.as_str(),
-                index: 1,
-            }),
-        );
-
-        assert_eq!(replayed.len(), 3);
-        let ConversationMessage::Chat(older_msg) = &replayed[0] else {
-            panic!(
-                "expected the older user message to replay as Chat, got {:?}",
-                replayed[0]
-            );
-        };
-        assert_eq!(
-            older_msg.content, preamble,
-            "an older genuine message matching the preamble must survive byte-for-byte"
-        );
-        let ConversationMessage::Chat(current_msg) = &replayed[1] else {
-            panic!(
-                "expected the injected user message to replay as Chat, got {:?}",
-                replayed[1]
-            );
-        };
-        assert_eq!(
-            current_msg.content, "current question",
-            "the injected message must still be stripped"
-        );
-    }
-
-    /// Regression: steering input appends newer user messages after the
-    /// injected one. Replay must strip the recorded target position only —
-    /// a later steering message starting with the same preamble block must
-    /// survive, and the injected memory must still be removed from the
-    /// original message.
-    #[test]
-    fn replay_loop_messages_preserves_a_later_steering_message_when_it_collides() {
-        let preamble = format!(
-            "{}\n- k: recalled fact\n{}\n\n",
-            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
-            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
-        );
-        let injected = ChatMessage::user(format!("{preamble}current question"));
-        let assistant = ChatMessage::assistant("working on it".to_string());
-        // A steering follow-up that happens to start with the same block.
-        let steering = ChatMessage::user(format!("{preamble}steering follow-up"));
-        let steering_original = steering.content.clone();
-        let replayed = Agent::replay_loop_messages(
-            &[injected, assistant, steering],
-            Some(MemoryPreambleTarget {
-                preamble: preamble.as_str(),
-                index: 0,
-            }),
-        );
-
-        assert_eq!(replayed.len(), 3);
-        let ConversationMessage::Chat(current_msg) = &replayed[0] else {
-            panic!(
-                "expected the injected user message to replay as Chat, got {:?}",
-                replayed[0]
-            );
-        };
-        assert_eq!(
-            current_msg.content, "current question",
-            "the injected message must still be stripped"
-        );
-        let ConversationMessage::Chat(steering_msg) = &replayed[2] else {
-            panic!(
-                "expected the steering message to replay as Chat, got {:?}",
-                replayed[2]
-            );
-        };
-        assert_eq!(
-            steering_msg.content, steering_original,
-            "a later steering message must survive even when it starts with the preamble"
-        );
+        assert_eq!(first.content, quoted);
+        assert_eq!(first.recalled_memory, message.recalled_memory);
+        assert_eq!(last.content, quoted);
+        assert!(last.recalled_memory.is_none());
     }
 
     zeroclaw_api::mock_tool_attribution!(
@@ -7973,6 +7724,117 @@ mod tests {
         alias: String,
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
         seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[tokio::test]
+    async fn recall_context_is_append_only_across_plain_streamed_and_restored_turns() {
+        let directory = tempfile::tempdir().expect("directory");
+        let memory = Arc::new(
+            zeroclaw_memory::sqlite::SqliteMemory::new("fixture", directory.path())
+                .expect("memory"),
+        );
+        memory
+            .store(
+                "architecture",
+                "architecture uses SQLite",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .expect("fact");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(TranscriptCaptureModelProvider {
+                alias: "fixture".into(),
+                responses: Mutex::new(vec![]),
+                seen_messages: seen.clone(),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(memory.clone())
+            .auto_save(true)
+            .observer(Arc::new(crate::observability::NoopObserver))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(directory.path().to_owned())
+            .model_name("fixture".into())
+            .build()
+            .expect("agent");
+        agent.turn("architecture first").await.expect("first turn");
+        let first = seen.lock()[0].clone();
+        assert!(
+            first
+                .iter()
+                .any(|message| message.content.contains("[Memory context]"))
+        );
+        assert!(
+            first
+                .iter()
+                .all(|message| message.recalled_memory.is_none()),
+            "physical provider receives rendered context"
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        agent
+            .turn_streamed("architecture second", tx, None)
+            .await
+            .expect("streamed turn");
+        let second = seen.lock()[1].clone();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second[..first.len()]).unwrap()
+        );
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message.content.contains("[Memory context]"))
+                .count(),
+            1,
+            "unchanged memory is not re-appended"
+        );
+        let stored = memory
+            .get("user_msg")
+            .await
+            .expect("get")
+            .expect("saved raw input");
+        assert_eq!(
+            stored.content, "architecture second",
+            "automatic memory writes exclude retained recall"
+        );
+        agent.history = serde_json::from_slice(&serde_json::to_vec(&agent.history).unwrap())
+            .expect("reopen typed context");
+        memory
+            .store(
+                "architecture",
+                "architecture uses a changed design",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .expect("update fact");
+        agent
+            .turn("architecture third")
+            .await
+            .expect("updated turn");
+        let third = seen.lock()[2].clone();
+        assert_eq!(
+            serde_json::to_value(&second).unwrap(),
+            serde_json::to_value(&third[..second.len()]).unwrap()
+        );
+        assert_eq!(
+            third
+                .iter()
+                .filter(|message| message.content.contains("[Memory context]"))
+                .count(),
+            2
+        );
+        assert!(
+            third
+                .last()
+                .expect("latest input")
+                .content
+                .contains("changed design")
+        );
+        assert!(agent.history.iter().any(|message|matches!(message,ConversationMessage::Chat(chat) if chat.content=="architecture first" && chat.recalled_memory.is_some())));
     }
 
     #[async_trait]

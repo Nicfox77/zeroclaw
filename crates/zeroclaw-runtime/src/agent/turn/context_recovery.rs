@@ -75,7 +75,6 @@ impl ContextRecovery {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_recover_context_overflow(
-    injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
     iteration: usize,
@@ -105,7 +104,6 @@ pub(crate) async fn try_recover_context_overflow(
         None => None,
     };
     let outcome = try_recover_context_overflow_unrecorded(
-        injected_memory_preamble,
         history,
         e,
         iteration,
@@ -140,7 +138,6 @@ pub(crate) async fn try_recover_context_overflow(
 
 #[allow(clippy::too_many_arguments)]
 async fn try_recover_context_overflow_unrecorded(
-    injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
     iteration: usize,
@@ -179,7 +176,6 @@ async fn try_recover_context_overflow_unrecorded(
         // retry-sizing limitation itself predates this token-accounting
         // feature.
         let tokens_now = estimate_history_tokens(history);
-        let retention_before = super::retention_layout(history, *crumb_present);
         // Preserve the established reactive policy after a context overflow.
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
@@ -205,12 +201,6 @@ async fn try_recover_context_overflow_unrecorded(
             tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);
         }
         *history = recovered_history;
-        super::remap_memory_after_trim(
-            injected_memory_preamble,
-            retention_before,
-            history,
-            *crumb_present,
-        );
         if trimmed {
             ::zeroclaw_log::record!(
                 INFO,
@@ -252,7 +242,6 @@ async fn try_recover_context_overflow_unrecorded(
                         tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                         unsatisfiable_floor: None,
                         retained_context: Some(super::retained_context_snapshot(
-                            injected_memory_preamble,
                             history,
                             *crumb_present,
                         )),
@@ -314,7 +303,7 @@ mod tests {
     use zeroclaw_providers::ChatMessage;
 
     #[tokio::test]
-    async fn retained_snapshot_tracks_injected_memory_across_retry_turn_trims() {
+    async fn retained_snapshot_preserves_typed_recall_until_its_turn_is_trimmed() {
         let preamble = "private recalled memory\n";
         let genuine = format!("{preamble}genuine retry text");
         let signature = serde_json::json!({"opaque_signature": "retain-this-signature"});
@@ -328,7 +317,18 @@ mod tests {
             ChatMessage::system("private system"),
             ChatMessage::user("old ".repeat(4000)),
             ChatMessage::assistant("old reply"),
-            ChatMessage::user(format!("{preamble}current request")),
+            {
+                let mut message = ChatMessage::user("current request");
+                message.recalled_memory =
+                    Some(zeroclaw_api::model_provider::RecalledMemoryContext {
+                        entries: vec![zeroclaw_api::model_provider::RecalledMemoryEntry {
+                            key: "fixture".into(),
+                            content: preamble.trim().into(),
+                            stored_on: None,
+                        }],
+                    });
+                message
+            },
             ChatMessage::assistant("current progress"),
             crate::agent::loop_::build_native_assistant_history(
                 "",
@@ -344,16 +344,11 @@ mod tests {
             }),
             ChatMessage::user(genuine.clone()),
         ];
-        let mut injected = Some(super::super::MemoryPreamble {
-            preamble: preamble.into(),
-            index: 3,
-        });
         let mut crumb = false;
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let error = anyhow::Error::msg("maximum context length exceeded");
         assert_eq!(
             super::try_recover_context_overflow(
-                &mut injected,
                 &mut history,
                 &error,
                 0,
@@ -379,7 +374,7 @@ mod tests {
         };
         let json = serde_json::to_string(&first.retained_messages).unwrap();
         assert!(!json.contains("private system"));
-        assert_eq!(json.matches("private recalled memory").count(), 1);
+        assert_eq!(json.matches("private recalled memory").count(), 2);
         assert!(json.contains("genuine retry text"));
         assert!(!json.contains("private reasoning"));
         let retained = first.retained_messages;
@@ -409,7 +404,6 @@ mod tests {
         // genuine input that then occupies a nearby position.
         assert_eq!(
             super::try_recover_context_overflow(
-                &mut injected,
                 &mut history,
                 &error,
                 1,
@@ -433,7 +427,11 @@ mod tests {
         else {
             panic!("second trim must include its retained projection");
         };
-        assert!(injected.is_none());
+        assert!(
+            history
+                .iter()
+                .all(|message| message.recalled_memory.is_none())
+        );
         assert!(second.retained_messages.iter().any(|message| matches!(message,
             zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.content == genuine)));
     }
@@ -442,7 +440,6 @@ mod tests {
     // calls the production seam with an explicit turn identity.
     #[allow(clippy::too_many_arguments)]
     async fn try_recover_context_overflow(
-        injected_memory_preamble: &mut Option<super::super::MemoryPreamble>,
         history: &mut Vec<ChatMessage>,
         error: &anyhow::Error,
         iteration: usize,
@@ -453,7 +450,6 @@ mod tests {
         crumb_present: &mut bool,
     ) -> ContextRecovery {
         super::try_recover_context_overflow(
-            injected_memory_preamble,
             history,
             error,
             iteration,
@@ -505,7 +501,6 @@ mod tests {
         let mut history = overflowing_history();
         let observer = TrimObserver::default();
         let recovered = super::try_recover_context_overflow(
-            &mut None,
             &mut history,
             &anyhow::Error::msg("maximum context length exceeded"),
             1,
@@ -550,7 +545,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -588,7 +582,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -629,7 +622,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -665,7 +657,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -756,7 +747,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -808,7 +798,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -854,7 +843,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -892,7 +880,6 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,
@@ -938,7 +925,6 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let recovered = try_recover_context_overflow(
-            &mut None,
             &mut history,
             &err,
             1,

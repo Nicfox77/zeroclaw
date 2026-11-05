@@ -140,6 +140,39 @@ next user message. Trimming therefore does not split a tool call from its
 result. A user message whose text happens to begin with `[Tool results]` is
 treated as part of the turn before it, not as a new turn.
 
+## Retained memory recall
+
+Recalled memories remain in the working context for all model providers. Each
+turn stores its selected snippets as a structured observation, separate from
+the user's literal message. Provider dispatch renders that observation as the
+existing `[Memory context]` block. Reconnects and restarts preserve it; normal
+turn trimming and summary-deck rotation determine when it leaves active context.
+
+Recall still runs against the new input using the existing scope, relevance,
+filtering and per-turn budgets. An unchanged observation already in active
+context is skipped before consuming the new-entry budget. Comparison uses the
+latest retained observation for each key, including its selected text and date.
+A changed value is appended with a later turn; earlier observations are never
+refreshed in place. Once its annotated turn leaves active context, a memory can
+be recalled again. Summaries may retain its meaning, but do not act as a second
+deduplication index.
+
+Between intentional context changes, adding a turn preserves earlier rendered
+recall blocks. This avoids memory-recall prefix edits that undermine provider
+prompt caching; cache availability and hits still depend on the provider.
+Compaction, tool-context collapse, system-prompt changes and other request
+changes can still invalidate a prefix. Retaining notes increases input tokens
+and can bring rotation forward. Their rendered bytes count toward context and
+summary budgets.
+
+The original transcript and user-message memory autosaves contain the raw user
+input, without injected recall. Current memory records and historical recall
+observations have different owners: editing or deleting a memory record does
+not rewrite a conversation that already received it. Native payload erasure
+can hide a stored observation, and summaries depending on it become unavailable.
+Erasing the original user source cannot resurrect it through a recall snapshot.
+There is no provider-specific toggle or additional configuration for this policy.
+
 ## Whole-turn retention
 
 `history_trim::trim_to_recent_turns` enforces the token budget.
