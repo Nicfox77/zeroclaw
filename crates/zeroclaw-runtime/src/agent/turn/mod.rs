@@ -1000,34 +1000,6 @@ pub(crate) struct DispatchTokenCounter {
     calibration_ratio: Option<f64>,
 }
 
-#[cfg(test)]
-mod route_usage_calibration_tests {
-    use super::*;
-
-    #[test]
-    fn reported_input_usage_calibrates_only_its_provider_and_model() {
-        for (provider, model, reported, estimated, expected) in [
-            ("fixture", "model-a", 400, 200, 200),
-            ("fixture", "model-b", 400, 200, 100),
-            ("other", "model-a", 400, 200, 100),
-            ("fixture", "model-a", 400, 0, 100),
-            ("fixture", "model-a", 100, 200, 100),
-        ] {
-            let counter = DispatchTokenCounter::for_route(
-                Some(ReportedRequestUsage {
-                    provider_name: "fixture".into(),
-                    model: "model-a".into(),
-                    reported_tokens: reported,
-                    estimated_tokens: estimated,
-                }),
-                provider,
-                model,
-            );
-            assert_eq!(counter.count(100), expected, "{provider}/{model}");
-        }
-    }
-}
-
 impl DispatchTokenCounter {
     fn for_route(usage: Option<ReportedRequestUsage>, provider: &str, model: &str) -> Self {
         let calibration_ratio = usage.and_then(|usage| {
@@ -11423,5 +11395,33 @@ mod tool_lifecycle_abandonment_tests {
             retained.lock().unwrap().is_empty(),
             "the cooperative dispatch releases exactly the retained entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod route_usage_calibration_tests {
+    use super::*;
+
+    #[test]
+    fn reported_input_usage_calibrates_only_its_provider_and_model() {
+        for (provider, model, reported, estimated, expected) in [
+            ("fixture", "model-a", 400, 200, 200),
+            ("fixture", "model-b", 400, 200, 100),
+            ("other", "model-a", 400, 200, 100),
+            ("fixture", "model-a", 400, 0, 100),
+            ("fixture", "model-a", 100, 200, 100),
+        ] {
+            let counter = DispatchTokenCounter::for_route(
+                Some(ReportedRequestUsage {
+                    provider_name: "fixture".into(),
+                    model: "model-a".into(),
+                    reported_tokens: reported,
+                    estimated_tokens: estimated,
+                }),
+                provider,
+                model,
+            );
+            assert_eq!(counter.count(100), expected, "{provider}/{model}");
+        }
     }
 }
