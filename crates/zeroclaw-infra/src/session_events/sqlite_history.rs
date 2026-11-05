@@ -1,9 +1,16 @@
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static VERIFIED_HISTORY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl SqliteEventStore {
     // Rebuild the rule index from committed rows. Recovery relies on the
     // transaction boundary and contiguous sequence numbers, not a hash chain.
     pub(super) fn verified_history(conn: &Connection) -> Result<Vec<SessionEvent>, ReadError> {
+        #[cfg(test)]
+        VERIFIED_HISTORY_READS.with(|count| count.set(count.get() + 1));
         let mut statement = conn
             .prepare("SELECT session_id,sequence,event_id,event_json FROM session_events ORDER BY session_id,sequence")
             .map_err(read_error)?;

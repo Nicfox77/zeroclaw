@@ -152,10 +152,39 @@ pub struct SqliteEventStore {
     validation: Mutex<Option<ValidationSnapshot>>,
 }
 
-struct ValidationSnapshot {
-    data_version: i64,
-    history: zeroclaw_api::session_events::rules::HistoryIndex,
-    payloads: zeroclaw_api::session_events::payloads::PayloadIndex,
+// Both variants are disposable views of committed events, never policy or a
+// second payload store. Readers retain verified erasure envelopes until a peer commit
+// invalidates them; append admission replaces that view with its richer index.
+enum ValidationSnapshot {
+    Read {
+        data_version: i64,
+        erasures: Vec<SessionEvent>,
+    },
+    Admission {
+        data_version: i64,
+        history: Box<zeroclaw_api::session_events::rules::HistoryIndex>,
+        payloads: Box<zeroclaw_api::session_events::payloads::PayloadIndex>,
+    },
+}
+
+impl ValidationSnapshot {
+    fn data_version(&self) -> i64 {
+        match self {
+            Self::Read { data_version, .. } | Self::Admission { data_version, .. } => *data_version,
+        }
+    }
+
+    fn disposition(
+        &self,
+        id: &PayloadId,
+    ) -> zeroclaw_api::session_events::payloads::PayloadDisposition {
+        match self {
+            Self::Read { erasures, .. } => {
+                zeroclaw_api::session_events::payloads::disposition(erasures, id)
+            }
+            Self::Admission { payloads, .. } => payloads.disposition(id),
+        }
+    }
 }
 
 impl SqliteEventStore {
@@ -462,9 +491,7 @@ impl SessionEventStore for SqliteEventStore {
             .query_row("PRAGMA data_version", [], |row| row.get(0))
             .map_err(map_sqlite)?;
         let mut cached = self.validation.lock();
-        if cached
-            .as_ref()
-            .is_none_or(|cache| cache.data_version != data_version)
+        if !matches!(cached.as_ref(), Some(ValidationSnapshot::Admission { data_version: version, .. }) if *version == data_version)
         {
             let history = Self::verified_history(&tx)
                 .map_err(|error| AppendError::Corrupt(error.to_string()))?;
@@ -510,17 +537,22 @@ impl SessionEventStore for SqliteEventStore {
                     .map_err(map_sqlite)
                 },
             )?;
-            *cached = Some(ValidationSnapshot {
+            *cached = Some(ValidationSnapshot::Admission {
                 data_version,
-                history: facts,
-                payloads,
+                history: Box::new(facts),
+                payloads: Box::new(payloads),
             });
         }
-        let cache = cached
-            .as_mut()
-            .ok_or_else(|| AppendError::Corrupt("validation reconstruction missing".into()))?;
-        let history_delta = cache.history.plan(&request)?;
-        let payload_delta = cache.payloads.plan(&cache.history, &request)?;
+        let Some(ValidationSnapshot::Admission {
+            history, payloads, ..
+        }) = cached.as_mut()
+        else {
+            return Err(AppendError::Corrupt(
+                "validation reconstruction missing".into(),
+            ));
+        };
+        let history_delta = history.plan(&request)?;
+        let payload_delta = payloads.plan(history, &request)?;
         let deleting = payload_delta.deleting().to_vec();
 
         let first_seq = head_seq
@@ -606,8 +638,8 @@ impl SessionEventStore for SqliteEventStore {
             *cached = None;
             return Err(AppendError::CommitOutcomeUnknown(error.to_string()));
         }
-        cache.history.commit(history_delta, &committed_events);
-        cache.payloads.commit(payload_delta);
+        history.commit(history_delta, &committed_events);
+        payloads.commit(payload_delta);
         if erased {
             checkpoint_erasure(&conn)?;
         }
@@ -775,9 +807,35 @@ impl SessionEventStore for SqliteEventStore {
         let Some((id, codec, body)) = row else {
             return Err(ReadError::PayloadMissing(payload_id.to_string()));
         };
-        let history = Self::verified_history(&conn)?;
-        use zeroclaw_api::session_events::payloads::{PayloadDisposition, disposition};
-        match disposition(&history, payload_id) {
+        let data_version: i64 = conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(read_error)?;
+        let mut cached = self.validation.lock();
+        if cached
+            .as_ref()
+            .is_none_or(|cache| cache.data_version() != data_version)
+        {
+            // Keep read compatibility with future structural codecs: a read
+            // verifies envelopes, but must not run strict append admission.
+            *cached = Some(ValidationSnapshot::Read {
+                data_version,
+                erasures: Self::verified_history(&conn)?
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event.body.data,
+                            zeroclaw_api::session_events::EventData::PayloadErasureRequested { .. }
+                                | zeroclaw_api::session_events::EventData::PayloadRedacted { .. }
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        let snapshot = cached
+            .as_ref()
+            .ok_or_else(|| ReadError::Corrupt("read snapshot reconstruction missing".into()))?;
+        use zeroclaw_api::session_events::payloads::PayloadDisposition;
+        match snapshot.disposition(payload_id) {
             PayloadDisposition::ErasurePending => return Ok(PayloadRead::ErasurePending),
             PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
             PayloadDisposition::Present => {}
@@ -1391,6 +1449,188 @@ mod conformance {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sqlite_payload_reads_do_not_reparse_history_for_every_context_item() {
+        let dir = TempDir::new().expect("directory");
+        let store = SqliteEventStore::open(dir.path()).expect("store");
+        let stream = SessionId::new();
+        let payload = PayloadRecord::new(
+            PayloadId::new(),
+            "session.text/v1".into(),
+            b"fixture title".to_vec(),
+        )
+        .expect("payload");
+        let mut events = vec![root(&stream)];
+        for _ in 0..2000 {
+            events.push(
+                SessionEvent::typed(
+                    stream.clone(),
+                    EventData::SessionMetadataChanged {
+                        field: "title".into(),
+                        new_value_ref: StoredPayloadRef::from(&payload),
+                    },
+                    EventActor::default(),
+                )
+                .expect("event"),
+            );
+        }
+        store
+            .append_batch(batch(&store, &stream, events, vec![payload.clone()]))
+            .expect("seed");
+        sqlite_history::VERIFIED_HISTORY_READS.with(|count| count.set(0));
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            assert_eq!(
+                store.read_payload(&payload.payload_id).expect("warm read"),
+                PayloadRead::Present(payload.clone())
+            );
+        }
+        sqlite_history::VERIFIED_HISTORY_READS.with(|count| assert_eq!(count.get(), 0));
+        eprintln!(
+            "200 warm payload reads across 2001 events: {:?}",
+            started.elapsed()
+        );
+        drop(store);
+        let store = SqliteEventStore::open(dir.path()).expect("reopen");
+        sqlite_history::VERIFIED_HISTORY_READS.with(|count| count.set(0));
+        for _ in 0..200 {
+            assert_eq!(
+                store
+                    .read_payload(&payload.payload_id)
+                    .expect("cold/read-only view"),
+                PayloadRead::Present(payload.clone())
+            );
+        }
+        sqlite_history::VERIFIED_HISTORY_READS.with(|count| assert_eq!(count.get(), 1));
+        // A read-only view is not sufficient for append admission.
+        let event = SessionEvent::typed(
+            stream.clone(),
+            EventData::SessionMetadataChanged {
+                field: "title".into(),
+                new_value_ref: StoredPayloadRef::from(&payload),
+            },
+            EventActor::default(),
+        )
+        .expect("event");
+        store
+            .append_batch(batch(&store, &stream, vec![event], vec![]))
+            .expect("upgrade read view to admission");
+        sqlite_history::VERIFIED_HISTORY_READS.with(|count| assert_eq!(count.get(), 2));
+        assert_eq!(
+            store
+                .read_payload(&payload.payload_id)
+                .expect("admission view"),
+            PayloadRead::Present(payload)
+        );
+        sqlite_history::VERIFIED_HISTORY_READS.with(|count| assert_eq!(count.get(), 2));
+    }
+
+    #[test]
+    fn sqlite_payload_read_snapshot_observes_peer_erasure_and_invalid_history() {
+        let dir = TempDir::new().expect("directory");
+        let writer = SqliteEventStore::open(dir.path()).expect("writer");
+        let reader = SqliteEventStore::open(dir.path()).expect("reader");
+        let stream = SessionId::new();
+        let payload = PayloadRecord::new(
+            PayloadId::new(),
+            "session.text/v1".into(),
+            b"private fixture content".to_vec(),
+        )
+        .expect("payload");
+        let reference = StoredPayloadRef::from(&payload);
+        let event = SessionEvent::typed(
+            stream.clone(),
+            EventData::SessionMetadataChanged {
+                field: "title".into(),
+                new_value_ref: reference.clone(),
+            },
+            EventActor::default(),
+        )
+        .expect("event");
+        writer
+            .append_batch(batch(
+                &writer,
+                &stream,
+                vec![root(&stream), event],
+                vec![payload.clone()],
+            ))
+            .expect("seed");
+        // Exercise invalidation of an admission view as well as a read-only view.
+        let event = SessionEvent::typed(
+            stream.clone(),
+            EventData::SessionMetadataChanged {
+                field: "title".into(),
+                new_value_ref: reference.clone(),
+            },
+            EventActor::default(),
+        )
+        .expect("reader event");
+        reader
+            .append_batch(batch(&reader, &stream, vec![event], vec![]))
+            .expect("reader admission");
+        assert_eq!(
+            reader.read_payload(&payload.payload_id).expect("present"),
+            PayloadRead::Present(payload.clone())
+        );
+        let page = writer
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
+            .expect("history");
+        let (_, commitment) = erasure_scope(
+            &page.events,
+            &[StoredPayload {
+                reference: reference.clone(),
+                body: Some(payload.body.clone()),
+            }],
+            std::slice::from_ref(&reference),
+        )
+        .expect("scope");
+        let intent = SessionEvent::typed(
+            stream.clone(),
+            EventData::PayloadErasureRequested {
+                targets: vec![reference],
+                reason_category: "operator_requested".into(),
+            },
+            EventActor::default(),
+        )
+        .expect("intent");
+        let id = intent.event_id.clone();
+        let mut request = batch(&writer, &stream, vec![intent], vec![]);
+        request.erasure_reference_commitment = Some(commitment);
+        writer.append_batch(request).expect("intent commit");
+        assert_eq!(
+            reader.read_payload(&payload.payload_id).expect("pending"),
+            PayloadRead::ErasurePending
+        );
+        let confirm = SessionEvent::typed(
+            stream.clone(),
+            EventData::PayloadRedacted {
+                erasure_requested_event_id: id,
+            },
+            EventActor::default(),
+        )
+        .expect("confirm");
+        writer
+            .append_batch(batch(&writer, &stream, vec![confirm], vec![]))
+            .expect("redact");
+        assert_eq!(
+            reader.read_payload(&payload.payload_id).expect("redacted"),
+            PayloadRead::Redacted
+        );
+        // A peer's invalid envelope must invalidate the read view and fail closed.
+        writer
+            .conn
+            .lock()
+            .execute(
+                "UPDATE session_events SET event_json=CAST('{}' AS BLOB) WHERE sequence=1",
+                [],
+            )
+            .expect("corrupt fixture");
+        assert!(matches!(
+            reader.read_payload(&payload.payload_id),
+            Err(ReadError::Corrupt(_))
+        ));
     }
 
     #[test]

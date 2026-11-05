@@ -294,6 +294,14 @@ impl PayloadDelta {
     }
 }
 impl PayloadIndex {
+    /// Current erasure visibility derived from the admitted event history.
+    pub fn disposition(&self, id: &PayloadId) -> PayloadDisposition {
+        self.dispositions
+            .get(id)
+            .copied()
+            .unwrap_or(PayloadDisposition::Present)
+    }
+
     pub fn from_history(
         history: &[SessionEvent],
         existing: &[StoredPayload],
