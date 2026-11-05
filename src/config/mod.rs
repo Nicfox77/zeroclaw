@@ -106,6 +106,7 @@ mod tests {
             bot_token: "token".into(),
             api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             stream_mode: StreamMode::default(),
+            send_text_with_voice: false,
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             interrupt_on_new_message: false,
