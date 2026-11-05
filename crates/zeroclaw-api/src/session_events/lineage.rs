@@ -2,6 +2,47 @@
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Resolve only immutable branch origins. SQLite indexes these lookups, so
+/// the common linear conversation does not replay its archived content.
+pub fn read_frozen_lineage(
+    store: &dyn SessionEventStore,
+    stream: &SessionId,
+    branch: &BranchId,
+    through: u64,
+) -> Result<BTreeMap<BranchId, u64>, ReadError> {
+    let mut origins = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = branch.clone();
+    loop {
+        if !seen.insert(current.clone()) {
+            return Err(ReadError::Corrupt("cyclic branch lineage".into()));
+        }
+        let mut origin = None;
+        for kind in [
+            EventKind::BranchCreated,
+            EventKind::SessionStarted,
+            EventKind::DerivedSessionStarted,
+        ] {
+            if let Some(event) = store.read_latest_event(stream, &current, None, &kind)? {
+                origin = Some(event);
+                break;
+            }
+        }
+        let origin = origin.ok_or_else(|| ReadError::Gap("branch origin missing".into()))?;
+        let parent = match &origin.body.data {
+            EventData::BranchCreated {
+                parent_branch_id, ..
+            } => Some(parent_branch_id.clone()),
+            _ => None,
+        };
+        origins.push(origin);
+        match parent {
+            Some(parent) => current = parent,
+            None => return frozen_lineage(&origins, stream, branch, through),
+        }
+    }
+}
+
 pub fn frozen_lineage<'a>(
     events: impl IntoIterator<Item = &'a SessionEvent>,
     stream: &SessionId,

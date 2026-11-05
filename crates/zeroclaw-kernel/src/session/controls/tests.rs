@@ -9,6 +9,9 @@ use zeroclaw_api::session_events::capture::*;
 #[path = "summary_deck_tests.rs"]
 mod summary_deck_tests;
 
+#[path = "scaling_tests.rs"]
+mod scaling_tests;
+
 struct Authority(AtomicBool);
 impl SessionAccessPolicy for Authority {
     fn authorize_actor(
