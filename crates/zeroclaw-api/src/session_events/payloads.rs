@@ -2,7 +2,7 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredPayload {
     pub reference: StoredPayloadRef,
     pub body: Option<Vec<u8>>,
@@ -264,7 +264,7 @@ pub fn erasure_scope(
 
 /// Validate relationships which require registered structure, never content leaves.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ApprovalState {
     requested: EventId,
     resolved: bool,
@@ -272,7 +272,7 @@ struct ApprovalState {
 }
 /// Disposable payload/reference admission index, reconstructed from committed
 /// records and events. Content leaves need metadata only during validation.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct PayloadIndex {
     records: HashMap<PayloadId, StoredPayload>,
     message_ids: HashSet<MessageId>,
@@ -280,6 +280,7 @@ pub struct PayloadIndex {
     dispositions: HashMap<PayloadId, PayloadDisposition>,
     provider_observations: super::provider_observation::ObservationIndex,
 }
+#[derive(Serialize, Deserialize)]
 pub struct PayloadDelta {
     records: HashMap<PayloadId, StoredPayload>,
     message_ids: HashSet<MessageId>,
@@ -289,6 +290,15 @@ pub struct PayloadDelta {
     provider_observations: super::provider_observation::ObservationDelta,
 }
 impl PayloadDelta {
+    /// Content bytes stay in canonical payload storage, never its admission
+    /// materialization. Structural references and validated offsets remain.
+    pub fn omit_content_bodies(&mut self) {
+        for record in self.records.values_mut() {
+            if content_leaf(&record.reference.codec) {
+                record.body = None;
+            }
+        }
+    }
     pub fn deleting(&self) -> &[PayloadId] {
         &self.deleting
     }

@@ -199,19 +199,24 @@ impl SqliteEventStore {
             .as_ref()
             .is_none_or(|cache| cache.revision() != revision)
         {
-            *cached = Some(ValidationSnapshot::Read {
-                revision,
-                erasures: Self::verified_history(conn)?
-                    .into_iter()
-                    .filter(|event| {
-                        matches!(
+            *cached = if let Some(restored) = admission_checkpoint::load_for_read(conn)? {
+                Some(restored)
+            } else {
+                Some(ValidationSnapshot::Read {
+                    revision,
+                    erasures:
+                        Self::verified_history(conn)?
+                            .into_iter()
+                            .filter(|event| {
+                                matches!(
                             event.body.data,
                             zeroclaw_api::session_events::EventData::PayloadErasureRequested { .. }
                                 | zeroclaw_api::session_events::EventData::PayloadRedacted { .. }
                         )
-                    })
-                    .collect(),
-            });
+                            })
+                            .collect(),
+                })
+            };
         }
         Ok(cached
             .as_ref()
@@ -284,6 +289,7 @@ impl SqliteEventStore {
         }
         index::ensure_sqlite_schema(&conn)?;
         checkpoints::ensure_schema(&conn)?;
+        admission_checkpoint::ensure_schema(&conn)?;
         // SQLite inherits the database mode for newly created sidecars; also
         // repair pre-existing files without following substituted links.
         for suffix in ["-wal", "-shm"] {
@@ -407,6 +413,26 @@ impl SqliteEventStore {
 }
 
 impl SessionEventStore for SqliteEventStore {
+    fn recovery_required(&self, through: &EventCursor) -> Result<Option<bool>, ReadError> {
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction().map_err(read_error)?;
+        if Self::current_head(&conn, &through.session_id)? != through.sequence {
+            return Ok(None);
+        }
+        let revision = checkpoints::canonical_revision(&conn)?;
+        let mut cached = self.validation.lock();
+        if !matches!(cached.as_ref(),Some(ValidationSnapshot::Admission {revision:prior,..}) if *prior==revision)
+        {
+            let Some(snapshot) = admission_checkpoint::load_for_read(&conn)? else {
+                return Ok(None);
+            };
+            *cached = Some(snapshot);
+        }
+        let Some(ValidationSnapshot::Admission { history, .. }) = cached.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(history.recovery_required(&through.session_id)))
+    }
     fn read_context_projection(
         &self,
         stream: &SessionId,
@@ -590,57 +616,64 @@ impl SessionEventStore for SqliteEventStore {
         let revision = checkpoints::canonical_revision(&tx)
             .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
         let mut cached = self.validation.lock();
+        let mut checkpoint_rebuilt = false;
         if !matches!(cached.as_ref(), Some(ValidationSnapshot::Admission { revision: version, .. }) if *version == revision)
         {
-            let history = Self::verified_history(&tx)
-                .map_err(|error| AppendError::Corrupt(error.to_string()))?;
-            let existing = {
-                let leaf_codecs = content_leaf_sql_list();
-                let query = format!(
-                    "SELECT payload_id, codec, CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END FROM event_payloads"
-                );
-                let mut statement = tx.prepare(&query).map_err(map_sqlite)?;
-                let rows = statement
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<Vec<u8>>>(2)?,
-                        ))
-                    })
-                    .map_err(map_sqlite)?;
-                let mut out = Vec::new();
-                for row in rows {
-                    let (id, codec, body) = row.map_err(map_sqlite)?;
-                    out.push(zeroclaw_api::session_events::payloads::StoredPayload {
-                        reference: zeroclaw_api::session_events::StoredPayloadRef {
-                            payload_id: PayloadId::from(id),
-                            codec,
-                        },
-                        body,
-                    });
-                }
-                out
-            };
-            let facts = zeroclaw_api::session_events::rules::HistoryIndex::from_history(&history)?;
-            let payloads = zeroclaw_api::session_events::payloads::PayloadIndex::from_index(
-                &facts,
-                &history,
-                &existing,
-                &|id| {
-                    tx.query_row(
-                        "SELECT length(body) FROM event_payloads WHERE payload_id=?1",
-                        params![id.as_str()],
-                        |row| row.get(0),
-                    )
-                    .map_err(map_sqlite)
-                },
-            )?;
-            *cached = Some(ValidationSnapshot::Admission {
-                revision,
-                history: Box::new(facts),
-                payloads: Box::new(payloads),
-            });
+            if let Some(restored) = admission_checkpoint::load(&tx)? {
+                *cached = Some(restored);
+            } else {
+                checkpoint_rebuilt = true;
+                let history = Self::verified_history(&tx)
+                    .map_err(|error| AppendError::Corrupt(error.to_string()))?;
+                let existing = {
+                    let leaf_codecs = content_leaf_sql_list();
+                    let query = format!(
+                        "SELECT payload_id, codec, CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END FROM event_payloads"
+                    );
+                    let mut statement = tx.prepare(&query).map_err(map_sqlite)?;
+                    let rows = statement
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<Vec<u8>>>(2)?,
+                            ))
+                        })
+                        .map_err(map_sqlite)?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        let (id, codec, body) = row.map_err(map_sqlite)?;
+                        out.push(zeroclaw_api::session_events::payloads::StoredPayload {
+                            reference: zeroclaw_api::session_events::StoredPayloadRef {
+                                payload_id: PayloadId::from(id),
+                                codec,
+                            },
+                            body,
+                        });
+                    }
+                    out
+                };
+                let facts =
+                    zeroclaw_api::session_events::rules::HistoryIndex::from_history(&history)?;
+                let payloads = zeroclaw_api::session_events::payloads::PayloadIndex::from_index(
+                    &facts,
+                    &history,
+                    &existing,
+                    &|id| {
+                        tx.query_row(
+                            "SELECT length(body) FROM event_payloads WHERE payload_id=?1",
+                            params![id.as_str()],
+                            |row| row.get(0),
+                        )
+                        .map_err(map_sqlite)
+                    },
+                )?;
+                *cached = Some(ValidationSnapshot::Admission {
+                    revision,
+                    history: Box::new(facts),
+                    payloads: Box::new(payloads),
+                });
+            }
         }
         let Some(ValidationSnapshot::Admission {
             history, payloads, ..
@@ -650,9 +683,10 @@ impl SessionEventStore for SqliteEventStore {
                 "validation reconstruction missing".into(),
             ));
         };
-        let history_delta = history.plan(&request)?;
-        let payload_delta = payloads.plan(history, &request)?;
+        let mut history_delta = history.plan(&request)?;
+        let mut payload_delta = payloads.plan(history, &request)?;
         let deleting = payload_delta.deleting().to_vec();
+        admission_checkpoint::maybe_save(&tx, history, payloads, checkpoint_rebuilt)?;
 
         let first_seq = head_seq
             .checked_add(1)
@@ -735,6 +769,9 @@ impl SessionEventStore for SqliteEventStore {
         crash_tests::crash_boundary("sqlite_before_commit");
         let next_revision = checkpoints::canonical_revision(&tx)
             .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
+        history_delta.bind_recorded(&committed_events);
+        payload_delta.omit_content_bodies();
+        admission_checkpoint::save_delta(&tx, &committed_events, &history_delta, &payload_delta)?;
         if let Err(error) = tx.commit() {
             *cached = None;
             return Err(AppendError::CommitOutcomeUnknown(error.to_string()));
@@ -967,6 +1004,7 @@ impl SessionEventStore for SqliteEventStore {
     }
 }
 
+mod admission_checkpoint;
 mod checkpoints;
 pub mod cli_state;
 mod filesystem;

@@ -28,32 +28,33 @@ pub fn order_provider_segments<T>(
     true
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum BlockKey {
     Protocol(ProviderContentPosition),
     Legacy(usize),
 }
 type ComponentKey = (InvocationId, BlockKey, String);
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LegacyBlock {
     descriptor: StoredPayloadRef,
     finalized: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Segment {
     position: Option<ProviderContentPosition>,
     reference: StoredPayloadRef,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub(super) struct ObservationIndex {
     components: HashMap<ComponentKey, Option<u64>>,
     segments: HashMap<(InvocationId, usize), Segment>,
     lengths: HashMap<InvocationId, usize>,
     legacy: HashMap<(InvocationId, usize), LegacyBlock>,
 }
+#[derive(Serialize, Deserialize)]
 pub(super) struct ObservationDelta {
     components: HashMap<ComponentKey, Option<u64>>,
     segments: HashMap<(InvocationId, usize), Segment>,

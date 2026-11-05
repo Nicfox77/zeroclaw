@@ -33,6 +33,28 @@ impl SessionCoordinator {
         stream: SessionId,
         verifier: Arc<dyn StreamExecutionLossVerifier>,
     ) -> Result<(), SessionError> {
+        let owner = self.clone();
+        let scope = stream.clone();
+        let settled = self
+            .blocking(move || {
+                let through = owner.store.head(&scope)?;
+                Ok((
+                    owner.store.recovery_required(&through)? == Some(false),
+                    through,
+                ))
+            })
+            .await?;
+        if settled.0 {
+            let proof = verifier.verify_stream_loss(&stream, &settled.1)?;
+            if proof.codec != "session.evidence/v1" {
+                return Err(SessionError::InvalidAdmission(
+                    "family recovery requires ownership proof".into(),
+                ));
+            }
+            if self.head(&stream)? == settled.1 {
+                return Ok(());
+            }
+        }
         let recovery_key = format!("family-owner-{}", EventId::new());
         let mut streams = vec![stream.clone()];
         let mut pending = vec![stream.clone()];
@@ -135,6 +157,7 @@ impl SessionCoordinator {
                     "recovery requires typed ownership evidence".into(),
                 ));
             }
+            if owner.store.recovery_required(&through)?==Some(false) { return Ok(None); }
             let mut projection = HistoryProjection::empty(stream.clone());
             let mut transforms = BTreeMap::new();
             let mut approvals = super::approvals::UnconsumedApprovals::default();

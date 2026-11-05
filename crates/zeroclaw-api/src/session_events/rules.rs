@@ -3,7 +3,7 @@ use super::index::{OverlayMap, OverlaySet};
 use super::*;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TurnState {
     stream: SessionId,
     branch: BranchId,
@@ -44,7 +44,7 @@ pub fn can_requeue_turn<'a>(
 
 /// Disposable admission index. Its only inputs are canonical committed events;
 /// it owns no permissions, scheduling decisions or writable session state.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct HistoryIndex {
     pub(super) prior: HashMap<EventId, SessionEvent>,
     branches: HashMap<BranchId, SessionId>,
@@ -64,6 +64,7 @@ pub struct HistoryIndex {
     streams: HashSet<SessionId>,
     closed: HashSet<SessionId>,
 }
+#[derive(Serialize, Deserialize)]
 pub struct HistoryDelta {
     prior: HashMap<EventId, SessionEvent>,
     branches: HashMap<BranchId, SessionId>,
@@ -83,7 +84,60 @@ pub struct HistoryDelta {
     streams: HashSet<SessionId>,
     closed: HashSet<SessionId>,
 }
+impl HistoryDelta {
+    /// Bind backend-assigned coordinates before serializing a disposable
+    /// validated delta. Publishing remains the storage transaction's job.
+    pub fn bind_recorded(&mut self, events: &[SessionEvent]) {
+        for event in events {
+            self.prior.insert(event.event_id.clone(), event.clone());
+            self.by_cursor.insert(
+                (event.session_id.clone(), event.sequence),
+                event.event_id.clone(),
+            );
+        }
+    }
+    pub fn recorded_event(&self, id: &EventId) -> Option<&SessionEvent> {
+        self.prior.get(id)
+    }
+}
 impl HistoryIndex {
+    /// Conservative eligibility for a no-op recovery. Complex families and
+    /// approval/erasure histories keep their detailed recovery path. This is
+    /// historical evidence only; the live owner must still prove writer loss.
+    pub fn recovery_required(&self, stream: &SessionId) -> bool {
+        self.turns
+            .values()
+            .any(|turn| turn.stream == *stream && !turn.terminal)
+            || self.invocation_scopes.iter().any(|(id, (scope, _, _, _))| {
+                scope == stream
+                    && self
+                        .invocations
+                        .get(id)
+                        .is_none_or(|(_, terminal)| !*terminal)
+            })
+            || self.transforms.iter().any(|(id, terminal)| {
+                !terminal
+                    && self
+                        .prior
+                        .get(id)
+                        .is_some_and(|event| event.session_id == *stream)
+            })
+            || self
+                .elicitations
+                .iter()
+                .any(|((scope, _), (_, resolved))| scope == stream && !resolved)
+            || self.prior.values().any(|event| {
+                event.session_id == *stream
+                    && matches!(
+                        event.body.data,
+                        EventData::ChildInvocationRequested { .. }
+                            | EventData::DerivedSessionStarted { .. }
+                            | EventData::ApprovalRequested { .. }
+                            | EventData::PayloadErasureRequested { .. }
+                            | EventData::Unknown { .. }
+                    )
+            })
+    }
     pub fn from_history(history: &[SessionEvent]) -> Result<Self, AppendError> {
         let mut index = Self::default();
         // Cross-stream histories can be supplied in stream order. All earlier
