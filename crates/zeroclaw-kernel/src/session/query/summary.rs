@@ -12,15 +12,17 @@ impl SessionQuery {
             .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
         let store = self.coordinator.store.clone();
         let scope = stream.clone();
-        let (mut reducer, revision, head) = self
+        let (mut reducer, revision, head, expected_revision) = self
             .coordinator
             .blocking(move || {
                 let revision = store.erasure_revision()?;
+                let expected_revision = store.canonical_revision()?;
                 let head = store.head(&scope)?;
                 Ok((
                     SessionReducer::load_checkpoint(store.as_ref(), &scope, &head)?,
                     revision,
                     head,
+                    expected_revision,
                 ))
             })
             .await?;
@@ -127,7 +129,11 @@ impl SessionQuery {
             .coordinator
             .blocking(move || {
                 if reducer.cursor().sequence != checkpoint_sequence {
-                    reducer.save_checkpoint(store.as_ref(), revision.as_ref())?;
+                    reducer.save_checkpoint(
+                        store.as_ref(),
+                        revision.as_ref(),
+                        expected_revision,
+                    )?;
                 }
                 Ok(reducer)
             })

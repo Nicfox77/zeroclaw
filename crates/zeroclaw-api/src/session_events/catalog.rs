@@ -107,9 +107,68 @@ pub struct SessionReducer {
     superseded: std::collections::HashSet<EventId>,
     has_copy_seed: bool,
     last_terminal: Option<(TurnId, projection::TurnView)>,
+    open_transforms: BTreeMap<EventId, SessionEvent>,
 }
 
 impl SessionReducer {
+    /// Trusted internal materialization of structural current-state facts.
+    /// Transport readers still resolve metadata through their authorized ports.
+    pub fn materialize(
+        store: &dyn SessionEventStore,
+        stream: &SessionId,
+    ) -> Result<Self, ReadError> {
+        let expected_revision = store.canonical_revision()?;
+        let erasure_revision = store.erasure_revision()?;
+        let head = store.head(stream)?;
+        let mut reducer = Self::load_checkpoint(store, stream, &head)?;
+        let initial = reducer.cursor().sequence;
+        let mut after = reducer.cursor();
+        loop {
+            let page = store.read_page(stream, &after, Some(&head), 256)?;
+            for event in &page.events {
+                let seed_count = if let EventData::ContextProjectionCreated {
+                    reason_key,
+                    result_ref,
+                    ..
+                } = &event.body.data
+                    && matches!(reason_key.as_str(), "host_seed" | "legacy_import")
+                {
+                    let record = context_read::present(store, result_ref)?;
+                    let body: Value = serde_json::from_slice(&record.body)
+                        .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                    Some(
+                        body.get(if reason_key == "host_seed" {
+                            "seed_messages"
+                        } else {
+                            "legacy_messages"
+                        })
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| ReadError::Corrupt("seed identities missing".into()))?
+                        .len(),
+                    )
+                } else {
+                    None
+                };
+                reducer.apply_indexed(event, seed_count, &|id| store.read_event(id))?;
+                if let EventData::TurnAccepted { ingress_ref, .. } = &event.body.data {
+                    let body = context_read::present(store, ingress_ref)?;
+                    reducer.observe_ingress(
+                        &serde_json::from_slice(&body.body)
+                            .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                    )?;
+                }
+            }
+            after = reducer.cursor();
+            if !page.has_more {
+                break;
+            }
+        }
+        reducer.compact();
+        if reducer.cursor().sequence != initial {
+            reducer.save_checkpoint(store, erasure_revision.as_ref(), expected_revision)?;
+        }
+        Ok(reducer)
+    }
     /// Restore a disposable summary prefix. An invalid/missing checkpoint is
     /// rebuilt from events; historical/branch-scoped views never use this path.
     pub fn load_checkpoint(
@@ -132,6 +191,7 @@ impl SessionReducer {
         &self,
         store: &dyn SessionEventStore,
         revision: Option<&Digest>,
+        expected_revision: Option<i64>,
     ) -> Result<(), ReadError> {
         if self.sequence == 0 {
             return Ok(());
@@ -144,6 +204,7 @@ impl SessionReducer {
                     erasure_revision: revision.clone(),
                     body: serde_json::to_vec(self)
                         .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                    expected_revision,
                 },
             )?;
         }
@@ -167,6 +228,7 @@ impl SessionReducer {
             superseded: Default::default(),
             has_copy_seed: false,
             last_terminal: None,
+            open_transforms: BTreeMap::new(),
         }
     }
 
@@ -289,6 +351,27 @@ impl SessionReducer {
             _ => {}
         }
         self.history.apply_turn(event)?;
+        match &event.body.data {
+            EventData::ContextTransformStarted { .. } => {
+                self.open_transforms
+                    .insert(event.event_id.clone(), event.clone());
+            }
+            EventData::ContextTransformFailed {
+                started_event_id, ..
+            }
+            | EventData::ContextTransformCancelled {
+                started_event_id, ..
+            } => {
+                self.open_transforms.remove(started_event_id);
+            }
+            EventData::ContextProjectionCreated {
+                transform_started_event_id: Some(id),
+                ..
+            } => {
+                self.open_transforms.remove(id);
+            }
+            _ => {}
+        }
         if let Some(id) = &event.turn_id
             && let Some(turn) = self.history.turns.get(id)
             && !matches!(
@@ -418,6 +501,9 @@ impl SessionReducer {
         self.last_terminal
             .as_ref()
             .is_some_and(|(_, turn)| turn.status == projection::TurnStatus::Unknown)
+    }
+    pub fn open_transforms(&self) -> impl Iterator<Item = &SessionEvent> {
+        self.open_transforms.values()
     }
 
     /// Channel attribution is derived from accepted ingress, without another

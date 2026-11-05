@@ -412,7 +412,74 @@ impl SqliteEventStore {
     }
 }
 
+impl SqliteEventStore {
+    fn related_events(
+        &self,
+        stream: &SessionId,
+        coordinate: &str,
+        identity: &str,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        let tag =
+            serde_json::to_value(kind).map_err(|error| ReadError::Corrupt(error.to_string()))?;
+        let tag = tag
+            .as_str()
+            .ok_or_else(|| ReadError::Corrupt("event kind is not a string".into()))?;
+        // The column is selected by these two internal call sites, never user SQL.
+        let ids: Vec<String> = {
+            let conn = self.conn.lock();
+            let mut statement = conn.prepare(&format!("SELECT event_id FROM session_events WHERE session_id=?1 AND json_extract(event_json,'$.{coordinate}')=?2 AND json_extract(event_json,'$.kind')=?3 AND json_extract(event_json,'$.body.codec_version')=1 ORDER BY sequence")).map_err(read_error)?;
+            statement
+                .query_map(params![stream.as_str(), identity, tag], |row| row.get(0))
+                .map_err(read_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(read_error)?
+        };
+        ids.into_iter()
+            .map(|id| {
+                let id =
+                    EventId::parse(id).map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                let event = self
+                    .read_event(&id)?
+                    .ok_or_else(|| ReadError::Gap("related event missing".into()))?;
+                let actual = match coordinate {
+                    "causation_id" => event.causation_id.as_ref().map(|id| id.as_str()),
+                    "invocation_id" => event.invocation_id.as_ref().map(|id| id.as_str()),
+                    _ => return Err(ReadError::Corrupt("invalid relation coordinate".into())),
+                };
+                if event.session_id != *stream
+                    || event.body.kind() != *kind
+                    || actual != Some(identity)
+                {
+                    return Err(ReadError::Corrupt("event relation index mismatch".into()));
+                }
+                Ok(event)
+            })
+            .collect()
+    }
+}
+
 impl SessionEventStore for SqliteEventStore {
+    fn read_caused_events(
+        &self,
+        stream: &SessionId,
+        cause: &EventId,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        self.related_events(stream, "causation_id", cause.as_str(), kind)
+    }
+    fn read_invocation_events(
+        &self,
+        stream: &SessionId,
+        invocation: &zeroclaw_api::session_events::InvocationId,
+        kind: &zeroclaw_api::session_events::EventKind,
+    ) -> Result<Vec<SessionEvent>, ReadError> {
+        self.related_events(stream, "invocation_id", invocation.as_str(), kind)
+    }
+
+    fn canonical_revision(&self) -> Result<Option<i64>, ReadError> {
+        Ok(Some(checkpoints::canonical_revision(&self.conn.lock())?))
+    }
     fn recovery_required(&self, through: &EventCursor) -> Result<Option<bool>, ReadError> {
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;

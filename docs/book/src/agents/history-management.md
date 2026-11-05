@@ -83,7 +83,9 @@ overhead, then subtracts the current system messages. `summary_share` divides
 the remaining estimated token allowance between summaries and recent history.
 Summarization starts at `trigger_ratio` of the recent-history allowance, or
 the corresponding fraction of the whole-turn limit. Estimates use roughly
-four characters per token; provider capacity enforcement remains authoritative.
+four UTF-8 bytes per token, including structured tool arguments and reasoning;
+provider capacity enforcement remains authoritative. Source chunks, generated
+responses and the retained deck use the same byte-based fallback.
 
 One background job per session branch freezes an older range of completed
 turns, preserving the two newest turns and their complete tool exchanges.
@@ -196,13 +198,23 @@ fallback remains available for safety calculations, but wire clients receive no
 `model_context_window` value for an unknown capacity.
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
-characters per token plus four framing tokens per message. This is a heuristic,
+UTF-8 bytes per token plus four framing tokens per message. Tool arguments,
+reasoning and structured message metadata contribute to this estimate. This is a heuristic,
 not a provider tokenizer. Loadable image attachments are charged a fixed
 per-image cost only in messages whose images are dispatched: user turns and the
 tool results of the current user turn. A tool result's images are the
 attachments the tool declared, not marker text in its output. Older tool
 results are priced as their message bytes, and system and
 assistant text is priced as text.
+
+Reported provider input-token usage calibrates the foreground request estimate
+conservatively upward for the same provider and model. Switching either route
+component resets that calibration. Usage describes the complete rendered request,
+including system text, tool schemas and protocol framing; it is not an immutable
+per-message token count. Different models can use different tokenizers, so stored
+messages and summary budgets still need an estimate before dispatch. Background
+summary usage remains in the cost ledger rather than calibrating a different
+foreground request.
 
 Proactive token-budget trimming runs before the first provider call of a turn
 when history already exceeds the effective budget and at provider-call

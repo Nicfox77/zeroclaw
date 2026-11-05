@@ -219,24 +219,45 @@ impl ProviderAdmissionPort for ProviderCaptureScope {
                 }
                 // Bind route origin to its canonical control event at dispatch.
                 // Summary purpose is already on Prepared; do not copy it here.
-                let history = coordinator.stream_history(&stream)?;
-                let lineage = lineage::frozen_lineage(&history, &stream, &branch, head.sequence)?;
-                let selection = history
-                    .iter()
-                    .rev()
-                    .find(|event| {
-                        lineage::includes(&lineage, event)
-                            && match event.body.data {
-                                EventData::SessionModelOverrideChanged {
-                                    resolution: ModelResolution::Applied { .. },
-                                } => true,
-                                EventData::SessionModelOverrideChanged {
-                                    resolution: ModelResolution::AppliedForTurn,
-                                } => event.turn_id == turn,
-                                _ => false,
+                let lineage = lineage::read_frozen_lineage(
+                    coordinator.store.as_ref(),
+                    &stream,
+                    &branch,
+                    head.sequence,
+                )?;
+                let mut applied: Option<SessionEvent> = None;
+                for (branch, mut through) in lineage {
+                    while let Some(event) = coordinator.store.read_latest_event_before(
+                        &stream,
+                        &branch,
+                        None,
+                        &EventKind::SessionModelOverrideChanged,
+                        through,
+                    )? {
+                        let effective = matches!(
+                            &event.body.data,
+                            EventData::SessionModelOverrideChanged {
+                                resolution: ModelResolution::Applied { .. }
                             }
-                    })
-                    .map(|event| event.event_id.clone());
+                        ) || matches!(
+                            &event.body.data,
+                            EventData::SessionModelOverrideChanged {
+                                resolution: ModelResolution::AppliedForTurn
+                            }
+                        ) && event.turn_id == turn;
+                        if effective {
+                            if applied
+                                .as_ref()
+                                .is_none_or(|prior| event.sequence > prior.sequence)
+                            {
+                                applied = Some(event);
+                            }
+                            break;
+                        }
+                        through = event.sequence.saturating_sub(1);
+                    }
+                }
+                let selection = applied.map(|event| event.event_id);
                 let route = payloads.last_mut().ok_or_else(|| {
                     SessionError::InvalidAdmission("route payload missing".into())
                 })?;

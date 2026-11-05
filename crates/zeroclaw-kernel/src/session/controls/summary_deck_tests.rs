@@ -27,6 +27,98 @@ fn summary_budget_counts_tool_arguments_reasoning_and_utf8() {
 }
 
 #[tokio::test]
+async fn summary_publication_reads_only_the_checkpoint_tail_and_captured_invocations() {
+    for archive_size in [0, 10_000] {
+        let directory = tempfile::tempdir().expect("directory");
+        let (mut port, _) = session(directory.path(), "sqlite");
+        let store = Arc::new(super::scaling_tests::CountedStore::new(
+            port.owner.store.clone(),
+        ));
+        port.owner = Arc::new(SessionCoordinator::new(store.clone()));
+        port = port.with_summary_deck(Arc::new(Runtime::new()));
+        let title = PayloadRecord::new(
+            PayloadId::new(),
+            "session.text/v1".into(),
+            b"fixture".to_vec(),
+        )
+        .expect("title");
+        for batch in 0..archive_size / 1_000 {
+            let events = (0..1_000)
+                .map(|_| {
+                    SessionEvent::typed(
+                        port.stream.clone(),
+                        EventData::SessionMetadataChanged {
+                            field: "title".into(),
+                            new_value_ref: StoredPayloadRef::from(&title),
+                        },
+                        EventActor::default(),
+                    )
+                    .expect("event")
+                })
+                .collect();
+            store
+                .append_batch(AppendRequest {
+                    session_id: port.stream.clone(),
+                    expected_head: store.head(&port.stream).expect("head"),
+                    idempotency_key: format!("archive-{batch}"),
+                    events,
+                    payloads: if batch == 0 {
+                        vec![title.clone()]
+                    } else {
+                        vec![]
+                    },
+                    erasure_reference_commitment: None,
+                })
+                .expect("archive");
+        }
+        port.replace_context(
+            ContextSnapshot {
+                messages: vec![ConversationMessage::Chat(ChatMessage::user(
+                    "current context",
+                ))],
+                history_has_trim_breadcrumb: Some(false),
+            },
+            "scaling_fixture",
+        )
+        .await
+        .expect("current context boundary");
+        // Warm the shared checkpoint as a normal status poll would. Subsequent
+        // publication must read new work, never the archived prefix again.
+        zeroclaw_api::session_events::catalog::SessionReducer::materialize(
+            store.as_ref(),
+            &port.stream,
+        )
+        .expect("checkpoint");
+        store.archived_through.store(
+            store.head(&port.stream).expect("head").sequence as usize,
+            Ordering::SeqCst,
+        );
+        store.read_events.store(0, Ordering::SeqCst);
+        for n in 0..10 {
+            let snapshot = add_turn(&port, n).await.expect("turn");
+            port.prepare_context(snapshot).await.expect("prepare");
+            wait_job(&port).await.expect("summary");
+        }
+        assert_eq!(
+            store.archived_reads.load(Ordering::SeqCst),
+            0,
+            "summary publication replayed the archived prefix; total page reads {}",
+            store.read_events.load(Ordering::SeqCst)
+        );
+        let current = port
+            .read_context_snapshot(port.latest_context().await.expect("projection"))
+            .await
+            .expect("snapshot")
+            .expect("present");
+        assert!(
+            serde_json::to_string(&current.messages)
+                .expect("messages")
+                .contains("Historical summary deck")
+        );
+    }
+}
+
+#[tokio::test]
 async fn retained_summaries_skip_raw_sources_but_observe_new_erasures() {
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
