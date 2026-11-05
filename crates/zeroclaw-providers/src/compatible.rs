@@ -4450,6 +4450,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // attachments) into base64 data URIs before this message reaches the
         // upstream provider.
         let user_msg = ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -5148,6 +5149,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // forwarding upstream — seefor the OpenAI-compatible
             // remote-vs-local file path problem.
             let user_msg = ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -12924,6 +12926,7 @@ mod tests {
         let path_str = path.to_string_lossy().into_owned();
 
         let msg = ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -12991,6 +12994,7 @@ mod tests {
             });
         }
         let msg = ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -13300,6 +13304,7 @@ mod tests {
     async fn chat_with_tools_without_key_attempts_request() {
         let p = make_model_provider("TestProvider", "http://127.0.0.1:1", None);
         let messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -16176,6 +16181,7 @@ mod tests {
     fn strip_native_tool_messages_drops_internal_pruning_markers_before_coalescing() {
         let messages = vec![
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,

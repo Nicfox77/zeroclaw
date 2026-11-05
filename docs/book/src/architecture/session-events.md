@@ -328,12 +328,11 @@ of the second commit can leave the context cleared; it does not acknowledge
 success or clear the uncommitted in-memory thinking selection.
 
 Model provider identity currently uses its configured `<family>.<alias>`.
-Native RPC and HTTP configuration reject model provider alias renames because
-configuration publication cannot atomically migrate references in session
-history and frozen branches. The offline CLI also rejects the rename when
-native or migrating history exists, under configuration ownership and the
-installation format guard. Keep the existing alias. This restriction does not apply
-to non-model provider aliases.
+Provider aliases can be renamed or deleted under the existing configuration
+reference and ownership rules. These operations leave recorded model selections
+in session history and frozen branches unchanged. If a historical provider
+reference no longer resolves, the user must manually select an available model;
+history does not impose an additional restriction on configuration edits.
 
 Authenticated RPC `session/compact` accepts the owning `session_id` for chat
 and ACP sessions. It takes the foreground execution lane, records a maintenance
@@ -484,7 +483,12 @@ there is no second session key or stream ID. The immutable `creation_source`
 metadata only records the first entrance protocol. Channel entrances record
 their actual protocol name. Legacy SQLite/JSONL imports record `legacy` when
 the original entrance is unknown; ACP and CLI imports retain their known
-protocol. Session ID prefixes never supply the source.
+protocol. During master-format transcript import only, the upgrader removes
+one `gw_` or `rpc_` storage wrapper and records `gateway` or `rpc` as the
+creation source. Thus the browser's public ID resumes the imported history
+directly. ACP and CLI public IDs are opaque and are not prefix-decoded.
+Normal execution never derives the source from a session ID. Distinct old
+keys that map to one new ID fail the upgrade without archiving the sources.
 
 Legacy writers, including read-side repairs of old ACP derived columns,
 share the installation publication lock and are fenced before import starts.
@@ -502,6 +506,16 @@ filtering. Configuration credentials retain their existing encryption.
 SQLite message timestamps are retained in imported context entries; native
 message history uses each content event's observation time. Sources without
 message timestamps remain unknown rather than acquiring the migration time.
+New runtime context messages retain literal text and an optional `timestamp`
+in Unix milliseconds. Agent turns, CLI loops, child agents and channel history
+never store generated date prefixes in message bodies. Heartbeat decision
+prompts and child system prompts also omit generated current-date text.
+Provider dispatch renders the
+`[CURRENT DATE & TIME: ...]` prefix on a temporary request copy at the physical
+adapter boundary, including streaming and retry paths. Context persistence,
+restoration and provider intent capture keep the structured representation.
+Legacy SQLite and JSONL body text is neither parsed for timestamps nor stripped;
+only independently recorded time fields are used.
 Channel and sender attribution are derived from accepted ingress in the common
 session projection. Later legacy imports cannot replace these native facts.
 Channel-specific room and thread details remain in the original reply route;

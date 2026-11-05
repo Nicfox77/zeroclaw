@@ -1,4 +1,6 @@
 use super::*;
+use crate::session_events::catalog::SessionCatalog;
+use crate::session_events::scoped::EventStorePool;
 use crate::session_events::upgrade::fixtures::session_backend::SessionBackend;
 
 #[test]
@@ -42,6 +44,161 @@ fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
                 1
             );
         }
+    }
+}
+
+#[test]
+fn transcript_wrappers_migrate_to_public_ids_and_creation_sources() {
+    for sqlite in [false, true] {
+        for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = old_source(directory.path(), sqlite, 1);
+            let cases = [
+                ("gw_fixture", "fixture", "gateway"),
+                ("rpc_client", "client", "rpc"),
+                ("gw_rpc_literal", "rpc_literal", "gateway"),
+                ("unprefixed", "unprefixed", "legacy"),
+            ];
+            for (key, _, _) in cases {
+                source
+                    .rewrite_messages(key, &[ChatMessage::user(key)])
+                    .unwrap();
+            }
+            drop(source);
+
+            upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
+            let pool = EventStorePool::default();
+            let catalog = SessionCatalog::open(directory.path(), &pool)
+                .unwrap()
+                .unwrap();
+            let rows = catalog.query().index_records().unwrap();
+            assert_eq!(rows.len(), cases.len());
+            let store = open_event_store(directory.path(), target.name()).unwrap();
+            for (old_key, id, source) in cases {
+                let row = rows
+                    .iter()
+                    .find(|row| row.session_id.as_str() == id)
+                    .unwrap();
+                assert_eq!(row.creation_source.as_deref(), Some(source));
+                assert_eq!(row.first_user_preview.as_deref(), Some(old_key));
+                let head = store.head(&row.session_id).unwrap();
+                assert!(head.sequence > 0);
+                if old_key != id {
+                    assert_eq!(
+                        store
+                            .head(&SessionId::parse(old_key).unwrap())
+                            .unwrap()
+                            .sequence,
+                        0
+                    );
+                }
+            }
+            drop(catalog);
+            upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
+            let catalog = SessionCatalog::open(directory.path(), &pool)
+                .unwrap()
+                .unwrap();
+            assert_eq!(catalog.query().index_records().unwrap().len(), cases.len());
+        }
+    }
+}
+
+#[test]
+fn normalized_transcript_id_collisions_preserve_sources() {
+    for sqlite in [false, true] {
+        for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            for keys in [["gw_shared", "rpc_shared"], ["shared", "gw_shared"]] {
+                let directory = tempfile::tempdir().unwrap();
+                let source: Box<dyn SessionBackend> = if sqlite {
+                    Box::new(SqliteSessionBackend::new(directory.path()).unwrap())
+                } else {
+                    Box::new(SessionStore::new(directory.path()).unwrap())
+                };
+                // Identical content and owner must not hide an ID collision.
+                for key in keys {
+                    source
+                        .append(key, &ChatMessage::user("same content"))
+                        .unwrap();
+                }
+                drop(source);
+                assert!(matches!(
+                    upgrade_installation(directory.path(), target, |_| "fixture".into()),
+                    Err(AppendError::Corrupt(message))
+                        if message == "frozen legacy source or import scope changed"
+                ));
+                let sessions = directory.path().join("sessions");
+                if sqlite {
+                    assert!(sessions.join("sessions.db").is_file());
+                    assert!(!sessions.join("sessions.db.backup").exists());
+                } else {
+                    for key in keys {
+                        assert!(sessions.join(format!("{key}.jsonl")).is_file());
+                        assert!(!sessions.join(format!("{key}.jsonl.backup")).exists());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_channel_metadata_supplies_the_creation_protocol() {
+    for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = SqliteSessionBackend::new(directory.path()).unwrap();
+        source
+            .append(
+                "telegram_bot_room_sender",
+                &ChatMessage::user("channel history"),
+            )
+            .unwrap();
+        drop(source);
+        let conn =
+            rusqlite::Connection::open(directory.path().join("sessions/sessions.db")).unwrap();
+        conn.execute(
+            "UPDATE session_metadata SET channel_id='telegram.bot' WHERE session_key='telegram_bot_room_sender'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
+        let pool = EventStorePool::default();
+        let catalog = SessionCatalog::open(directory.path(), &pool)
+            .unwrap()
+            .unwrap();
+        let rows = catalog.query().index_records().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].creation_source.as_deref(), Some("telegram"));
+        assert_eq!(rows[0].session_id.as_str(), "telegram_bot_room_sender");
+    }
+}
+
+#[test]
+fn acp_public_ids_are_opaque_even_when_they_look_like_transcript_wrappers() {
+    use crate::session_repository::SessionRepository;
+    for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+        let directory = tempfile::tempdir().unwrap();
+        drop(old_source(directory.path(), true, 1));
+        let acp = SessionRepository::legacy_fixture(directory.path()).unwrap();
+        for id in ["gw_fixture", "rpc_client"] {
+            acp.create_session(id, "acp", "fixture", "/workspace", None)
+                .unwrap();
+        }
+        drop(acp);
+        upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
+        let pool = EventStorePool::default();
+        let catalog = SessionCatalog::open(directory.path(), &pool)
+            .unwrap()
+            .unwrap();
+        let rows = catalog.query().index_records().unwrap();
+        for id in ["gw_fixture", "rpc_client"] {
+            let row = rows
+                .iter()
+                .find(|row| row.session_id.as_str() == id)
+                .unwrap();
+            assert_eq!(row.creation_source.as_deref(), Some("acp"));
+        }
+        assert!(rows.iter().any(|row| row.session_id.as_str() == "fixture"));
     }
 }
 use crate::{
@@ -109,6 +266,44 @@ fn sqlite_message_timestamps_survive_upgrade_to_each_native_backend() {
 }
 
 #[test]
+fn legacy_timestamp_prefixes_stay_literal_during_sqlite_and_jsonl_upgrade() {
+    use zeroclaw_api::session_events::context_read;
+    let body =
+        "[CURRENT DATE & TIME: 2001-02-03 04:05:06 UTC]\n\n[2020-01-01 00:00:00 UTC] literal";
+    for sqlite in [false, true] {
+        for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = old_source(directory.path(), sqlite, 1);
+            source
+                .rewrite_messages("gw_fixture", &[ChatMessage::user(body)])
+                .unwrap();
+            drop(source);
+            upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
+            let store = open_event_store(directory.path(), target.name()).unwrap();
+            let stream = session_id("gw_fixture").unwrap();
+            let page = store
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
+                .unwrap();
+            let context = page.events.iter().rev().find(|event| {
+                matches!(&event.body.data, EventData::ContextProjectionCreated { reason_key, .. } if reason_key == "legacy_import")
+            }).unwrap();
+            let restored: Vec<_> = context_read::context_refs(store.as_ref(), context)
+                .unwrap()
+                .iter()
+                .filter_map(|reference| {
+                    context_read::resolve_message(store.as_ref(), &stream, reference).unwrap()
+                })
+                .collect();
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].chat_messages()[0].content, body);
+            if !sqlite {
+                assert!(restored[0].chat_messages()[0].timestamp.is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn legacy_tool_metadata_survives_storage_upgrade_and_context_reconstruction() {
     use zeroclaw_api::model_provider::ConversationMessage;
     use zeroclaw_api::session_events::context_read;
@@ -136,6 +331,7 @@ fn legacy_tool_metadata_survives_storage_upgrade_and_context_reconstruction() {
                 .append(
                     "gw_fixture",
                     &ChatMessage {
+                        timestamp: None,
                         role: "tool".into(),
                         content: serde_json::json!({
                             "tool_call_id":"call-1","name":"shell","success":false,"content":output,
@@ -408,7 +604,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
 fn imported_count(directory: &Path, target: NativeBackend) -> usize {
     let catalog = installation::session_ids(directory, target).expect("catalog");
     let stream = catalog
-        .get("gw_fixture")
+        .get("fixture")
         .expect("read-visible imported family");
     let store = open_event_store(directory, target.name()).expect("native store");
     let receipt = store
@@ -557,7 +753,7 @@ fn colliding_acp_and_transcript_ids_leave_both_sources_available() {
         let old = old_source(directory.path(), true, 1);
         drop(old);
         let acp = SessionRepository::legacy_fixture(directory.path()).expect("ACP source");
-        acp.create_session("gw_fixture", "acp", "fixture", "/workspace", None)
+        acp.create_session("fixture", "acp", "fixture", "/workspace", None)
             .expect("colliding source");
         drop(acp);
         assert!(matches!(

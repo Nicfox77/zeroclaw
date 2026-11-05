@@ -1609,86 +1609,93 @@ async fn prepare_skill_child(
     )))
 }
 
-async fn execute_skill_child<T: serde::Serialize + Send>(
+fn execute_skill_child<T: serde::Serialize + Send>(
     child: Option<PreparedSkillChild>,
     engine: impl std::future::Future<Output = Result<T>> + Send,
-) -> Result<T> {
-    let Some(mut child) = child else {
-        return engine.await;
-    };
-    let port = child
-        .port
-        .as_ref()
-        .ok_or_else(|| {
+) -> impl std::future::Future<Output = Result<T>> + Send {
+    // Keep the nested skill engine out of the parent turn and task-local
+    // futures. Polling and cancellation still happen in the caller's scope.
+    Box::pin(async move {
+        let Some(mut child) = child else {
+            return engine.await;
+        };
+        let port = child
+            .port
+            .as_ref()
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                    "skill_child_execution_handle_missing"
+                );
+                anyhow::Error::msg("skill child execution handle missing")
+            })?
+            .clone();
+        let mut observed = None;
+        let recorded = port
+            .execute(Box::pin(async {
+                let result = engine.await;
+                let terminal = match &result {
+                    Ok(value) => serde_json::to_string(value).map_err(anyhow::Error::from),
+                    Err(error) => {
+                        let diagnostic = crate::agent::Agent::session_execution_diagnostic(error);
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(serde_json::json!({"error": diagnostic})),
+                            "skill_child_execution_failed"
+                        );
+                        Err(anyhow::Error::msg(diagnostic))
+                    }
+                };
+                observed = Some(result);
+                terminal
+            }))
+            .await;
+        if let Err(error) = recorded
+            && (observed.is_none()
+                || zeroclaw_api::session_events::capture::is_capture_stopped(&error)
+                || error.chain().any(|source| {
+                    source.is::<zeroclaw_kernel::session::SessionError>()
+                        || source.is::<zeroclaw_api::session_events::AppendError>()
+                        || source.is::<zeroclaw_api::session_events::ReadError>()
+                }))
+        {
+            if let Err(cleanup) = child.interrupted("skill_child_execution_stopped").await {
+                return Err(zeroclaw_api::session_events::capture::capture_stopped(
+                    error.context(format!(
+                        "skill_child_interruption_capture_failed: {}",
+                        crate::agent::Agent::session_execution_diagnostic(&cleanup)
+                    )),
+                ));
+            }
+            return Err(zeroclaw_api::session_events::capture::capture_stopped(
+                error,
+            ));
+        }
+        child.port = None;
+        let result = observed.ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
-                "skill_child_execution_handle_missing"
+                "skill_child_result_missing"
             );
-            anyhow::Error::msg("skill child execution handle missing")
-        })?
-        .clone();
-    let mut observed = None;
-    let recorded = port
-        .execute(Box::pin(async {
-            let result = engine.await;
-            let terminal = match &result {
-                Ok(value) => serde_json::to_string(value).map_err(anyhow::Error::from),
-                Err(error) => {
-                    let diagnostic = crate::agent::Agent::session_execution_diagnostic(error);
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_attrs(serde_json::json!({"error": diagnostic})),
-                        "skill_child_execution_failed"
-                    );
-                    Err(anyhow::Error::msg(diagnostic))
-                }
-            };
-            observed = Some(result);
-            terminal
-        }))
-        .await;
-    if let Err(error) = recorded
-        && (observed.is_none()
-            || zeroclaw_api::session_events::capture::is_capture_stopped(&error)
-            || error.chain().any(|source| {
+            anyhow::Error::msg("skill child result missing")
+        })?;
+        result.map_err(|error| {
+            if error.chain().any(|source| {
                 source.is::<zeroclaw_kernel::session::SessionError>()
                     || source.is::<zeroclaw_api::session_events::AppendError>()
                     || source.is::<zeroclaw_api::session_events::ReadError>()
-            }))
-    {
-        if let Err(cleanup) = child.interrupted("skill_child_execution_stopped").await {
-            return Err(zeroclaw_api::session_events::capture::capture_stopped(
-                error.context(format!(
-                    "skill_child_interruption_capture_failed: {}",
-                    crate::agent::Agent::session_execution_diagnostic(&cleanup)
-                )),
-            ));
-        }
-        return Err(zeroclaw_api::session_events::capture::capture_stopped(
-            error,
-        ));
-    }
-    child.port = None;
-    let result = observed.ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
-            "skill_child_result_missing"
-        );
-        anyhow::Error::msg("skill child result missing")
-    })?;
-    result.map_err(|error| {
-        if error.chain().any(|source| {
-            source.is::<zeroclaw_kernel::session::SessionError>()
-                || source.is::<zeroclaw_api::session_events::AppendError>()
-                || source.is::<zeroclaw_api::session_events::ReadError>()
-        }) {
-            zeroclaw_api::session_events::capture::capture_stopped(error)
-        } else {
-            error
-        }
+            }) {
+                zeroclaw_api::session_events::capture::capture_stopped(error)
+            } else {
+                error
+            }
+        })
     })
 }
 
@@ -2659,16 +2666,12 @@ async fn run_inner(
                 })
                 .unwrap_or_default();
             let context = hw_context;
-            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-            let enriched = if context.is_empty() {
-                format!("[{now}] {effective_msg}")
-            } else {
-                format!("{context}[{now}] {effective_msg}")
-            };
+            let timestamp = chrono::Utc::now().timestamp_millis();
+            let enriched = format!("{context}{effective_msg}");
 
             let mut history = vec![
                 ChatMessage::system(&system_prompt),
-                ChatMessage::user(&enriched),
+                ChatMessage::user(&enriched).with_timestamp(timestamp),
             ];
             let mut native_restored_crumb = false;
             if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution()
@@ -2684,7 +2687,7 @@ async fn run_inner(
                 }
                 normalize_system_messages(&mut history);
                 crate::agent::history_pruner::remove_orphaned_tool_messages(&mut history);
-                history.push(ChatMessage::user(&enriched));
+                history.push(ChatMessage::user(&enriched).with_timestamp(timestamp));
             }
             let execution_tree_budget = ExecutionTreeBudget::current()
                 .map(|budget| budget.child())
@@ -3426,14 +3429,10 @@ async fn run_inner(
                     })
                     .unwrap_or_default();
                 let context = hw_context;
-                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-                let enriched = if context.is_empty() {
-                    format!("[{now}] {effective_input}")
-                } else {
-                    format!("{context}[{now}] {effective_input}")
-                };
+                let timestamp = chrono::Utc::now().timestamp_millis();
+                let enriched = format!("{context}{effective_input}");
 
-                history.push(ChatMessage::user(&enriched));
+                history.push(ChatMessage::user(&enriched).with_timestamp(timestamp));
                 let execution_tree_budget = ExecutionTreeBudget::current()
                     .map(|budget| budget.child())
                     .or_else(|| {
@@ -4797,12 +4796,8 @@ async fn process_message_inner(
             })
             .unwrap_or_default();
         let context = hw_context;
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {effective_message}")
-        } else {
-            format!("{context}[{now}] {effective_message}")
-        };
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let enriched = format!("{context}{effective_message}");
 
         let native = zeroclaw_api::session_events::capture::current_session_execution();
         let restored = if let Some(port) = &native {
@@ -4825,7 +4820,11 @@ async fn process_message_inner(
             }
             normalize_system_messages(&mut history);
         }
-        history.push(ChatMessage::user(&enriched).with_attachments(__zc_message.attachments));
+        history.push(
+            ChatMessage::user(&enriched)
+                .with_timestamp(timestamp)
+                .with_attachments(__zc_message.attachments),
+        );
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,

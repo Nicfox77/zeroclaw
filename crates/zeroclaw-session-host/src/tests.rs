@@ -695,7 +695,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
         let authority = Arc::new(Authority(AtomicBool::new(true)));
         let query = hub
             .query(
-                "gw_expired".into(),
+                "expired".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
             )
@@ -707,18 +707,19 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
             .summary(query.stream.clone())
             .await
             .expect("summary");
+        assert_eq!(summary.creation_source(), Some("gateway"));
         assert_eq!(summary.created_at, original.created_at.timestamp_millis());
         assert_eq!(
             summary.last_activity,
             original.last_activity.timestamp_millis()
         );
         assert_eq!(
-            hub.archive_stale("legacy", summary.last_activity + 1)
+            hub.archive_stale("gateway", summary.last_activity + 1)
                 .await
                 .expect("retention"),
             1
         );
-        let successor = "gw_expired".to_owned();
+        let successor = "expired".to_owned();
         let continuation = hub
             .open(
                 successor.clone(),
@@ -736,7 +737,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
         drop(continuation);
         let query = hub
             .query(
-                "gw_expired".into(),
+                "expired".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
             )
