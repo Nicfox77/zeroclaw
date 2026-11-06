@@ -15486,6 +15486,7 @@ data: [DONE]\n\n";
     #[cfg(feature = "channel-linq")]
     fn test_channel_message(sender: &str, content: &str) -> zeroclaw_api::channel::ChannelMessage {
         zeroclaw_api::channel::ChannelMessage {
+            control: None,
             id: "msg-1".into(),
             sender: sender.into(),
             platform_sender_id: None,

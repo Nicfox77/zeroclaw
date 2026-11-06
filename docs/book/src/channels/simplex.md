@@ -133,18 +133,51 @@ preserves the source model’s bandwidth without first reducing playback to
 Recognition uses a separate 16 kHz audio graph, keeping the existing PCM and
 voice-detection timing contract. Voice-note encoding is independent of this path.
 
-Incoming speech is collected in bounded, memory-only utterances using an energy
-threshold and approximately 700 ms of silence. Continuous speech is transcribed
-in 30-second chunks in the background; one combined turn enters dispatch only
-when silence closes it. After roughly 100–150 ms of above-threshold input, playback stops, including
-queued clips and pending audio decoding, and stale-generation audio is refused.
-Native speech preparation is cancelled immediately. A recognized utterance enters the shared dispatcher; with
-`interrupt_on_new_message`, it also cancels the preceding model turn. Recognition
-latency therefore still affects when model work is cancelled. The detector is
-energy-based and can mistake background noise for speech; it does not perform
-speaker identification or semantic turn-taking. Cancellation does not reverse
-completed tool effects, and history does not track the exact words heard before
-an interruption.
+For Parakeet Unified live recognition, configure the owning agent's selected
+`local_whisper` provider with an explicit loopback WebSocket endpoint:
+
+```toml
+[providers.transcription.local_whisper.local]
+uri = "http://127.0.0.1:18162/v1/audio/transcriptions" # files and voice notes
+stream_uri = "ws://127.0.0.1:18161/v1/audio/stream" # live PCM
+# bearer_token uses the provider's existing secret configuration
+```
+
+`stream_uri` defaults absent. The endpoint must be loopback and implement the
+Parakeet companion protocol: authenticated WebSocket, `ready` with `sampleRate`
+16000 and `streaming` true, binary mono PCM16 input, and `speech_start`, `partial`,
+and `final` JSON events carrying `utteranceId`. The companion owns streaming ASR,
+voice activity detection, noise reduction, and endpoint timing. Configure its
+buffered attention profile there. Parakeet Unified's balanced 560 ms chunk plus
+560 ms right context provides 1.12 s of algorithmic lookahead; that is separate
+from end-of-speech silence and processing/network latency.
+
+With this endpoint selected, microphone frames stream continuously in bounded,
+memory-only queues. Partials stay ephemeral; only the finalized utterance enters
+the existing conversation and model loop. Speech-start stops queued playback,
+pending decoding, and synthesis, and, with `interrupt_on_new_message`, cancels the
+preceding model turn immediately without waiting for final transcription. A
+stream failure ends the call rather than silently dropping PCM or switching to
+batch recognition. Only one companion connection is owned by an admitted call;
+ending it releases recognition resources. Peer grants, speech activation, and
+endpoint selection are checked against live configuration during the call.
+
+Without `stream_uri`, the adapter retains its bounded batch fallback: an energy
+detector ends utterances after approximately 700 ms of silence, transcribes
+continuous speech in 30-second chunks, and combines them into one user turn.
+Model cancellation in that fallback still waits for a recognized utterance.
+
+Playback receipts outlive model generation. Interrupting a clip records completed
+segments, the partly played segment's text and elapsed/duration milliseconds, and
+discarded queued audio. A passive delivery observation precedes the next spoken
+user turn in shared history, including when generation had already finished.
+The complete assistant reply remains in the append-only archive and context;
+no historical text is rewritten and synthetic output is not transcribed again.
+The elapsed time is measured at the sender, so network and phone buffering make
+it an estimate of playout, not an exact word boundary or proof of what was heard.
+The agent is explicitly told that only part of the current segment was played.
+Cancellation does not undo completed tool effects. The streaming detector does
+not provide semantic turn-taking or guarantee that noise will never interrupt.
 
 Outbound speech uses the existing sentence/paragraph segmenter and the agent's
 TTS provider. Sanitized, leak-checked assistant text may become audible while the
@@ -166,7 +199,7 @@ transport failure; interrupted speech must not be retried as a fresh full answer
 
 Run `npm test` in `contrib/simplex` (ffmpeg and ffprobe are required for note tests). With `CHROMIUM_PATH` and assets configured,
 `SIMPLEX_RTC_TEST=1 npm test` additionally checks encrypted audio in both directions
-and rejects mismatched encryption keys. `SIMPLEX_CLI_TEST=1 npm test` additionally
+through public TURN and rejects mismatched encryption keys. `SIMPLEX_CLI_TEST=1 npm test` additionally
 creates two temporary CLI profiles and verifies encrypted voice-note transfers
 in both directions through public relays; `SIMPLEX_CLI_PATH` selects the CLI binary.
 Rust adapter tests exercise peer denial,

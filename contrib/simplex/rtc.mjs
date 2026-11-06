@@ -31,10 +31,12 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
       silence.offset.value = 0;
       silence.connect(destination);
       silence.start();
+      // Owns scheduled clip receipts until the next stop. Ended clips release
+      // their AudioBufferSourceNode; only bounded text/timing remains.
       const sources = new Set();
       const waiting = new Set();
       let next = 0;
-      globalThis.playAudio = async base64 => {
+      globalThis.playAudio = async (base64, metadata = {}) => {
         let cancelled = false, timer, rejectStarted, starts;
         const cancel = () => {
           cancelled = true;
@@ -49,7 +51,7 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
           const raw = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
           const buffer = await audio.decodeAudioData(raw.buffer);
           if (cancelled) throw Object.assign(Error('simplex_audio_cancelled'), {notDelivered: true});
-          if (buffer.duration > 180 || sources.size >= 2) throw Object.assign(Error('simplex_audio_queue_limit'), {notDelivered: true});
+          if (buffer.duration > 180 || [...sources].filter(clip => clip.source).length >= 2 || sources.size >= 256 || [...sources].reduce((n, clip) => n + clip.text.length, 0) + (metadata.text?.length ?? 0) > 262144) throw Object.assign(Error('simplex_audio_queue_limit'), {notDelivered: true});
           const source = audio.createBufferSource();
           source.buffer = buffer;
           source.connect(destination);
@@ -57,8 +59,10 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
           starts = next;
           source.start(starts);
           next += buffer.duration;
-          sources.add(source);
-          source.onended = () => sources.delete(source);
+          const clip = {source, text: metadata.text ?? '', scope: metadata.scope ?? '',
+            segment: metadata.segment ?? '', starts, ends: starts + buffer.duration};
+          sources.add(clip);
+          source.onended = () => {clip.source = null;};
           // ACK at playback start, allowing one future clip while the active
           // clip plays. Already audible delivery is not retroactively rejected.
           await new Promise((resolve, reject) => {
@@ -68,10 +72,23 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
         } finally {waiting.delete(cancel);}
       };
       globalThis.stopAudio = () => {
-        for (const source of sources) source.stop();
+        const now = audio.currentTime;
+        const completed = [], partials = [];
+        let queued = 0;
+        for (const clip of sources) {
+          if (now >= clip.ends) completed.push(clip.text);
+          else if (now <= clip.starts) queued++;
+          else partials.push({text: clip.text, scope: clip.scope, segment: clip.segment,
+            played_ms: Math.floor((now - clip.starts) * 1000),
+            duration_ms: Math.ceil((clip.ends - clip.starts) * 1000)});
+        }
+        const report = {interrupted: partials.length > 0 || queued > 0 || waiting.size > 0,
+          completed, partial: partials[0] ?? null, queued};
+        for (const clip of sources) clip.source?.stop();
         for (const cancel of waiting) cancel();
         waiting.clear();
         sources.clear(); next = 0;
+        return report;
       };
       Object.defineProperty(navigator, 'mediaDevices', {value: {
         getUserMedia: async () => destination.stream,
@@ -88,15 +105,28 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
             const input = recognition.createMediaStreamSource(new MediaStream([event.track]));
             const processor = recognition.createScriptProcessor(1024, 1, 1);
             input.connect(processor); processor.connect(recognition.destination);
-            let pending = false;
+            const frames = [];
+            let pumping = false, failed = false;
+            const fail = () => {
+              if (failed) return;
+              failed = true; frames.length = 0; processor.onaudioprocess = null;
+              hostSignal({resp: {type: 'audio_error'}});
+            };
+            const drain = async () => {
+              pumping = true;
+              try {while (frames.length && !failed) await hostPcm(frames.shift());}
+              catch {fail();}
+              finally {pumping = false;}
+            };
             processor.onaudioprocess = event => {
-              if (pending) return; // bounded host IPC; never queue raw audio
+              if (failed) return;
+              if (frames.length >= 16) {fail(); return;}
               const data = event.inputBuffer.getChannelData(0);
               const bytes = new Uint8Array(data.length * 2);
               const view = new DataView(bytes.buffer);
               for (let i = 0; i < data.length; i++) view.setInt16(i * 2, Math.max(-32768, Math.min(32767, data[i] * 32767)), true);
-              pending = true;
-              hostPcm(btoa(String.fromCharCode(...bytes))).finally(() => {pending = false;});
+              frames.push(btoa(String.fromCharCode(...bytes)));
+              if (!pumping) drain();
             };
           });
         }
@@ -106,7 +136,7 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
       globalThis.audioDiagnostics = async spectrum => {
         const result = {playbackSampleRate: audio.sampleRate, recognitionSampleRate: recognition.sampleRate,
           contentHint: destination.stream.getAudioTracks()[0].contentHint,
-          playingSources: sources.size, pendingPlaybacks: waiting.size,
+          playingSources: [...sources].filter(clip => clip.source).length, pendingPlaybacks: waiting.size,
           track: {sampleRate: destination.stream.getAudioTracks()[0].getSettings().sampleRate}};
         const remote = typeof activeCall === 'undefined' ? undefined
           : activeCall?.connection.getTransceivers().find(t => t.mid === '0')?.receiver.track;
@@ -155,11 +185,11 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
         }
         return result;
       }, command),
-      play: async audio => {
-        const result = await page.evaluate(async audio => {
-          try {await playAudio(audio); return {ok: true};}
+      play: async (audio, metadata = {}) => {
+        const result = await page.evaluate(async ({audio, metadata}) => {
+          try {await playAudio(audio, metadata); return {ok: true};}
           catch (error) {return {ok: false, notDelivered: error.notDelivered === true};}
-        }, audio);
+        }, {audio, metadata});
         if (!result.ok) throw Object.assign(Error('simplex_playback_failed'), {notDelivered: result.notDelivered});
       },
       stop: () => page.evaluate(() => stopAudio()),

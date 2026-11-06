@@ -12,7 +12,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
 };
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelControl, ChannelMessage, SendMessage};
 use zeroclaw_config::live::LiveConfigHandle;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,11 +40,22 @@ struct Inner {
     writer: Mutex<Option<mpsc::Sender<Value>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     drafts: Mutex<HashMap<String, VoiceDraft>>,
+    recognition: Mutex<HashMap<String, CallRecognition>>,
     /// Creates the unfinished spoken turn from completed STT chunks. It is
     /// neither durable chat history nor a policy snapshot; only the assembled
     /// turn enters shared dispatch, once silence closes it.
     transcripts: Mutex<HashMap<String, String>>,
     cancel: Mutex<CancellationToken>,
+}
+/// Owns the backend connection and its event pump for one call, not policy.
+struct CallRecognition {
+    stream: crate::transcription::live::LiveTranscription,
+    events: tokio::task::JoinHandle<()>,
+}
+impl Drop for CallRecognition {
+    fn drop(&mut self) {
+        self.events.abort();
+    }
 }
 struct PendingRequest<'a> {
     inner: &'a Inner,
@@ -65,6 +76,7 @@ impl SimplexChannel {
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 drafts: Mutex::new(HashMap::new()),
+                recognition: Mutex::new(HashMap::new()),
                 transcripts: Mutex::new(HashMap::new()),
                 cancel: Mutex::new(CancellationToken::new()),
             }),
@@ -95,12 +107,16 @@ impl SimplexChannel {
                 crate::allowlist::Match::Sensitive,
             )
     }
-    async fn request(&self, mut value: Value) -> Result<()> {
+    async fn request(&self, value: Value) -> Result<()> {
+        self.request_reply(value).await.map(|_| ())
+    }
+    async fn request_reply(&self, mut value: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         value["id"] = json!(id);
         let writer = self.inner.writer.lock().clone();
         let Some(writer) = writer else {
-            return self.one_shot_request(value).await;
+            self.one_shot_request(value).await?;
+            return Ok(Value::Null);
         };
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().insert(id.clone(), tx);
@@ -115,7 +131,9 @@ impl SimplexChannel {
         };
         let result = tokio::time::timeout(timeout, async {
             writer.send(value).await.context("simplex_bridge_closed")?;
-            bridge_result(rx.await.context("simplex_bridge_disconnected")?)
+            let reply = rx.await.context("simplex_bridge_disconnected")?;
+            bridge_result(reply.clone())?;
+            Ok(reply)
         })
         .await
         .context("simplex_bridge_timeout")?;
@@ -301,10 +319,233 @@ impl SimplexChannel {
             .await
     }
 
+    fn stream_authorized(&self, contact: &str, call: &str) -> bool {
+        if !self.allowed(contact, true) {
+            return false;
+        }
+        let config = self.inner.config.read();
+        if !config.transcription.enabled {
+            return false;
+        }
+        let selected = config
+            .agent_for_channel(&format!("simplex.{}", self.inner.alias))
+            .and_then(|owner| config.agents.get(owner))
+            .and_then(|agent| agent.transcription_provider.strip_prefix("local_whisper."))
+            .and_then(|alias| config.providers.transcription.local_whisper.get(alias))
+            .and_then(|provider| provider.stream_uri.as_deref());
+        self.inner
+            .recognition
+            .lock()
+            .get(call)
+            .is_some_and(|resource| selected == Some(resource.stream.endpoint.as_str()))
+    }
+    async fn start_recognition(
+        &self,
+        contact: &str,
+        call_id: &str,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> Result<bool> {
+        let settings = {
+            let config = self.inner.config.read();
+            let owner = config
+                .agent_for_channel(&format!("simplex.{}", self.inner.alias))
+                .and_then(|a| config.agents.get(a))
+                .context("simplex_unowned_channel")?;
+            owner
+                .transcription_provider
+                .strip_prefix("local_whisper.")
+                .and_then(|alias| config.providers.transcription.local_whisper.get(alias))
+                .filter(|provider| provider.stream_uri.is_some())
+                .cloned()
+        };
+        let Some(settings) = settings else {
+            return Ok(false);
+        };
+        let (stream, mut events) =
+            crate::transcription::live::LiveTranscription::connect(&settings).await?;
+        let channel = Arc::downgrade(&self.inner);
+        let contact = contact.to_string();
+        let call = call_id.to_string();
+        let tx = tx.clone();
+        let worker = zeroclaw_spawn::spawn!(async move {
+            while let Some(event) = events.recv().await {
+                let Some(inner) = channel.upgrade() else {
+                    break;
+                };
+                let channel = SimplexChannel { inner };
+                if !channel.stream_authorized(&contact, &call) {
+                    let _ = channel
+                        .request(json!({"type":"hangup","contact":contact,"call_id":call}))
+                        .await;
+                    break;
+                }
+                let result = async {
+                    match event["type"].as_str() {
+                        Some("speech_start") => {
+                            let utterance = event["utteranceId"].as_str().context("simplex_live_utterance_missing")?;
+                            channel.inner.drafts.lock().retain(|_, draft| draft.contact != contact || !draft.scope.starts_with(&format!("{call}/")));
+                            let reply = channel.request_reply(json!({"type":"speech_start","contact":contact,"call_id":call,"utterance_id":utterance})).await?;
+                            // The same producer sends the observation before its final transcript.
+                            // A backlogged PCM reader must not reorder these two session events.
+                            let observation = &reply["observation"];
+                            ensure!(observation["contact"] == contact && observation["call_id"] == call
+                                && observation["scope"] == format!("{call}/{utterance}"), "simplex_playback_scope_mismatch");
+                            channel.playback_observation(observation, &tx, true).await?;
+                        }
+                        Some("final") => {
+                            let utterance = event["utteranceId"].as_str().context("simplex_live_utterance_missing")?;
+                            let message = json!({"contact":contact,"call_id":call,
+                                "scope":format!("{call}/{utterance}"),"id":format!("{call}/{utterance}")});
+                            channel.dispatch_message(&message,
+                                event["text"].as_str().context("simplex_live_text_missing")?.to_string(), true, true, &tx).await?;
+                        }
+                        _ => anyhow::bail!("simplex_live_recognition_failed"),
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                if result.is_err() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                        "simplex_live_recognition_failed"
+                    );
+                    let text = zeroclaw_runtime::i18n::get_required_cli_string(
+                        "channel-simplex-live-recognition-failed",
+                    );
+                    if channel.allowed(&contact, false) {
+                        let _ = channel
+                            .request(json!({"type":"send","contact":contact,"text":text}))
+                            .await;
+                    }
+                    let _ = channel
+                        .request(json!({"type":"hangup","contact":contact,"call_id":call}))
+                        .await;
+                    break;
+                }
+            }
+        });
+        self.inner.recognition.lock().insert(
+            call_id.into(),
+            CallRecognition {
+                stream,
+                events: worker,
+            },
+        );
+        Ok(true)
+    }
+    async fn playback_observation(
+        &self,
+        event: &Value,
+        tx: &mpsc::Sender<ChannelMessage>,
+        interrupt: bool,
+    ) -> Result<()> {
+        let contact = event["contact"].as_str().unwrap_or("");
+        if !self.allowed(contact, true) {
+            return Ok(());
+        }
+        let report = &event["playback"];
+        let text = if report["interrupted"] == true {
+            let completed = report["completed"]
+                .as_array()
+                .context("simplex_playback_report_invalid")?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let partial = report["partial"]["text"].as_str().unwrap_or("");
+            ensure!(
+                completed.len() + partial.len() <= 262144,
+                "simplex_playback_report_limit"
+            );
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-simplex-playback-interrupted",
+                &[
+                    ("completed", completed.as_str()),
+                    ("partial", partial),
+                    (
+                        "played",
+                        &report["partial"]["played_ms"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .to_string(),
+                    ),
+                    (
+                        "duration",
+                        &report["partial"]["duration_ms"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .to_string(),
+                    ),
+                ],
+            )
+        } else {
+            String::new()
+        };
+        if !interrupt && text.is_empty() {
+            return Ok(());
+        }
+        tx.send(ChannelMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: contact.into(),
+            platform_sender_id: Some(contact.into()),
+            reply_target: contact.into(),
+            channel: "simplex".into(),
+            channel_alias: Some(self.inner.alias.clone()),
+            content: text,
+            passive_context: true,
+            control: interrupt.then_some(ChannelControl::Interrupt),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+            thread_ts: event["scope"].as_str().map(str::to_string),
+            interruption_scope_id: event["call_id"].as_str().map(str::to_string),
+            ..Default::default()
+        })
+        .await
+        .context("simplex_dispatch_closed")
+    }
     async fn event(&self, event: Value, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let kind = event["type"].as_str().unwrap_or("");
         let contact = event["contact"].as_str().unwrap_or("");
+        if kind == "interrupted" {
+            return self.playback_observation(&event, tx, true).await;
+        }
+        if kind == "call_audio" {
+            let call = event["call_id"]
+                .as_str()
+                .context("simplex_call_id_missing")?;
+            if !self.stream_authorized(contact, call) {
+                return self
+                    .request(json!({"type":"hangup","contact":contact,"call_id":call}))
+                    .await;
+            }
+            let sender = self
+                .inner
+                .recognition
+                .lock()
+                .get(call)
+                .map(|r| r.stream.audio.clone());
+            if let Some(sender) = sender {
+                let pcm = base64::engine::general_purpose::STANDARD
+                    .decode(event["audio"].as_str().context("simplex_audio_missing")?)?;
+                ensure!(pcm.len() <= 8192, "simplex_pcm_limit");
+                if !matches!(
+                    tokio::time::timeout(Duration::from_secs(1), sender.send(pcm)).await,
+                    Ok(Ok(()))
+                ) {
+                    self.inner.recognition.lock().remove(call);
+                    self.request(json!({"type":"hangup","contact":contact,"call_id":call}))
+                        .await?;
+                    anyhow::bail!("simplex_live_audio_backpressure");
+                }
+            }
+            return Ok(());
+        }
         if kind == "call_ended" {
+            if let Some(call) = event["call_id"].as_str() {
+                self.inner.recognition.lock().remove(call);
+            }
+            self.playback_observation(&event, tx, false).await?;
             let prefix = format!("{}/", event["call_id"].as_str().unwrap_or(""));
             self.inner
                 .transcripts
@@ -356,7 +597,26 @@ impl SimplexChannel {
                         .and_then(|a| config.agents.get(a))
                         .is_some_and(|a| !a.transcription_provider.is_empty())
             };
-            return self.request(json!({"type": if accept {"accept"} else {"reject"}, "contact": contact, "call_id": event["call_id"]})).await;
+            let call = event["call_id"]
+                .as_str()
+                .context("simplex_call_id_missing")?;
+            let streaming = if accept {
+                match self.start_recognition(contact, call, tx).await {
+                    Ok(streaming) => streaming,
+                    Err(error) => {
+                        self.request(json!({"type":"reject","contact":contact,"call_id":call}))
+                            .await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                false
+            };
+            let result = self.request(json!({"type": if accept {"accept"} else {"reject"}, "contact": contact, "call_id":call,"streaming":streaming})).await;
+            if result.is_err() {
+                self.inner.recognition.lock().remove(call);
+            }
+            return result;
         }
         if !matches!(kind, "message" | "utterance" | "voice_note")
             || !self.allowed(contact, kind == "utterance")
@@ -426,6 +686,22 @@ impl SimplexChannel {
             text = complete;
         }
         if text.trim().is_empty() {
+            return Ok(());
+        }
+        self.dispatch_message(&event, text, voice, call, tx).await
+    }
+    async fn dispatch_message(
+        &self,
+        event: &Value,
+        text: String,
+        voice: bool,
+        call: bool,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> Result<()> {
+        let contact = event["contact"]
+            .as_str()
+            .context("simplex_contact_missing")?;
+        if !self.allowed(contact, call) || text.trim().is_empty() {
             return Ok(());
         }
         tx.send(ChannelMessage {
@@ -578,12 +854,10 @@ impl Channel for SimplexChannel {
                     channel.inner.drafts.lock().retain(|_, draft| {
                         draft.contact != contact || draft.scope.split('/').next() != Some(call_id)
                     });
-                    if value["type"] == "call_ended" {
-                        events
-                            .send(value)
-                            .await
-                            .context("simplex_event_loop_closed")?;
-                    }
+                    events
+                        .send(value)
+                        .await
+                        .context("simplex_event_loop_closed")?;
                 } else {
                     events
                         .send(value)
@@ -625,6 +899,7 @@ impl Channel for SimplexChannel {
         self.inner.pending.lock().clear();
         self.inner.drafts.lock().clear();
         self.inner.transcripts.lock().clear();
+        self.inner.recognition.lock().clear();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         // Closing stdin gives the helper a chance to close browser/media first.
@@ -883,7 +1158,7 @@ impl VoiceDraft {
                         segment,
                         channel
                             .request(json!({"type": "audio", "contact": contact, "scope": scope,
-                        "audio": base64::engine::general_purpose::STANDARD.encode(audio)})),
+                        "audio": base64::engine::general_purpose::STANDARD.encode(audio), "text":segment})),
                     )
                     .await?;
                     spoken.push(segment.clone());
@@ -1259,6 +1534,116 @@ mod tests {
             "the opener must not be synthesized twice"
         );
         assert!(channel.inner.drafts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_speech_orders_playback_receipt_before_final_user_turn() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("ws://{}/stream", listener.local_addr().unwrap());
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"ready","sampleRate":16000,"streaming":true})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            while !matches!(socket.next().await, Some(Ok(Message::Binary(_)))) {}
+            for event in [
+                json!({"type":"speech_start","utteranceId":"u1"}),
+                json!({"type":"final","utteranceId":"u1","text":"Please explain the last point."}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let _ = socket.next().await;
+        });
+        let (channel, live) = fixture();
+        let mut config = live.snapshot();
+        config.transcription.enabled = true;
+        config
+            .agents
+            .get_mut("assistant")
+            .unwrap()
+            .transcription_provider = "local_whisper.fixture".into();
+        config.providers.transcription.local_whisper.insert(
+            "fixture".into(),
+            LocalWhisperTranscriptionProviderConfig {
+                stream_uri: Some(uri),
+                ..Default::default()
+            },
+        );
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let responder = channel.clone();
+        let bridge = zeroclaw_spawn::spawn!(async move {
+            let request = requests.recv().await.unwrap();
+            assert_eq!(request["type"], "speech_start");
+            assert_eq!(request["utterance_id"], "u1");
+            responder.inner.pending.lock().remove(request["id"].as_str().unwrap()).unwrap().send(json!({"ok":true,
+                "observation":{"contact":"17","call_id":"call","scope":"call/u1", "playback":{"interrupted":true,"completed":[],"partial":{"text":"The second point is important.","played_ms":200,"duration_ms":3000}}}})).unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(channel.start_recognition("17", "call", &tx).await.unwrap());
+        channel
+            .event(
+                json!({"type":"call_audio","contact":"17","call_id":"call","audio":"AAAAAA=="}),
+                &tx,
+            )
+            .await
+            .unwrap();
+        let observation = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.control, Some(ChannelControl::Interrupt));
+        assert!(observation.passive_context);
+        assert!(
+            observation
+                .content
+                .contains("The second point is important.")
+        );
+        let final_turn = rx.recv().await.unwrap();
+        assert_eq!(final_turn.content, "Please explain the last point.");
+        assert!(final_turn.voice_origin && !final_turn.passive_context);
+        assert_eq!(final_turn.thread_ts.as_deref(), Some("call/u1"));
+        assert_eq!(final_turn.interruption_scope_id.as_deref(), Some("call"));
+        channel.inner.recognition.lock().clear();
+        bridge.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finished_generation_can_still_record_a_passive_playback_interruption() {
+        let (channel, _) = fixture();
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(channel.inner.drafts.lock().is_empty());
+        channel.event(json!({"type":"interrupted","contact":"17","call_id":"call", "scope":"call/next",
+            "playback":{"interrupted":true,"completed":["An opening sentence."],
+            "partial":{"text":"The longer remaining paragraph.","played_ms":1250,"duration_ms":10000}}}), &tx).await.unwrap();
+        let report = rx.recv().await.unwrap();
+        assert_eq!(report.control, Some(ChannelControl::Interrupt));
+        assert!(report.passive_context);
+        assert!(report.content.contains("An opening sentence."));
+        assert!(report.content.contains("1250"));
+        assert!(report.content.contains("only partly played"));
+        assert_eq!(report.interruption_scope_id.as_deref(), Some("call"));
+        channel.event(json!({"type":"interrupted","contact":"17","call_id":"call","scope":"call/next", "playback":{"interrupted":false}}),&tx).await.unwrap();
+        let control = rx.recv().await.unwrap();
+        assert!(control.content.is_empty());
+        assert_eq!(control.control, Some(ChannelControl::Interrupt));
     }
 
     #[tokio::test]
