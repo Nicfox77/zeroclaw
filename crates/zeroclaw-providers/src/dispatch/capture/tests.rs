@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::session_events::capture::scope_provider_capture;
