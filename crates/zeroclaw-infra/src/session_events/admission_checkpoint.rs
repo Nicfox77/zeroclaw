@@ -7,7 +7,8 @@ use zeroclaw_api::session_events::{
     rules::{HistoryDelta, HistoryIndex},
 };
 
-const FORMAT: i64 = 1;
+// Transform admission stores the canonical terminal identity, not a boolean.
+const FORMAT: i64 = 2;
 const INTERVAL: i64 = 4_096;
 
 pub(super) fn load_for_read(conn: &Connection) -> Result<Option<ValidationSnapshot>, ReadError> {
@@ -459,5 +460,94 @@ mod tests {
         metadata(&store, &stream, "after-repair", &reference, 1, vec![]);
         sqlite_history::VERIFIED_HISTORY_READS
             .with(|count| assert_eq!(count.get(), 1, "the rebuilt checkpoint must be reusable"));
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use zeroclaw_api::session_events::{CaptureMode, EventData, StoredPayloadRef};
+
+    #[test]
+    fn old_admission_format_rebuilds_without_changing_canonical_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(directory.path()).unwrap();
+        let stream = SessionId::new();
+        let branch = zeroclaw_api::session_events::BranchId::new();
+        let mut root = SessionEvent::typed(
+            stream.clone(),
+            EventData::SessionStarted {
+                owning_agent: "fixture".into(),
+                capture_mode: CaptureMode::Native,
+            },
+            zeroclaw_api::session_events::EventActor::default(),
+        )
+        .unwrap();
+        root.branch_id = Some(branch.clone());
+        let root_id = root.event_id.clone();
+        let receipt = store
+            .append_batch(AppendRequest {
+                session_id: stream.clone(),
+                expected_head: EventCursor::beginning(stream.clone()),
+                idempotency_key: "fixture_root".into(),
+                events: vec![root],
+                payloads: vec![],
+                erasure_reference_commitment: None,
+            })
+            .unwrap();
+        {
+            let conn = store.conn.lock();
+            let validation = store.validation.lock();
+            let Some(ValidationSnapshot::Admission {
+                history, payloads, ..
+            }) = validation.as_ref()
+            else {
+                panic!("fixture admission index missing");
+            };
+            maybe_save(&conn, history, payloads, true).unwrap();
+            conn.execute("UPDATE session_admission_checkpoint SET format=1", [])
+                .unwrap();
+            assert!(load(&conn).unwrap().is_none());
+        }
+        let original = store.read_event(&root_id).unwrap().unwrap();
+        drop(store);
+        let store = SqliteEventStore::open(directory.path()).unwrap();
+        let title = PayloadRecord::new(
+            PayloadId::new(),
+            "session.text/v1".into(),
+            b"fixture title".to_vec(),
+        )
+        .unwrap();
+        let mut metadata = SessionEvent::typed(
+            stream.clone(),
+            EventData::SessionMetadataChanged {
+                field: "title".into(),
+                new_value_ref: StoredPayloadRef::from(&title),
+            },
+            zeroclaw_api::session_events::EventActor::default(),
+        )
+        .unwrap();
+        metadata.branch_id = Some(branch);
+        store
+            .append_batch(AppendRequest {
+                session_id: stream,
+                expected_head: receipt.last,
+                idempotency_key: "fixture_title".into(),
+                events: vec![metadata],
+                payloads: vec![title],
+                erasure_reference_commitment: None,
+            })
+            .unwrap();
+        assert_eq!(store.read_event(&root_id).unwrap().unwrap(), original);
+        let conn = store.conn.lock();
+        let format: i64 = conn
+            .query_row(
+                "SELECT format FROM session_admission_checkpoint WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(format, FORMAT);
+        assert!(load_for_read(&conn).unwrap().is_some());
     }
 }
