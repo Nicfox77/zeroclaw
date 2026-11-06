@@ -42,6 +42,10 @@ deny.toml
 # License file (not needed for runtime)
 LICENSE
 
+# Local diagnostics and disposable build caches
+tmp/
+.cache/
+
 # Temporary files
 .tmp_*
 *.tmp
