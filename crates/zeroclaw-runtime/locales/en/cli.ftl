@@ -1751,3 +1751,6 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+channel-simplex-voice-note-failed = I couldn’t process that voice note. Please try again, or send your message as text.
+channel-simplex-voice-reply-failed = I couldn’t send the voice reply. The text response is available above.

@@ -9,6 +9,7 @@ import {join} from 'node:path';
 import {once} from 'node:events';
 import {openRtc} from './rtc.mjs';
 import {Utterances} from './audio.mjs';
+import {VoiceNotes} from './notes.mjs';
 
 const pending = new Map();
 let socket, call, invitation;
@@ -27,6 +28,7 @@ function rpc(cmd) {
     });
   });
 }
+const notes = new VoiceNotes(rpc, emit);
 async function endCall(notify = true) {
   const previous = call; call = undefined;
   if (!previous) return;
@@ -39,10 +41,12 @@ function contactId(value) {
   return String(value);
 }
 async function event(resp) {
+  await notes.event(resp);
   switch (resp.type) {
     case 'newChatItems':
       for (const item of resp.chatItems ?? []) {
         if (item.chatInfo?.type !== 'direct' || item.chatItem?.chatDir?.type !== 'directRcv') continue;
+        if (await notes.invitation(item)) continue;
         const body = item.chatItem.content;
         if (body?.type !== 'rcvMsgContent' || body.msgContent?.type !== 'text') continue;
         await emit({type: 'message', contact: contactId(item.chatInfo.contact.contactId),
@@ -133,10 +137,14 @@ async function command(message) {
       });
       socket.on('close', fatal); socket.on('error', fatal);
     } else if (type === 'ping') await rpc('/u');
+    else if (type === 'receive_voice') await notes.receive(message);
     else if (type === 'send') {
       const contact = contactId(Number(message.contact));
+      if (message.voice) await notes.send(contact, message.text, message.voice);
+      else {
       const chars = [...message.text];
       for (let i = 0; i < chars.length; i += 12000) await rpc(`/_send @${contact} json ${JSON.stringify([{msgContent: {type: 'text', text: chars.slice(i, i + 12000).join('')}}])}`);
+      }
     } else if (type === 'accept') await accept(contactId(Number(message.contact)), message.call_id);
     else if (type === 'reject') {
       if (invitation?.id === message.call_id) {await rpc(`/_call reject @${invitation.contact}`); invitation = undefined;}
@@ -160,6 +168,7 @@ async function fatal() {
   for (const {reject, timer} of pending.values()) {clearTimeout(timer); reject(Error('simplex_disconnected'));}
   pending.clear();
   await endCall(false).catch(() => {});
+  await notes.close().catch(() => {});
   socket?.terminate(); process.exitCode = 1;
   process.stdin.destroy();
 }
