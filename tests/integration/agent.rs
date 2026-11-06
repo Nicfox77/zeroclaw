@@ -277,9 +277,8 @@ async fn e2e_memory_enrichment_injects_context() {
         user_msg.content,
     );
 
-    // Agent history stores the CLEAN message: the engine injects the
-    // memory block per turn onto the outgoing request, and it is not
-    // persisted into conversation history (no stale-block accumulation).
+    // Literal user text stays clean in history. The retained recall
+    // observation is rendered separately on the provider request copy.
     let history = agent.history();
     match &history[1] {
         ConversationMessage::Chat(c) => {
@@ -315,16 +314,14 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert!(req1_user.content.contains("project: zeroclaw"));
     assert!(req1_user.content.ends_with("first question"));
 
-    // Turn 2: only the CURRENT turn's user message is enriched. The
-    // engine injects per turn onto the outgoing request; earlier user
-    // messages stay clean in history (no stale-block accumulation).
+    // Turn 2 retains the first turn's immutable recall observation in the
+    // provider request. An unchanged memory is not injected again into the
+    // current turn, preserving the prior request prefix without duplicates.
     let req2_users: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "user").collect();
     assert_eq!(req2_users.len(), 2, "Request 2 should have 2 user messages");
 
-    assert!(!req2_users[0].content.contains("[Memory context]"));
-    assert!(req2_users[0].content.ends_with("first question"));
-
-    assert!(req2_users[1].content.contains("[Memory context]"));
+    assert_eq!(req2_users[0].content, req1_user.content);
+    assert!(!req2_users[1].content.contains("[Memory context]"));
     assert!(req2_users[1].content.ends_with("second question"));
 
     // Assistant response from turn 1 preserved
@@ -335,7 +332,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert_eq!(req2_assts.len(), 1);
     assert_eq!(req2_assts[0].content, "answer 1");
 
-    // History: system + 2*(enriched_user + assistant) = 5
+    // History: system + 2*(literal_user + assistant) = 5
     assert_eq!(agent.history().len(), 5);
 }
 
