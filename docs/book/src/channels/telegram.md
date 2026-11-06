@@ -74,7 +74,9 @@ and no shared audio buffer between replies. Text delivery still follows
 complete. Rejected or empty speech and synthesis/upload failures retain the
 existing voice-error logging behavior; text-plus-voice peers still receive text.
 Explicit voice finalization transfers the prepared job before cancelling the
-draft placeholder. If speculative synthesis failed, final delivery makes one
+draft placeholder. A failed preview deletion is logged and cannot veto the
+final reply. If pacing drops a final operation, it also cancels the owned draft
+and prepared speech. If speculative synthesis failed, final delivery makes one
 fresh synthesis attempt using only the approved final text; it never uploads
 partially prepared audio. A failed final attempt is logged without further retries.
 

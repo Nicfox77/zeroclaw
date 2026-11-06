@@ -3204,6 +3204,18 @@ impl TelegramChannel {
 
     /// Override the Telegram Bot API base URL.
     /// Useful for local Bot API servers or testing.
+    #[cfg(test)]
+    pub(crate) fn with_fixture_timeout(mut self, timeout: Duration) -> Self {
+        self.fixture_http_client = Some(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()
+                .unwrap(),
+        );
+        self
+    }
+
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = normalize_telegram_api_base(&api_base);
         self
@@ -8328,7 +8340,14 @@ impl Channel for TelegramChannel {
             .voice_drafts
             .lock()
             .remove(&Self::multi_draft_key(recipient, message_id));
-        self.cancel_draft(recipient, message_id).await?;
+        // Cleanup cannot veto final speech, and the job is already owned here.
+        if let Err(error) = self.cancel_draft(recipient, message_id).await {
+            ::zeroclaw_log::record!(WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                "Voice draft preview cleanup failed; continuing final delivery"
+            );
+        }
         self.queue_voice_reply(recipient, &strip_tool_call_tags(text), job, true);
         if (self.send_text_with_voice_resolver)() {
             self.send(&SendMessage::new(text, recipient).suppress_voice())

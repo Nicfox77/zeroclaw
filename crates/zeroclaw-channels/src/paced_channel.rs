@@ -184,6 +184,7 @@ impl PacedChannel {
     async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
         let recipient_key = op.recipient().to_string();
 
+        let mut dropped = None;
         let decision: (Option<PacedOp>, Option<oneshot::Receiver<Result<()>>>, bool) = {
             let mut map = self.recipients.lock().await;
             map.evict_if_over_cap();
@@ -223,6 +224,7 @@ impl PacedChannel {
                         })),
                     "paced channel queue full: dropping newest outbound message"
                 );
+                dropped = Some(op);
                 (None, None, false)
             } else {
                 let (tx, rx) = oneshot::channel();
@@ -235,6 +237,14 @@ impl PacedChannel {
             }
         };
 
+        if let Some(PacedOp::FinalizeDraft {
+            recipient,
+            message_id,
+            ..
+        }) = dropped
+        {
+            self.inner.cancel_draft(&recipient, &message_id).await?;
+        }
         let (immediate, awaited, spawn_worker) = decision;
         if let Some(op) = immediate {
             let result = op.dispatch(&self.inner).await;
@@ -702,6 +712,7 @@ mod tests {
         sends: AtomicUsize,
         final_sends: AtomicUsize,
         finalize_drafts: AtomicUsize,
+        cancellations: AtomicUsize,
     }
 
     impl Attributable for CountingChannel {
@@ -721,6 +732,10 @@ mod tests {
         }
         async fn send(&self, _message: &SendMessage) -> Result<()> {
             self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> Result<()> {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn send_final(&self, _message: &SendMessage) -> Result<()> {
@@ -858,6 +873,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let cfg = PacingFixture {
             interval_secs: 0,
@@ -876,6 +892,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // Use 1h to make the wait long enough that we can assert the
@@ -904,6 +921,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h interval again — we only ever send once per recipient, so
@@ -934,6 +952,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -964,6 +983,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1020,6 +1040,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h floor: the first op fires immediately, so no real time elapses.
@@ -1048,11 +1069,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speech_queue_overflow_cancels_owned_draft_without_delivering() {
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: counting.clone(),
+            min_interval: Duration::from_secs(3600),
+            queue_depth: 1,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("first", "alice"))
+            .await
+            .unwrap();
+        let queued_channel = paced.clone();
+        let queued = zeroclaw_spawn::spawn!(async move {
+            queued_channel
+                .send(&SendMessage::new("queued", "alice"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while paced
+                .recipients
+                .lock()
+                .await
+                .inner
+                .get("alice")
+                .unwrap()
+                .queue
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        paced
+            .finalize_draft_with_modality("alice", "voice-draft", "final", false, true)
+            .await
+            .unwrap();
+        paced
+            .finalize_draft("alice", "text-draft", "final", false)
+            .await
+            .unwrap();
+        assert_eq!(counting.cancellations.load(Ordering::SeqCst), 2);
+        assert_eq!(counting.finalize_drafts.load(Ordering::SeqCst), 0);
+        queued.abort();
+    }
+
+    #[tokio::test]
     async fn final_response_dispatches_to_inner_send_final_not_send() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1140,6 +1215,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
