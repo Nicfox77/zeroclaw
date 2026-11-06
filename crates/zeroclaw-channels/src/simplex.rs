@@ -18,6 +18,18 @@ use zeroclaw_config::live::LiveConfigHandle;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
 
+fn bridge_result(value: Value) -> Result<()> {
+    if value["ok"] == true {
+        return Ok(());
+    }
+    let error = anyhow::Error::msg("simplex_bridge_command_failed");
+    if value["not_delivered"] == true {
+        Err(zeroclaw_api::session_events::capture::delivery_definitely_failed(error))
+    } else {
+        Err(error)
+    }
+}
+
 #[derive(Clone)]
 pub struct SimplexChannel {
     inner: Arc<Inner>,
@@ -26,8 +38,12 @@ struct Inner {
     alias: String,
     config: LiveConfigHandle,
     writer: Mutex<Option<mpsc::Sender<Value>>>,
-    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     drafts: Mutex<HashMap<String, VoiceDraft>>,
+    /// Creates the unfinished spoken turn from completed STT chunks. It is
+    /// neither durable chat history nor a policy snapshot; only the assembled
+    /// turn enters shared dispatch, once silence closes it.
+    transcripts: Mutex<HashMap<String, String>>,
     cancel: Mutex<CancellationToken>,
 }
 struct PendingRequest<'a> {
@@ -49,6 +65,7 @@ impl SimplexChannel {
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 drafts: Mutex::new(HashMap::new()),
+                transcripts: Mutex::new(HashMap::new()),
                 cancel: Mutex::new(CancellationToken::new()),
             }),
         }
@@ -98,11 +115,7 @@ impl SimplexChannel {
         };
         let result = tokio::time::timeout(timeout, async {
             writer.send(value).await.context("simplex_bridge_closed")?;
-            ensure!(
-                rx.await.context("simplex_bridge_disconnected")?,
-                "simplex_bridge_command_failed"
-            );
-            Ok(())
+            bridge_result(rx.await.context("simplex_bridge_disconnected")?)
         })
         .await
         .context("simplex_bridge_timeout")?;
@@ -159,7 +172,7 @@ impl SimplexChannel {
                     );
                     let response: Value = serde_json::from_str(&line)?;
                     if response["type"] == "result" && response["id"] == id {
-                        ensure!(response["ok"] == true, "simplex_bridge_command_failed");
+                        bridge_result(response)?;
                         break;
                     }
                 }
@@ -189,6 +202,14 @@ impl SimplexChannel {
     async fn event(&self, event: Value, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let kind = event["type"].as_str().unwrap_or("");
         let contact = event["contact"].as_str().unwrap_or("");
+        if kind == "call_ended" {
+            let prefix = format!("{}/", event["call_id"].as_str().unwrap_or(""));
+            self.inner
+                .transcripts
+                .lock()
+                .retain(|scope, _| !scope.starts_with(&prefix));
+            return Ok(());
+        }
         if kind == "call_invitation" {
             let accept = self.allowed(contact, true) && self.manager(contact).is_ok() && {
                 let config = self.inner.config.read();
@@ -204,7 +225,7 @@ impl SimplexChannel {
             return Ok(());
         }
         let voice = kind == "utterance";
-        let text = if voice {
+        let mut text = if voice {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(event["audio"].as_str().context("simplex_audio_missing")?)?;
             ensure!(
@@ -233,7 +254,21 @@ impl SimplexChannel {
                 .to_string()
         };
         // Speech recognition is asynchronous. Recheck policy after it returns.
-        if text.trim().is_empty() || !self.allowed(contact, voice) {
+        if (!voice && text.trim().is_empty()) || !self.allowed(contact, voice) {
+            return Ok(());
+        }
+        if voice {
+            let scope = event["scope"]
+                .as_str()
+                .context("simplex_voice_scope_missing")?;
+            let Some(complete) =
+                self.assemble_transcript(scope, &text, event["finished"] == true)?
+            else {
+                return Ok(());
+            };
+            text = complete;
+        }
+        if text.trim().is_empty() {
             return Ok(());
         }
         tx.send(ChannelMessage {
@@ -259,6 +294,34 @@ impl SimplexChannel {
         })
         .await
         .context("simplex_dispatch_closed")
+    }
+    fn assemble_transcript(
+        &self,
+        scope: &str,
+        text: &str,
+        finished: bool,
+    ) -> Result<Option<String>> {
+        let mut transcripts = self.inner.transcripts.lock();
+        ensure!(
+            transcripts.contains_key(scope) || transcripts.len() < 32,
+            "simplex_unfinished_turn_limit"
+        );
+        let combined = transcripts.entry(scope.to_string()).or_default();
+        ensure!(
+            combined.len() + text.len() <= 256_000,
+            "simplex_transcript_limit"
+        );
+        if !text.trim().is_empty() {
+            if !combined.is_empty() {
+                combined.push(' ');
+            }
+            combined.push_str(text.trim());
+        }
+        Ok(if finished {
+            transcripts.remove(scope)
+        } else {
+            None
+        })
     }
 }
 
@@ -347,7 +410,7 @@ impl Channel for SimplexChannel {
                 if value["type"] == "result" {
                     if let Some(id) = value["id"].as_str()
                         && let Some(waiter) = channel.inner.pending.lock().remove(id)
-                        && waiter.send(value["ok"] == true).is_err()
+                        && waiter.send(value).is_err()
                     {
                         continue; // the request owner already cancelled
                     }
@@ -358,6 +421,12 @@ impl Channel for SimplexChannel {
                     channel.inner.drafts.lock().retain(|_, draft| {
                         draft.contact != contact || draft.scope.split('/').next() != Some(call_id)
                     });
+                    if value["type"] == "call_ended" {
+                        events
+                            .send(value)
+                            .await
+                            .context("simplex_event_loop_closed")?;
+                    }
                 } else {
                     events
                         .send(value)
@@ -395,6 +464,7 @@ impl Channel for SimplexChannel {
         self.inner.writer.lock().take();
         self.inner.pending.lock().clear();
         self.inner.drafts.lock().clear();
+        self.inner.transcripts.lock().clear();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         // Closing stdin gives the helper a chance to close browser/media first.
@@ -473,8 +543,21 @@ impl Channel for SimplexChannel {
         );
         // Audio failure after text delivery must never trigger a duplicate text
         // fallback. Deliver audio first and let final text ACK be authoritative.
-        if !suppress_voice && let Some(mut draft) = draft {
-            draft.finish(text).await?;
+        if !suppress_voice
+            && let Some(mut draft) = draft
+            && let Err(error) = draft.finish(text).await
+        {
+            if zeroclaw_api::session_events::capture::is_capture_stopped(&error) {
+                return Err(error);
+            }
+            // Text is the final delivery boundary. A handled speech failure
+            // must not turn an unattempted text send into uncertain capture.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(json!({"error": error.to_string()})),
+                "SimpleX speech failed; delivering final text"
+            );
         }
         self.request(json!({"type": "send", "contact": recipient, "text": text}))
             .await
@@ -504,12 +587,13 @@ struct VoiceDraft {
     phase_start: usize,
     updates: watch::Sender<SpeechSnapshot>,
     worker: Option<tokio::task::JoinHandle<Result<()>>>,
+    cancel: CancellationToken,
 }
 impl Drop for VoiceDraft {
     fn drop(&mut self) {
-        if let Some(worker) = &self.worker {
-            worker.abort();
-        }
+        // Cancel synthesis immediately, but let an admitted audio delivery
+        // settle its receipt. Aborting that future would strand an intent.
+        self.cancel.cancel();
     }
 }
 impl VoiceDraft {
@@ -523,6 +607,7 @@ impl VoiceDraft {
             phase_start: 0,
             updates,
             worker: None,
+            cancel: CancellationToken::new(),
         }
     }
     fn update(&mut self, phase: usize, text: &str, phase_finished: bool) {
@@ -552,9 +637,13 @@ impl VoiceDraft {
         // Spawned tasks do not inherit task locals. Transfer the existing turn
         // coordinate; its port rechecks live admission at actual delivery.
         let delivery = crate::orchestrator::DeliveryScope::current();
+        let cancel = self.cancel.clone();
         self.worker = Some(zeroclaw_spawn::spawn!(async move {
             let mut spoken = Vec::new();
             loop {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
                 let snapshot = rx.borrow_and_update().clone();
                 let channel = SimplexChannel {
                     inner: channel.upgrade().context("simplex_channel_closed")?,
@@ -569,7 +658,10 @@ impl VoiceDraft {
                     "simplex_live_speech_rewritten"
                 );
                 if let Some(segment) = segments.get(spoken.len()) {
-                    let audio = manager.synthesize(segment).await?;
+                    let audio = tokio::select! {
+                        () = cancel.cancelled() => return Ok(()),
+                        result = manager.synthesize(segment) => result?,
+                    };
                     ensure!(
                         !audio.is_empty() && audio.len() <= 5 * 1024 * 1024,
                         "simplex_invalid_tts_audio"
@@ -603,7 +695,10 @@ impl VoiceDraft {
                     return Ok(());
                 }
                 drop(channel);
-                rx.changed().await.context("simplex_speech_cancelled")?;
+                tokio::select! {
+                    () = cancel.cancelled() => return Ok(()),
+                    changed = rx.changed() => {changed.context("simplex_speech_cancelled")?;}
+                }
             }
         }));
     }
@@ -667,6 +762,50 @@ mod tests {
         );
         let live = LiveConfig::new(config);
         (SimplexChannel::new("personal".into(), live.handle()), live)
+    }
+
+    #[test]
+    fn bridge_rejections_preserve_known_failure_without_guessing_on_lost_acceptance() {
+        use zeroclaw_api::session_events::capture::is_delivery_definitely_failed;
+        assert!(bridge_result(json!({"ok":true})).is_ok());
+        assert!(is_delivery_definitely_failed(
+            &bridge_result(json!({"ok":false,"not_delivered":true})).unwrap_err()
+        ));
+        assert!(!is_delivery_definitely_failed(
+            &bridge_result(json!({"ok":false})).unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn continuous_speech_chunks_form_one_input_only_after_silence() {
+        let (channel, _) = fixture();
+        assert!(
+            channel
+                .assemble_transcript("call/turn", "First part.", false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            channel
+                .assemble_transcript("call/turn", "Second part.", false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            channel
+                .assemble_transcript("call/turn", "", true)
+                .unwrap()
+                .as_deref(),
+            Some("First part. Second part.")
+        );
+        assert_eq!(
+            channel
+                .assemble_transcript("call/next", "Next turn.", true)
+                .unwrap()
+                .as_deref(),
+            Some("Next turn.")
+        );
+        assert!(channel.inner.transcripts.lock().is_empty());
     }
 
     #[tokio::test]
@@ -777,7 +916,7 @@ mod tests {
                     .lock()
                     .remove(value["id"].as_str().unwrap())
                 {
-                    waiter.send(true).ok();
+                    waiter.send(json!({"ok": true})).ok();
                 }
             }
         });

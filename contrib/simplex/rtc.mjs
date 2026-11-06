@@ -30,7 +30,7 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
       globalThis.playAudio = async base64 => {
         const raw = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
         const buffer = await audio.decodeAudioData(raw.buffer);
-        if (buffer.duration > 180 || sources.size >= 2) throw Error('simplex_audio_queue_limit');
+        if (buffer.duration > 180 || sources.size >= 2) throw Object.assign(Error('simplex_audio_queue_limit'), {notDelivered: true});
         const source = audio.createBufferSource();
         source.buffer = buffer;
         source.connect(destination);
@@ -43,7 +43,7 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
         // ACK when playback begins. The producer can synthesize the next clip
         // while this one plays, with at most one future clip queued.
         await new Promise((resolve, reject) => {
-          const cancel = () => {clearTimeout(timer); reject(Error('simplex_audio_cancelled'));};
+          const cancel = () => {clearTimeout(timer); reject(Object.assign(Error('simplex_audio_cancelled'), {notDelivered: audio.currentTime < starts}));};
           const timer = setTimeout(() => {waiting.delete(cancel); resolve();}, Math.max(0, starts - audio.currentTime) * 1000);
           waiting.add(cancel);
         });
@@ -63,7 +63,9 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
         constructor(...args) {
           super(...args);
           this.addEventListener('track', event => {
-            if (event.track.kind !== 'audio') return;
+            // SimpleX also negotiates a separate screen-audio transceiver.
+            // Mixing its silence with the mic would repeatedly reset VAD.
+            if (event.track.kind !== 'audio' || event.transceiver.mid !== '0') return;
             const input = audio.createMediaStreamSource(new MediaStream([event.track]));
             const processor = audio.createScriptProcessor(1024, 1, 1);
             input.connect(processor); processor.connect(audio.destination);
@@ -89,7 +91,13 @@ export async function openRtc({assets, executablePath, onSignal, onPcm}) {
     await page.evaluate(() => {sendMessageToNative = signal => hostSignal(signal);});
     return {
       command: command => page.evaluate(command => processCommand({command}), command),
-      play: audio => page.evaluate(audio => playAudio(audio), audio),
+      play: async audio => {
+        const result = await page.evaluate(async audio => {
+          try {await playAudio(audio); return {ok: true};}
+          catch (error) {return {ok: false, notDelivered: error.notDelivered === true};}
+        }, audio);
+        if (!result.ok) throw Object.assign(Error('simplex_playback_failed'), {notDelivered: result.notDelivered});
+      },
       stop: () => page.evaluate(() => stopAudio()),
       diagnostics: () => page.evaluate(async () => ({audio: audioState(),
         state: activeCall?.connection.connectionState,

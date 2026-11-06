@@ -90,8 +90,9 @@ neither needs access to message or encrypted call content. A configured external
 model provider still receives agent prompts after decryption on your server.
 
 Incoming speech is collected in bounded, memory-only utterances using an energy
-threshold and approximately 700 ms of silence. Continuous speech is split at
-30 seconds. At speech onset, queued playback stops and stale-generation audio
+threshold and approximately 700 ms of silence. Continuous speech is transcribed
+in 30-second chunks in the background; one combined turn enters dispatch only
+when silence closes it. At speech onset, queued playback stops and stale-generation audio
 is refused. A recognized utterance enters the shared dispatcher; with
 `interrupt_on_new_message`, it also cancels the preceding model turn. Recognition
 latency therefore still affects when model work is cancelled.
@@ -108,12 +109,20 @@ file attachments, voice-note messages, and agent-initiated calls are not handled
 Android screen-off, Bluetooth routing, TURN reachability, and battery restrictions
 must be verified on the actual phone.
 
+Streamed audio chunks use the current turn's native delivery capture. Cancellation
+stops synthesis while allowing an already admitted delivery to settle its receipt.
+The bridge distinguishes a proven pre-playback rejection from an uncertain
+transport failure; interrupted speech must not be retried as a fresh full answer.
+
 ## Verification and rollback
 
 Run `npm test` in `contrib/simplex`. With `CHROMIUM_PATH` and assets configured,
 `SIMPLEX_RTC_TEST=1 npm test` additionally checks encrypted audio in both directions
 and rejects mismatched encryption keys. Rust adapter tests exercise peer denial,
 live policy changes, routing, and speech before finalization.
+`SIMPLEX_RELAY_TEST=1 npm test` additionally exercises the real helper through
+public TURN relays with simulated CLI signaling, including speech detection and
+interruption. It does not contact phone users or invoke model providers.
 
 For an end-to-end check, send a direct message, then start an audio call from
 Android. Confirm the encryption indicator, speak, hear the reply, interrupt it,

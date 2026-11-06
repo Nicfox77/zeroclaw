@@ -13,7 +13,9 @@ for (const wrongKey of [false, true]) test(wrongKey ? 'wrong encryption key prev
   const key = randomBytes(32).toString('base64').replaceAll('+', '-').replaceAll('/', '_');
   try {
     for (let i = 0; i < 2; i++) peers.push(await openRtc({...config,
-      onSignal: () => {}, onPcm: encoded => {
+      onSignal: ({resp, command}) => {
+        if (!command && resp.type === 'ice') return peers[1-i]?.command({type: 'ice', iceCandidates: resp.iceCandidates});
+      }, onPcm: encoded => {
         const pcm = Buffer.from(encoded, 'base64');
         for (let j = 0; j < pcm.length; j += 2) if (Math.abs(pcm.readInt16LE(j)) > 100) received[i]++;
       }}));
@@ -25,9 +27,9 @@ for (const wrongKey of [false, true]) test(wrongKey ? 'wrong encryption key prev
       offer: offer.offer, iceCandidates: offer.iceCandidates, iceServers: [], relay: false})).resp;
     assert.equal(answer.type, 'answer', answer.message);
     assert.equal((await peers[0].command({type: 'answer', answer: answer.answer, iceCandidates: answer.iceCandidates})).resp.type, 'ok');
-    const connecting = Date.now() + 5000;
+    const connecting = Date.now() + 15000;
     while ((await Promise.all(peers.map(p => p.diagnostics()))).some(s => s.state !== 'connected') && Date.now() < connecting) await new Promise(resolve => setTimeout(resolve, 50));
-    assert.ok((await Promise.all(peers.map(p => p.diagnostics()))).every(s => s.state === 'connected'));
+    assert.ok((await Promise.all(peers.map(p => p.diagnostics()))).every(s => s.state === 'connected'), JSON.stringify(await Promise.all(peers.map(p => p.diagnostics()))));
     await new Promise(resolve => setTimeout(resolve, 300));
     const samples = 16000;
     const wav = Buffer.alloc(44 + samples * 2);

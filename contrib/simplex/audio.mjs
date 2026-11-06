@@ -33,9 +33,14 @@ export class Utterances {
     }
     this.parts.push(pcm); this.samples += count;
     this.silence = speech ? 0 : this.silence + count;
-    if (this.silence >= 11200 || this.samples >= 480000) {
+    if (this.silence >= 11200) {
       const audio = wav(Buffer.concat(this.parts));
-      this.reset(); this.onEnd(audio);
+      this.reset(); this.onEnd(audio, true);
+    } else if (this.samples >= 480000) {
+      const audio = wav(Buffer.concat(this.parts));
+      this.parts = []; this.samples = 0;
+      // Keep the same voice turn and generation while STT works on this chunk.
+      this.onEnd(audio, false);
     }
   }
 }

@@ -81,9 +81,9 @@ async function accept(contact, callId) {
     current.generation = randomUUID();
     current.rtc.stop().catch(() => endCall());
     emit({type: 'interrupted', contact, call_id: current.id}).catch(fatal);
-  }, audio => {
+  }, (audio, finished) => {
     if (call !== current) return;
-    emit({type: 'utterance', contact, call_id: current.id, scope: `${current.id}/${current.generation}`,
+    emit({type: 'utterance', contact, call_id: current.id, scope: `${current.id}/${current.generation}`, finished,
       audio: audio.toString('base64')}).catch(fatal);
   });
   current.rtc = await openRtc({
@@ -95,9 +95,10 @@ async function accept(contact, callId) {
       try {
         if (resp.type === 'ice') await rpc(`/_call extra @${contact} ${JSON.stringify({rtcIceCandidates: resp.iceCandidates})}`);
         if (resp.type === 'connection') {
-          if (['connected', 'disconnected', 'failed'].includes(resp.connectionState)) await rpc(`/_call status @${contact} ${resp.connectionState}`);
-          if (resp.connectionState === 'connected') await emit({type: 'call_connected', contact, call_id: current.id});
-          if (['failed', 'closed'].includes(resp.connectionState)) await endCall();
+          const state = resp.state?.connectionState;
+          if (['connected', 'disconnected', 'failed'].includes(state)) await rpc(`/_call status @${contact} ${state}`);
+          if (state === 'connected') await emit({type: 'call_connected', contact, call_id: current.id});
+          if (['failed', 'closed'].includes(state)) await endCall();
         }
       } catch {await endCall();}
     },
@@ -140,16 +141,16 @@ async function command(message) {
     else if (type === 'reject') {
       if (invitation?.id === message.call_id) {await rpc(`/_call reject @${invitation.contact}`); invitation = undefined;}
     } else if (type === 'audio') {
-      if (!call || message.scope !== `${call.id}/${call.generation}` || message.contact !== call.contact) throw Error('simplex_stale_call_audio');
+      if (!call || message.scope !== `${call.id}/${call.generation}` || message.contact !== call.contact) throw Object.assign(Error('simplex_stale_call_audio'), {notDelivered: true});
       await call.rtc.play(message.audio);
     } else if (type === 'stop_audio') {
       if (call?.contact === message.contact && message.scope === `${call.id}/${call.generation}`) await call.rtc.stop();
     } else if (type === 'hangup') await endCall();
     else throw Error('simplex_unknown_bridge_command');
     await emit({type: 'result', id, ok: true});
-  } catch {
+  } catch (error) {
     if (type === 'accept') await endCall().catch(() => {});
-    await emit({type: 'result', id, ok: false});
+    await emit({type: 'result', id, ok: false, not_delivered: error.notDelivered === true});
   }
 }
 let shuttingDown = false;
