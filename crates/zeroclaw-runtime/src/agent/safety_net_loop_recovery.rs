@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Scripted providers deliberately disregard correction to prove containment
 //! at the same Agent APIs consumed by embedded callers and ACP.
 
