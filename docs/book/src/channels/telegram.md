@@ -62,7 +62,10 @@ leak-checked assistant text enters preparation; reasoning and tool-status text
 do not. A new assistant phase or rewritten final response discards incompatible
 speculative audio. Cancellation drops the draft's worker. With outbound hooks
 enabled, synthesis waits for final approval so a hook can reject or rewrite the
-text before it reaches the TTS provider.
+text before it reaches the TTS provider. Preparation reads the current per-turn
+route on every text update; text-only or redirected replies cancel preparation
+for the original destination. Segments sent before a route change cannot be
+retracted from the configured provider.
 
 Finalization waits for the worker, reuses matching completed clips and encodes
 one OGG/Opus file for one Telegram voice upload. There is no quiet-period timer
@@ -70,6 +73,12 @@ and no shared audio buffer between replies. Text delivery still follows
 `send_text_with_voice`. Non-streaming sends synthesize after the response is
 complete. Rejected or empty speech and synthesis/upload failures retain the
 existing voice-error logging behavior; text-plus-voice peers still receive text.
+Explicit voice finalization transfers the prepared job before cancelling the
+draft placeholder. A failed preview deletion is logged and cannot veto the
+final reply; cleanup waits at most two seconds. If pacing drops a final operation, it also cancels the owned draft
+and prepared speech. If speculative synthesis failed, final delivery makes one
+fresh synthesis attempt using only the approved final text; it never uploads
+partially prepared audio. A failed final attempt is logged without further retries.
 
 This reduces the remaining synthesis work after generation, rather than
 removing it: a slower TTS backend can build a backlog, and the final encode and

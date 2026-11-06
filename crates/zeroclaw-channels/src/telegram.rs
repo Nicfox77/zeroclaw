@@ -3204,6 +3204,18 @@ impl TelegramChannel {
 
     /// Override the Telegram Bot API base URL.
     /// Useful for local Bot API servers or testing.
+    #[cfg(test)]
+    pub(crate) fn with_fixture_timeout(mut self, timeout: Duration) -> Self {
+        self.fixture_http_client = Some(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()
+                .unwrap(),
+        );
+        self
+    }
+
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = normalize_telegram_api_base(&api_base);
         self
@@ -4077,6 +4089,16 @@ impl TelegramChannel {
                 .lock()
                 .remove(&Self::multi_draft_key(recipient, id))
         });
+        self.queue_voice_reply(recipient, content, job, force);
+    }
+
+    fn queue_voice_reply(
+        &self,
+        recipient: &str,
+        content: &str,
+        job: Option<crate::tts::SpeechJob>,
+        force: bool,
+    ) {
         if !force && !self.is_voice_chat(recipient) {
             return;
         }
@@ -4094,6 +4116,7 @@ impl TelegramChannel {
             );
             return;
         }
+        let had_prepared_job = job.is_some();
         let job = job.unwrap_or_else(|| crate::tts::SpeechJob::start(tts_manager.clone()));
         let text = content.to_owned();
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
@@ -4104,7 +4127,21 @@ impl TelegramChannel {
         let bot_token = self.bot_token.clone();
         let proxy_url = self.proxy_url.clone();
         zeroclaw_spawn::spawn!(async move {
-            match job.finish(&text).await {
+            let mut result = job.finish(&text).await;
+            if had_prepared_job && let Err(error) = &result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                    "Speculative TTS failed; synthesizing approved final response"
+                );
+                // At most one fresh final attempt, using the approved text only.
+                // Failed speculative clips never become a partial voice upload.
+                result = crate::tts::SpeechJob::start(tts_manager.clone())
+                    .finish(&text)
+                    .await;
+            }
+            match result {
                 Ok(parts) => {
                     Self::deliver_voice_parts(
                         &api_base,
@@ -8280,6 +8317,36 @@ impl Channel for TelegramChannel {
                 Ok(())
             }
         }
+    }
+
+    fn supports_voice_draft_finalization(&self) -> bool {
+        true
+    }
+
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        force_voice: bool,
+    ) -> anyhow::Result<()> {
+        if suppress_voice || !force_voice {
+            return self
+                .finalize_draft(recipient, message_id, text, suppress_voice)
+                .await;
+        }
+        let job = self
+            .voice_drafts
+            .lock()
+            .remove(&Self::multi_draft_key(recipient, message_id));
+        crate::util::cancel_draft_best_effort(self, recipient, message_id).await;
+        self.queue_voice_reply(recipient, &strip_tool_call_tags(text), job, true);
+        if (self.send_text_with_voice_resolver)() {
+            self.send(&SendMessage::new(text, recipient).suppress_voice())
+                .await?;
+        }
+        Ok(())
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
