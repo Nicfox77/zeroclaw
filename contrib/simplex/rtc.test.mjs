@@ -27,9 +27,16 @@ for (const wrongKey of [false, true]) test(wrongKey ? 'wrong encryption key prev
       offer: offer.offer, iceCandidates: offer.iceCandidates, iceServers: [], relay: false})).resp;
     assert.equal(answer.type, 'answer', answer.message);
     assert.equal((await peers[0].command({type: 'answer', answer: answer.answer, iceCandidates: answer.iceCandidates})).resp.type, 'ok');
-    const connecting = Date.now() + 15000;
+    const connecting = Date.now() + 20000;
     while ((await Promise.all(peers.map(p => p.diagnostics()))).some(s => s.state !== 'connected') && Date.now() < connecting) await new Promise(resolve => setTimeout(resolve, 50));
     assert.ok((await Promise.all(peers.map(p => p.diagnostics()))).every(s => s.state === 'connected'), JSON.stringify(await Promise.all(peers.map(p => p.diagnostics()))));
+    const diagnostics = await Promise.all(peers.map(p => p.diagnostics()));
+    for (const diagnostic of diagnostics) {
+      assert.equal(diagnostic.media.playbackSampleRate, 48000);
+      assert.equal(diagnostic.media.recognitionSampleRate, 16000);
+      assert.equal(diagnostic.media.contentHint, 'music');
+      assert.ok(diagnostic.codecs.some(codec => codec.mimeType === 'audio/opus' && codec.clockRate === 48000));
+    }
     await new Promise(resolve => setTimeout(resolve, 300));
     const samples = 16000;
     const wav = Buffer.alloc(44 + samples * 2);
@@ -44,6 +51,44 @@ for (const wrongKey of [false, true]) test(wrongKey ? 'wrong encryption key prev
     if (wrongKey) {
       assert.deepEqual(received, [0, 0]);
       assert.ok((await Promise.all(peers.map(p => p.diagnostics()))).every(s => s.stats.some(s => s.packetsSent > 0)));
-    } else assert.ok(received.every(count => count > 4000), `received audible samples: ${received}; ${JSON.stringify(await Promise.all(peers.map(p => p.diagnostics())))}`);
+    } else {
+      assert.ok(received.every(count => count > 4000), `received audible samples: ${received}; ${JSON.stringify(await Promise.all(peers.map(p => p.diagnostics())))}`);
+      await Promise.all(peers.map(peer => peer.stop()));
+      const rate = 24000, seconds = 2;
+      const high = Buffer.alloc(44 + rate * seconds * 2);
+      wav.copy(high, 0, 0, 44);
+      high.writeUInt32LE(high.length - 8, 4); high.writeUInt32LE(rate, 24);
+      high.writeUInt32LE(rate * 2, 28); high.writeUInt32LE(rate * seconds * 2, 40);
+      for (let i = 0; i < rate * seconds; i++) high.writeInt16LE(Math.round(4000 * Math.sin(i * 2 * Math.PI * 10000 / rate) + 4000 * Math.sin(i * 2 * Math.PI * 440 / rate)), 44 + i * 2);
+      await Promise.all(peers.map(peer => peer.play(high.toString('base64'))));
+      await new Promise(resolve => setTimeout(resolve, 600));
+      const fullband = await Promise.all(peers.map(peer => peer.diagnostics({spectrum: true})));
+      assert.ok(fullband.every(peer => peer.stats.some(stat => stat.targetBitrate === 64000)),
+        'the uncongested test connection must use the requested Opus target');
+      assert.ok(fullband.every(peer => peer.media.highBandPeakDb > -45),
+        `10 kHz must survive encrypted transport before STT downsampling: ${JSON.stringify(fullband)}`);
+    }
   } finally {await Promise.all(peers.map(peer => peer.close()));}
+});
+
+
+test('stopping playback cancels outstanding decode and leaves no late audio source', {
+  skip: !process.env.SIMPLEX_RTC_TEST,
+}, async () => {
+  const peer = await openRtc({assets: process.env.SIMPLEX_CALL_ASSETS ?? join(homedir(), '.local/share/zeroclaw-simplex'),
+    executablePath: process.env.CHROMIUM_PATH, onSignal: () => {}, onPcm: () => {}});
+  try {
+    const rate = 24000, samples = rate * 30;
+    const audio = Buffer.alloc(44 + samples * 2);
+    audio.write('RIFF'); audio.writeUInt32LE(audio.length - 8, 4); audio.write('WAVEfmt ', 8);
+    audio.writeUInt32LE(16, 16); audio.writeUInt16LE(1, 20); audio.writeUInt16LE(1, 22);
+    audio.writeUInt32LE(rate, 24); audio.writeUInt32LE(rate * 2, 28); audio.writeUInt16LE(2, 32); audio.writeUInt16LE(16, 34);
+    audio.write('data', 36); audio.writeUInt32LE(samples * 2, 40);
+    const outcome = peer.play(audio.toString('base64')).then(() => 'started', error => error);
+    await peer.stop();
+    const result = await outcome;
+    assert.equal(result.notDelivered, true);
+    const state = await peer.diagnostics();
+    assert.equal(state.media.pendingPlaybacks, 0); assert.equal(state.media.playingSources, 0);
+  } finally {await peer.close();}
 });

@@ -126,13 +126,25 @@ show encryption. Public SimpleX messaging and TURN relays are used by default;
 neither needs access to message or encrypted call content. A configured external
 model provider still receives agent prompts after decryption on your server.
 
+Call playback uses a 48 kHz mono audio graph and a 64 kbps Opus sender ceiling.
+A fidelity-oriented content hint is applied to the synthesized track. This
+preserves the source model’s bandwidth without first reducing playback to
+16 kHz. Opus can still adapt to network conditions and receiver limits.
+Recognition uses a separate 16 kHz audio graph, keeping the existing PCM and
+voice-detection timing contract. Voice-note encoding is independent of this path.
+
 Incoming speech is collected in bounded, memory-only utterances using an energy
 threshold and approximately 700 ms of silence. Continuous speech is transcribed
 in 30-second chunks in the background; one combined turn enters dispatch only
-when silence closes it. At speech onset, queued playback stops and stale-generation audio
-is refused. A recognized utterance enters the shared dispatcher; with
+when silence closes it. After roughly 100–150 ms of above-threshold input, playback stops, including
+queued clips and pending audio decoding, and stale-generation audio is refused.
+Native speech preparation is cancelled immediately. A recognized utterance enters the shared dispatcher; with
 `interrupt_on_new_message`, it also cancels the preceding model turn. Recognition
-latency therefore still affects when model work is cancelled.
+latency therefore still affects when model work is cancelled. The detector is
+energy-based and can mistake background noise for speech; it does not perform
+speaker identification or semantic turn-taking. Cancellation does not reverse
+completed tool effects, and history does not track the exact words heard before
+an interruption.
 
 Outbound speech uses the existing sentence/paragraph segmenter and the agent's
 TTS provider. Sanitized, leak-checked assistant text may become audible while the
