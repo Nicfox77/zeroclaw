@@ -108,6 +108,16 @@ the last hour. Completed notes and older history are not replayed. Recovery
 only emits metadata; native live authorization still precedes every download.
 Generic attachments are ignored.
 
+Completed assistant text alongside tool calls is sent immediately as an
+intermediate text message, after the shared outbound hooks and leak checks.
+Repeated flushes do not repeat accepted text. Tool status and private reasoning
+are excluded. Optional tool-debug notifications use the existing global
+`channels.show_tool_calls` setting and are text-only. Set it to `false` to hide
+tool notifications while keeping assistant acknowledgments and updates.
+The final answer is still delivered with its configured voice
+note; intermediate text does not create additional voice notes. During a call,
+that same narration already uses the existing live speech stream.
+
 The CLI’s configured server list owns relay approval. Configure the official
 file-relay presets used by your phone (including Flux when enabled there).
 A note can reference several relay replicas; all must satisfy the CLI’s policy.

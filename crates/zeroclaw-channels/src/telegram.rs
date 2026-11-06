@@ -7836,9 +7836,8 @@ impl Channel for TelegramChannel {
     }
 
     fn supports_turn_flush_narration(&self) -> bool {
-        // Telegram is the only channel that implements `flush_draft_turn` /
-        // `discard_draft_turn`; scope the orchestrator's narration-policy +
-        // flush-barrier path to it so channels that stream paragraphs another
+        // Enable the shared narration-policy / flush-barrier path only for
+        // Telegram's turn-based mode. Channels that stream paragraphs another
         // way (e.g. Matrix `update_draft`) do not run outbound hooks on phantom
         // flushes that deliver nothing.
         self.stream_mode == StreamMode::MultiMessage
