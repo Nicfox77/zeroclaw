@@ -420,6 +420,12 @@ context installation and turn settlement reference that creation. Unchanged
 context items reuse their identity. Regenerated summaries always create a new
 identity, replace the previous summary and retain its provider provenance.
 No-op transforms preserve the canonical summary reference.
+Conversation identities created by a transform resolve through its committed
+projection in the admission index. A background transform can retain newer
+context items only when their identities, payload references and positions
+match that canonical origin in the visible branch lineage. Resolving this
+provenance does not scan the archive. Admission checkpoints are disposable;
+an older cache format rebuilds from committed events without changing them.
 Host-supplied history gets immutable message identities
 that point into one canonical conversation payload, plus import evidence that
 earlier execution was not observed.
