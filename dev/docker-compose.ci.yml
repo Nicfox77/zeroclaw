@@ -13,7 +13,7 @@ services:
             - DAC_READ_SEARCH
         # Ephemeral fixtures should not contend on the image's writable layer.
         tmpfs:
-            - /tmp:rw,mode=1777,size=4g
+            - /tmp:rw,exec,nosuid,nodev,mode=1777,size=4g
         environment:
             - CARGO_TERM_COLOR=always
             - PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
