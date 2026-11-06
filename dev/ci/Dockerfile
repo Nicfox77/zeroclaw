@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     g++ \
     ripgrep \
+    python3 \
+    jq \
     pkg-config \
     libssl-dev \
     curl \
