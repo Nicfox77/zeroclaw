@@ -1,3 +1,4 @@
+pub use crate::simplex::SimplexConfig;
 // Historical schema typed lenses for migration. Each module is frozen after
 // its corresponding version ships; only their `migrate(self) -> ...` methods
 // are referenced at runtime by `crate::migration`.
@@ -7,7 +8,10 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
-use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
+use crate::pairing::{
+    PAIR_ATTEMPTS_RANGE, PAIR_LOCKOUT_SECS_RANGE, PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH,
+    PAIRING_CODE_TTL_MAX_SECS, PAIRING_CODE_TTL_MIN_SECS, PairingCodePolicy,
+};
 use crate::scattered_types::OutboundSmtp;
 use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
@@ -118,6 +122,8 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    // Pooled connection tasks belong to the runtime that constructed this client.
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -4207,6 +4213,10 @@ impl<'de> Deserialize<'de> for DelegateTargetConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate_agent"]
 pub struct AliasedAgentConfig {
+    /// Opt-in personal conversation shared by explicitly linked connections.
+    #[serde(default)]
+    #[nested]
+    pub main_session: crate::main_session::MainSessionConfig,
     /// Whether this agent is active. Set false to disable without removing the definition.
     #[tab(General)]
     #[serde(default = "default_true")]
@@ -4407,6 +4417,7 @@ pub struct AliasedAgentConfig {
 impl Default for AliasedAgentConfig {
     fn default() -> Self {
         Self {
+            main_session: crate::main_session::MainSessionConfig::default(),
             enabled: true,
             channels: Vec::new(),
             model_provider: crate::providers::ModelProviderRef::default(),
@@ -6553,6 +6564,11 @@ impl TranscriptionEndpoint for LocalWhisperTranscriptionEndpoint {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.transcription.local_whisper"]
 pub struct LocalWhisperTranscriptionProviderConfig {
+    /// Optional loopback PCM WebSocket endpoint for live calls. Binary input
+    /// is PCM16 mono 16 kHz; JSON events are ready/speech_start/partial/final.
+    /// HTTP voice-note transcription continues to use `uri`.
+    #[serde(default)]
+    pub stream_uri: Option<String>,
     /// Endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
     pub uri: String,
     /// Bearer token for endpoint authentication. Omit for unauthenticated
@@ -6593,6 +6609,7 @@ pub struct LocalWhisperTranscriptionProviderConfig {
 impl Default for LocalWhisperTranscriptionProviderConfig {
     fn default() -> Self {
         Self {
+            stream_uri: None,
             uri: String::new(),
             bearer_token: None,
             language: None,
@@ -7266,7 +7283,7 @@ impl Default for PipelineConfig {
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
     ///
-    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// Caps the total number of image attachments that survive into the
     /// provider request after multimodal preprocessing. Older images are
     /// dropped first. When a new image takes the count past the limit, the
     /// oldest images are removed in one batch, down to half the limit
@@ -7313,7 +7330,7 @@ pub struct MultimodalConfig {
     #[serde(default)]
     pub allow_remote_fetch: bool,
     /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
-    /// When set, messages containing `[IMAGE:]` markers are routed to this
+    /// When set, messages containing image attachments are routed to this
     /// model_provider instead of the default text model_provider.
     #[serde(default)]
     pub vision_model_provider: Option<String>,
@@ -7959,7 +7976,8 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_code: PairingCodePolicy,
 
-    /// Pairing dashboard configuration
+    /// Pairing-code lifetime and brute-force limits for the gateway's
+    /// pairing and enrollment codes (`[gateway.pairing_dashboard]`).
     #[serde(default)]
     #[nested]
     pub pairing_dashboard: PairingDashboardConfig,
@@ -8098,7 +8116,19 @@ impl Default for GatewayConfig {
     }
 }
 
-/// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+/// Pairing-code lifetime and brute-force limits for the gateway
+/// (`[gateway.pairing_dashboard]`).
+///
+/// They govern the gateway's own pairing guard: its pairing code (`/pair`,
+/// the dashboard pairing flow, `zeroclaw gateway get-paircode`) and the
+/// daemon's certificate-enrollment code. The gateway reads them from live
+/// config on every code check and failed attempt, so an edit applies without
+/// a restart. Channel pairing (Telegram, LINE, WeChat) keeps its own fixed
+/// limits.
+///
+/// The gateway holds one pending pairing code at a time, and issuing a new one
+/// cancels the previous code, so there is no setting for how many codes may be
+/// pending.
 ///
 /// Code length and character family are **not** configured here. The
 /// dashboard pairing flow issues its codes through the same
@@ -8110,38 +8140,36 @@ impl Default for GatewayConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing_dashboard"]
 pub struct PairingDashboardConfig {
-    /// Time-to-live for pending pairing codes in seconds (default: 3600)
+    /// Seconds a pairing code stays redeemable after it is issued: 30 to 600,
+    /// default 600 (10 minutes). 600 is also the cap: a saved value above it
+    /// is lowered to 600 when the config loads, with a notice, so no code
+    /// lives longer than 10 minutes.
     #[serde(default = "default_pairing_ttl")]
     pub code_ttl_secs: u64,
-    /// Maximum concurrent pending pairing codes (default: 3)
-    #[serde(default = "default_max_pending_codes")]
-    pub max_pending_codes: usize,
-    /// Maximum failed pairing attempts before lockout (default: 5)
+    /// Wrong codes one client may try before it is locked out: 1 to 100,
+    /// default 5.
     #[serde(default = "default_max_failed_attempts")]
     pub max_failed_attempts: u32,
-    /// Lockout duration in seconds after max attempts (default: 300)
+    /// Seconds a client stays locked out after too many wrong codes: 1 to
+    /// 86400 (one day), default 300. A change applies to the next lockout.
     #[serde(default = "default_pairing_lockout_secs")]
     pub lockout_secs: u64,
 }
 
 fn default_pairing_ttl() -> u64 {
-    3600
-}
-fn default_max_pending_codes() -> usize {
-    3
+    PAIRING_CODE_TTL_MAX_SECS
 }
 fn default_max_failed_attempts() -> u32 {
-    5
+    crate::pairing::MAX_PAIR_ATTEMPTS
 }
 fn default_pairing_lockout_secs() -> u64 {
-    300
+    crate::pairing::PAIR_LOCKOUT_SECS
 }
 
 impl Default for PairingDashboardConfig {
     fn default() -> Self {
         Self {
             code_ttl_secs: default_pairing_ttl(),
-            max_pending_codes: default_max_pending_codes(),
             max_failed_attempts: default_max_failed_attempts(),
             lockout_secs: default_pairing_lockout_secs(),
         }
@@ -8363,6 +8391,20 @@ pub struct WssConfig {
     /// it on slow links rather than disabling the bound.
     #[serde(default = "default_wss_incomplete_message_timeout_secs")]
     pub incomplete_message_timeout_secs: u64,
+    /// How long, in seconds, a remote client's sessions stay open after its
+    /// last connection ends (default: 1800). Past that, the daemon closes each
+    /// of them that has been idle as long, has no turn running and has no
+    /// approval pending, which frees its place among the daemon's live
+    /// sessions. The transcript is kept, and never written by this: a chat
+    /// session whose store doesn't already hold all of its history stays
+    /// open. A client
+    /// that reconnects with its identity in time keeps its sessions; one that
+    /// returns later can't reach the closed sessions over WSS. Sessions of local clients (the
+    /// RPC socket) are not affected. `0` keeps orphaned sessions open until
+    /// the daemon restarts. Read on every check, so a change applies without
+    /// a restart.
+    #[serde(default = "default_wss_orphaned_session_timeout_secs")]
+    pub orphaned_session_timeout_secs: u64,
 }
 
 impl Default for WssConfig {
@@ -8380,6 +8422,7 @@ impl Default for WssConfig {
             max_sessions: default_wss_max_sessions(),
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
+            orphaned_session_timeout_secs: default_wss_orphaned_session_timeout_secs(),
         }
     }
 }
@@ -8494,6 +8537,10 @@ fn default_wss_max_sessions_per_client() -> usize {
 
 fn default_wss_incomplete_message_timeout_secs() -> u64 {
     60
+}
+
+fn default_wss_orphaned_session_timeout_secs() -> u64 {
+    30 * 60
 }
 
 /// Local IPC endpoint limits (`[rpc]`).
@@ -11899,21 +11946,26 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -11921,13 +11973,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -14915,6 +14981,9 @@ impl Default for RiskProfileConfig {
 #[prefix = "runtime_profile"]
 #[serde(default)]
 pub struct RuntimeProfileConfig {
+    /// Optional asynchronous summaries over permanent native session history.
+    #[nested]
+    pub summary_deck: crate::summary_deck::SummaryDeckConfig,
     /// Enable agentic (multi-turn tool-call loop) mode.
     pub agentic: bool,
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
@@ -15017,6 +15086,7 @@ pub struct RuntimeProfileConfig {
 impl Default for RuntimeProfileConfig {
     fn default() -> Self {
         Self {
+            summary_deck: crate::summary_deck::SummaryDeckConfig::default(),
             agentic: false,
             max_tool_iterations: 0,
             max_execution_tree_iterations: None,
@@ -16138,6 +16208,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub signal: HashMap<String, SignalConfig>,
+    /// SimpleX CLI instances (`[channels.simplex.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub simplex: HashMap<String, SimplexConfig>,
     /// WhatsApp channel instances (`[channels.whatsapp.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -16351,6 +16425,13 @@ impl ChannelsConfig {
                 name: "Matrix",
                 desc: "self-hosted chat",
                 configured: !self.matrix.is_empty(),
+            },
+            ChannelInfo {
+                kind: "simplex",
+                config_key: "simplex",
+                name: "SimpleX",
+                desc: "Private messaging and encrypted audio calls",
+                configured: !self.simplex.is_empty(),
             },
             ChannelInfo {
                 kind: "signal",
@@ -16579,6 +16660,7 @@ impl ChannelsConfig {
             || self.imessage.values().any(|c| c.enabled)
             || self.matrix.values().any(|c| c.enabled)
             || self.signal.values().any(|c| c.enabled)
+            || self.simplex.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
@@ -16616,7 +16698,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -16626,6 +16708,7 @@ impl ChannelsConfig {
             ("imessage", !self.imessage.is_empty(), true),
             ("matrix", !self.matrix.is_empty(), true),
             ("signal", !self.signal.is_empty(), true),
+            ("simplex", !self.simplex.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
@@ -16712,6 +16795,7 @@ impl Default for ChannelsConfig {
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
+            simplex: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             nextcloud_talk: HashMap::new(),
@@ -16981,6 +17065,12 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
+    /// Keep the text response alongside a Telegram voice reply. Applies to
+    /// configured voice peers and per-turn voice routing. Default: `false`.
+    /// Explicit text-only routing still suppresses speech.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub send_text_with_voice: bool,
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
@@ -17096,6 +17186,7 @@ impl Default for TelegramConfig {
             bot_token: String::new(),
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::default(),
+            send_text_with_voice: false,
             draft_update_interval_ms: default_draft_update_interval_ms(),
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
@@ -24223,9 +24314,30 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        for (alias, agent) in &self.agents {
+            agent.main_session.validate(self, alias)?;
+        }
         self.cost.rates.validate()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
+            profile
+                .summary_deck
+                .validate()
+                .with_context(|| format!("runtime_profiles.{profile_alias}.summary_deck"))?;
+            let summary_provider = profile.summary_deck.provider.trim();
+            if !summary_provider.is_empty() {
+                let (family, alias) = summary_provider.split_once('.').ok_or_else(|| anyhow::Error::msg(format!(
+                    "runtime_profiles.{profile_alias}.summary_deck.provider requires <type>.<alias>")))?;
+                anyhow::ensure!(
+                    self.providers.models.find(family, alias).is_some(),
+                    "runtime_profiles.{profile_alias}.summary_deck.provider references an unknown provider"
+                );
+            }
+            anyhow::ensure!(
+                !profile.summary_deck.enabled
+                    || profile.max_history_messages.is_none_or(|limit| limit >= 4),
+                "runtime_profiles.{profile_alias}.summary_deck requires at least four retained turns"
+            );
             if profile.max_execution_tree_iterations == Some(0) {
                 validation_bail!(
                     InvalidNumericRange,
@@ -24298,6 +24410,39 @@ impl Config {
                 "{path} = {pairing_code_length} is out of range; must be \
                  {PAIRING_CODE_MIN_LENGTH}..={PAIRING_CODE_MAX_LENGTH}"
             );
+        }
+
+        // Pairing limits. A saved code lifetime above the cap was already
+        // lowered on load (`migration::CAPPED_KEYS`), so a value out of range
+        // here was set explicitly, and is refused rather than changed. Startup
+        // only warns about it, so the guard also holds what it reads to these
+        // ranges (`PairingLimits::within_bounds`).
+        let dashboard = &self.gateway.pairing_dashboard;
+        for (path, value, range) in [
+            (
+                "gateway.pairing_dashboard.code_ttl_secs",
+                dashboard.code_ttl_secs,
+                PAIRING_CODE_TTL_MIN_SECS..=PAIRING_CODE_TTL_MAX_SECS,
+            ),
+            (
+                "gateway.pairing_dashboard.max_failed_attempts",
+                u64::from(dashboard.max_failed_attempts),
+                u64::from(*PAIR_ATTEMPTS_RANGE.start())..=u64::from(*PAIR_ATTEMPTS_RANGE.end()),
+            ),
+            (
+                "gateway.pairing_dashboard.lockout_secs",
+                dashboard.lockout_secs,
+                PAIR_LOCKOUT_SECS_RANGE,
+            ),
+        ] {
+            if !range.contains(&value) {
+                let (min, max) = (range.start(), range.end());
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {value} is out of range; must be {min}..={max}"
+                );
+            }
         }
 
         // Tunnel — OpenVPN
@@ -24418,6 +24563,9 @@ impl Config {
         // enabled channel built with an empty credential never connects and
         // its per-channel supervisor restarts it forever (crashloop), so
         // reject at config-load time instead.
+        for channel in self.channels.simplex.values() {
+            channel.validate()?;
+        }
         for (alias, sig) in &self.channels.signal {
             sig.validate_required(alias)?;
         }
@@ -26536,7 +26684,12 @@ impl Config {
             // drop a retired key anyway, since the typed config has no field
             // for it, but silently: one written by another handle after this
             // config loaded would leave without the notice it is owed.
-            let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+            let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+            // Values above a `CAPPED_KEYS` maximum are lowered the same way,
+            // with the notice the load path gives.
+            retired.extend(crate::migration::lower_capped_keys_in_doc(
+                doc.as_table_mut(),
+            ));
             // Then sync onto the spelling the snapshot is written in, keeping
             // the comments of a section spelled another way; a current file
             // still holding two live spellings of one setting is refused. An
@@ -26656,7 +26809,13 @@ impl Config {
         // the file are preserved. It runs first, as on load, so a retired
         // table under one spelling of a section does not count as a second
         // spelling of the live one.
-        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+        let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+        // A value above a `CAPPED_KEYS` maximum is lowered for the same
+        // reason: the load path lowers it, so it is never dirty, and it would
+        // otherwise stay in the file through every incremental save.
+        retired.extend(crate::migration::lower_capped_keys_in_doc(
+            doc.as_table_mut(),
+        ));
         // A setting the file spells another way the schema accepts
         // (`channels_config` for `channels`) is renamed to the spelling the
         // dirty paths use, so an edit lands on it rather than beside it.
@@ -26813,13 +26972,14 @@ fn log_migration_saved(notices: &[crate::migration::MigrationNotice]) {
     }
 }
 
-/// Log each retired key a save removed from `config.toml`. Called only once
-/// the file is durably replaced: a failed write leaves the retired keys on
-/// disk and must not claim otherwise.
+/// Log each retired key a save removed from `config.toml`, and each capped
+/// value it lowered. Called only once the file is durably replaced: a failed
+/// write leaves them on disk and must not claim otherwise.
 fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
     for notice in retired {
         let path = match notice {
-            crate::migration::MigrationNotice::Removed { path, .. } => path.as_str(),
+            crate::migration::MigrationNotice::Removed { path, .. }
+            | crate::migration::MigrationNotice::Lowered { path, .. } => path.as_str(),
             crate::migration::MigrationNotice::AssumedV1
             | crate::migration::MigrationNotice::InferredV3
             | crate::migration::MigrationNotice::IgnoredEnvOverride { .. } => continue,
@@ -31847,6 +32007,64 @@ open_skills_enabled = false
         ));
     }
 
+    #[tokio::test]
+    async fn v4_upgrade_preserves_session_storage_selection_and_existing_history() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        for backend in ["sqlite", "jsonl"] {
+            let dir = TempDir::new().unwrap();
+            let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+            let path = dir.path().join("config.toml");
+            let raw = format!(
+                "schema_version = 3\n\n[channels]\nsession_backend = \"{backend}\"\n\
+                 session_persistence = false\nsession_ttl_hours = 4\n\n\
+                 [agents.writer]\ncompact_context = true\n"
+            );
+            fs::write(&path, &raw).await.unwrap();
+            let history = dir.path().join("workspace/sessions/existing.jsonl");
+            fs::create_dir_all(history.parent().unwrap()).await.unwrap();
+            let recorded = "{\"role\":\"user\",\"content\":\"existing history\"}\n";
+            fs::write(&history, recorded).await.unwrap();
+
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(
+                config.schema_version,
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(config.channels.session_backend, backend);
+            assert!(!config.channels.session_persistence);
+            assert_eq!(config.channels.session_ttl_hours, 4);
+            assert!(config.agents.contains_key("writer"));
+            assert!(!config.agents.contains_key("default"));
+            assert!(config.migration_notices.iter().any(|notice| matches!(
+                notice,
+                crate::migration::MigrationNotice::Removed { path, .. }
+                    if path == "agents.writer.compact_context"
+            )));
+            assert_eq!(fs::read_to_string(&path).await.unwrap(), raw);
+            config.save().await.unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.path().join("config.toml.v3.backup"))
+                    .await
+                    .unwrap(),
+                raw
+            );
+            // Full saves omit values equal to defaults (including SQLite).
+            // Verify the effective selection after loading those defaults.
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.channels.session_backend, backend);
+            assert!(!reloaded.channels.session_persistence);
+            assert_eq!(reloaded.channels.session_ttl_hours, 4);
+            assert_eq!(fs::read_to_string(&history).await.unwrap(), recorded);
+            assert!(
+                !dir.path()
+                    .join("agents/default/workspace/sessions")
+                    .exists()
+            );
+        }
+    }
+
     #[test]
     async fn runtime_profile_deferred_builtin_tools_is_opt_in() {
         assert!(!RuntimeProfileConfig::default().deferred_builtin_tools);
@@ -32166,6 +32384,98 @@ enabled = true
             config
                 .validate()
                 .unwrap_or_else(|e| panic!("documented bound {length} must validate: {e}"));
+        }
+    }
+
+    /// The gateway's pairing limits default to what channel pairing uses, and
+    /// each field's description states its range; the lifetime's states
+    /// the cap and what happens to a larger saved value.
+    #[test]
+    async fn pairing_dashboard_defaults_and_descriptions_state_the_limits() {
+        let defaults = PairingDashboardConfig::default();
+        assert_eq!(
+            (
+                defaults.code_ttl_secs,
+                defaults.max_failed_attempts,
+                defaults.lockout_secs
+            ),
+            (600, 5, 300)
+        );
+        assert_eq!(
+            crate::pairing::PairingLimits::from_dashboard(&defaults),
+            crate::pairing::PairingLimits::default(),
+            "the gateway's defaults are the fixed limits channel pairing keeps"
+        );
+
+        let props = Config::default().prop_fields();
+        let dashboard: Vec<_> = props
+            .iter()
+            .filter(|f| {
+                f.name
+                    .replace('-', "_")
+                    .starts_with("gateway.pairing_dashboard.")
+            })
+            .collect();
+        let description = |field: &str| {
+            dashboard
+                .iter()
+                .find(|f| f.name.replace('-', "_").ends_with(field))
+                .unwrap_or_else(|| panic!("no `{field}` property"))
+                .description
+        };
+        let ttl = description("code_ttl_secs");
+        assert!(
+            ttl.contains("30 to 600") && ttl.contains("lowered to 600"),
+            "{ttl}"
+        );
+        assert!(description("max_failed_attempts").contains("1 to 100"));
+        assert!(description("lockout_secs").contains("1 to 86400"));
+        assert!(
+            !dashboard
+                .iter()
+                .any(|f| f.name.replace('-', "_").ends_with("max_pending_codes")),
+            "the pending-code cap is retired, not settable"
+        );
+    }
+
+    /// Out-of-range pairing limits are refused at validation. The lifetime's
+    /// range starts at 30 seconds; a saved value above 600 never gets here,
+    /// because loading lowers it first.
+    #[test]
+    async fn pairing_dashboard_limits_are_validated() {
+        let validate = |edit: &dyn Fn(&mut PairingDashboardConfig)| {
+            let mut config = Config::default();
+            edit(&mut config.gateway.pairing_dashboard);
+            config.validate().map_err(|e| format!("{e:#}"))
+        };
+        validate(&|_| {}).expect("the defaults are valid");
+        for ttl in [30, 600] {
+            validate(&|d| d.code_ttl_secs = ttl).unwrap_or_else(|e| panic!("{ttl}: {e}"));
+        }
+        for attempts in [1, 100] {
+            validate(&|d| d.max_failed_attempts = attempts)
+                .unwrap_or_else(|e| panic!("{attempts}: {e}"));
+        }
+        for lockout in [1, 86_400] {
+            validate(&|d| d.lockout_secs = lockout).unwrap_or_else(|e| panic!("{lockout}: {e}"));
+        }
+        for (field, err) in [0, 29, 601, 3_600]
+            .map(|ttl| ("code_ttl_secs", validate(&|d| d.code_ttl_secs = ttl)))
+            .into_iter()
+            .chain([0, 101].map(|n| {
+                (
+                    "max_failed_attempts",
+                    validate(&|d| d.max_failed_attempts = n),
+                )
+            }))
+            .chain([0, 86_401].map(|secs| ("lockout_secs", validate(&|d| d.lockout_secs = secs))))
+        {
+            let err = err.expect_err(field);
+            assert!(
+                err.contains(&format!("gateway.pairing_dashboard.{field}"))
+                    && err.contains("out of range"),
+                "{err}"
+            );
         }
     }
 
@@ -33945,6 +34255,7 @@ auto_save = true
                         bot_token: "123:ABC".into(),
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
+                        send_text_with_voice: false,
                         draft_update_interval_ms: default_draft_update_interval_ms(),
                         multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
@@ -33968,6 +34279,7 @@ auto_save = true
                 imessage: HashMap::new(),
                 matrix: HashMap::new(),
                 signal: HashMap::new(),
+                simplex: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
@@ -35985,6 +36297,7 @@ default_temperature = 0.7
             bot_token: "123:XYZ".into(),
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
+            send_text_with_voice: true,
             draft_update_interval_ms: 500,
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
@@ -36006,6 +36319,7 @@ default_temperature = 0.7
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
         assert!(parsed.interrupt_on_new_message);
+        assert!(parsed.send_text_with_voice);
     }
 
     #[test]
@@ -36013,6 +36327,7 @@ default_temperature = 0.7
         let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
+        assert!(!parsed.send_text_with_voice);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.api_base_url, "https://api.telegram.org");
@@ -36391,6 +36706,7 @@ allowed_users = ["@u:matrix.org"]
                 },
             )]),
             signal: HashMap::new(),
+            simplex: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             nextcloud_talk: HashMap::new(),
@@ -36980,6 +37296,7 @@ allowed_numbers = ["+1", "+2"]
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
+            simplex: HashMap::new(),
             whatsapp: HashMap::from([(
                 "default".to_string(),
                 WhatsAppConfig {
@@ -39986,6 +40303,115 @@ api_token = "tok"
     }
 
     #[test]
+    async fn runtime_proxy_client_cache_is_bound_to_request_runtime() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let _env_guard = env_override_lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP fixture listener");
+        let url = format!(
+            "http://{}/",
+            listener.local_addr().expect("fixture address")
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            loop {
+                let (socket, _) = listener.accept().await.expect("HTTP fixture connection");
+                zeroclaw_spawn::spawn!(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut line = String::new();
+                    // Pool checkout can race a speculative connection. Bind a
+                    // socket to its first request's runtime, not an accept ID.
+                    let mut connection_runtime = None;
+                    loop {
+                        let mut request_runtime = None;
+                        loop {
+                            line.clear();
+                            if socket.read_line(&mut line).await.expect("request header") == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':')
+                                && name.eq_ignore_ascii_case("x-fixture-runtime")
+                            {
+                                request_runtime = Some(value.trim().to_owned());
+                            }
+                        }
+                        let body = connection_runtime.get_or_insert(
+                            request_runtime.expect("request must identify its runtime"),
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if socket
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let outcome = tokio::task::spawn_blocking(move || {
+            let new_runtime = || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("request runtime")
+            };
+            let first = new_runtime();
+            let second = new_runtime();
+            let service_key = format!("model_provider.runtime_scope.{}", uuid::Uuid::new_v4());
+            let cache_key = runtime_proxy_cache_key(&service_key, Some(5), Some(5));
+            let request = |runtime: &tokio::runtime::Runtime, label: &str, cached: bool| {
+                runtime.block_on(async {
+                    assert_eq!(runtime_proxy_cache_contains(&cache_key), cached);
+                    let client = build_runtime_proxy_client_with_timeouts(&service_key, 5, 5);
+                    {
+                        let cache = runtime_proxy_client_cache().read().unwrap();
+                        let entry = cache.get(&cache_key).expect("cached client");
+                        assert_eq!(entry.runtime_id, runtime.handle().id());
+                        assert_eq!(entry.generation, runtime_proxy_current_generation());
+                    }
+                    client
+                        .get(&url)
+                        .header("x-fixture-runtime", label)
+                        .send()
+                        .await
+                        .expect("request must use a live runtime")
+                        .text()
+                        .await
+                        .expect("connection runtime")
+                })
+            };
+            assert_eq!(request(&first, "first", false), "first");
+            assert_eq!(request(&first, "first", true), "first");
+            assert_eq!(
+                request(&second, "second", false),
+                "second",
+                "another runtime cannot borrow the first runtime's connection"
+            );
+            drop(first);
+            assert_eq!(
+                request(&second, "second", true),
+                "second",
+                "the second runtime's pool must survive the first runtime's shutdown"
+            );
+        })
+        .await;
+        server.abort();
+        assert!(server.await.expect_err("fixture is stopped").is_cancelled());
+        outcome.expect("cross-runtime requests must succeed");
+    }
+
+    #[test]
     async fn environment_proxy_detection_respects_scheme_and_no_proxy() {
         let values = HashMap::from([
             ("HTTP_PROXY", "http://http-proxy.example:3128"),
@@ -40090,6 +40516,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -40100,6 +40527,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -42811,6 +43239,7 @@ high_entropy_tokens = false
                 bot_token: plaintext_token.into(),
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
+                send_text_with_voice: false,
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
@@ -45920,6 +46349,39 @@ channel = "notion"
         }
     }
 
+    /// An unrelated incremental save carries the pairing limits into
+    /// the file too: the lifetime lowered to the cap, the pending-code cap
+    /// retired, the other limits kept, and nothing left for a reload to fix.
+    #[test]
+    async fn save_dirty_applies_the_pairing_limits_to_the_file() {
+        for version in [3, crate::migration::CURRENT_SCHEMA_VERSION] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let written = save_dirty_after_unrelated_edit(
+                tmp.path(),
+                &format!(
+                    "schema_version = {version}\n\n\
+                     [gateway.pairing_dashboard]\ncode_ttl_secs = 3600\nmax_pending_codes = 3\n\
+                     lockout_secs = 120\n\n\
+                     [observability]\nbackend = \"none\"\n"
+                ),
+            )
+            .await;
+            assert!(
+                written.contains("code_ttl_secs = 600")
+                    && !written.contains("max_pending_codes")
+                    && written.contains("lockout_secs = 120"),
+                "V{version}; got:\n{written}"
+            );
+            let reloaded = crate::migration::migrate_to_current_salvaged(&written);
+            assert!(
+                reloaded.notices.is_empty(),
+                "V{version}: {:?}",
+                reloaded.notices
+            );
+            assert_eq!(reloaded.config.gateway.pairing_dashboard.lockout_secs, 120);
+        }
+    }
+
     #[test]
     async fn save_dirty_removes_retired_dashboard_code_length() {
         // An unrelated incremental save must drop the retired dashboard
@@ -45931,7 +46393,7 @@ channel = "notion"
                 tmp.path(),
                 &format!(
                     "schema_version = {version}\n\n\
-                     [gateway.pairing_dashboard]\ncode_length = 8\ncode_ttl_secs = 3600\n\n\
+                     [gateway.pairing_dashboard]\ncode_length = 8\ncode_ttl_secs = 300\n\n\
                      [gateway.pairing_code]\nlength = 20\ncharset = \"unambiguous\"\n\n\
                      [observability]\nbackend = \"none\"\n"
                 ),
@@ -45947,10 +46409,7 @@ channel = "notion"
                 "V{version}: {:?}",
                 reloaded.notices
             );
-            assert_eq!(
-                reloaded.config.gateway.pairing_dashboard.code_ttl_secs,
-                3600
-            );
+            assert_eq!(reloaded.config.gateway.pairing_dashboard.code_ttl_secs, 300);
             assert_eq!(reloaded.config.gateway.pairing_code.length, 20);
             assert_eq!(
                 reloaded.config.observability.backend,

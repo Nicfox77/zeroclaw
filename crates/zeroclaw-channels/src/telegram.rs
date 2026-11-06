@@ -859,26 +859,12 @@ enum TelegramAttachmentKind {
     Document,
     Video,
     Audio,
-    Voice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TelegramAttachment {
     kind: TelegramAttachmentKind,
     target: String,
-}
-
-impl TelegramAttachmentKind {
-    fn from_marker(marker: &str) -> Option<Self> {
-        match marker.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
 }
 
 fn telegram_audio_send_spec(
@@ -909,47 +895,21 @@ fn telegram_audio_send_spec(
 
 /// Build the user-facing content string for an incoming attachment.
 ///
-/// An attachment earns the `[IMAGE:/path]` marker when the multimodal loader
-/// will actually accept it (`provider_loadable_image_mime()`), regardless of
-/// whether Telegram delivered it as a photo or a document — so an image sent
-/// "as file", even extensionless, is still marked as an image rather than
-/// falling back to the `[Document: name] /path` form.
-///
-/// The check is deliberately the *loadable* one rather than the conservative
-/// `looks_like_image()`. A marker the loader rejects is worse than no marker:
-/// preparation drops it in favour of a "could not be loaded" note, and the
-/// `[Document: ...]` line that would have kept the saved path reachable was
-/// never emitted. Formats outside the provider's set therefore stay documents,
-/// which leaves both the bytes and a usable path in the model's hands.
-/// The disposition Telegram commits to for an inbound attachment, resolved once
-/// against the provider's loadability contract.
+/// Resolve the typed disposition Telegram commits to for an inbound attachment,
+/// using the provider's loadability contract once at ingestion.
 ///
 /// `parse_attachment_metadata` only yields documents and photos, so an
 /// attachment is either a loadable image the provider will accept or a
 /// document. The rendered text and the typed envelope both read this one
 /// verdict, so a document the loader would reject cannot be re-decided as an
 /// image by a later payload-only classifier.
-fn attachment_marker_kind(
+fn attachment_kind(
     attachment: &zeroclaw_api::media::MediaAttachment,
-) -> zeroclaw_api::media::MarkerKind {
+) -> zeroclaw_api::media::AttachmentKind {
     if attachment.provider_loadable_image_mime().is_some() {
-        zeroclaw_api::media::MarkerKind::Image
+        zeroclaw_api::media::AttachmentKind::Image
     } else {
-        zeroclaw_api::media::MarkerKind::Document
-    }
-}
-
-fn format_attachment_content(
-    attachment: &zeroclaw_api::media::MediaAttachment,
-    local_path: &Path,
-) -> String {
-    match attachment_marker_kind(attachment) {
-        zeroclaw_api::media::MarkerKind::Image => format!("[IMAGE:{}]", local_path.display()),
-        _ => format!(
-            "[Document: {}] {}",
-            attachment.file_name,
-            local_path.display()
-        ),
+        zeroclaw_api::media::AttachmentKind::Document
     }
 }
 
@@ -974,121 +934,9 @@ fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
-fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
-    let normalized = target
-        .split('?')
-        .next()
-        .unwrap_or(target)
-        .split('#')
-        .next()
-        .unwrap_or(target);
-
-    let extension = Path::new(normalized)
-        .extension()
-        .and_then(|ext| ext.to_str())?
-        .to_ascii_lowercase();
-
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(TelegramAttachmentKind::Image),
-        "mp4" | "mov" | "mkv" | "avi" | "webm" => Some(TelegramAttachmentKind::Video),
-        "mp3" | "m4a" | "wav" | "flac" => Some(TelegramAttachmentKind::Audio),
-        "ogg" | "oga" | "opus" => Some(TelegramAttachmentKind::Voice),
-        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
-        | "xlsx" | "ppt" | "pptx" => Some(TelegramAttachmentKind::Document),
-        _ => None,
-    }
-}
-
-fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.contains('\n') {
-        return None;
-    }
-
-    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
-    if candidate.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
-    let kind = infer_attachment_kind_from_target(candidate)?;
-
-    if !is_http_url(candidate) && !Path::new(candidate).exists() {
-        return None;
-    }
-
-    Some(TelegramAttachment {
-        kind,
-        target: candidate.to_string(),
-    })
-}
-
 /// Delegate to the shared `strip_tool_call_tags` in the orchestrator module.
 fn strip_tool_call_tags(message: &str) -> String {
     crate::orchestrator::strip_tool_call_tags(message)
-}
-
-fn find_matching_close(s: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < message.len() {
-        let Some(open_rel) = message[cursor..].find('[') else {
-            cleaned.push_str(&message[cursor..]);
-            break;
-        };
-
-        let open = cursor + open_rel;
-        cleaned.push_str(&message[cursor..open]);
-
-        let Some(close_rel) = find_matching_close(&message[open + 1..]) else {
-            cleaned.push_str(&message[open..]);
-            break;
-        };
-
-        let close = open + 1 + close_rel;
-        let marker = &message[open + 1..close];
-
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let kind = TelegramAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(TelegramAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[open..=close]);
-        }
-
-        cursor = close + 1;
-    }
-
-    (cleaned.trim().to_string(), attachments)
 }
 
 /// Telegram Bot API maximum file download size (20 MB).
@@ -1143,8 +991,11 @@ pub struct TelegramChannel {
     /// Resolves voice peers from canonical config at call-time.
     /// See AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH" — no cache.
     voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    pending_voice:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
+    /// Reads channels.telegram.<alias>.send_text_with_voice from live config.
+    send_text_with_voice_resolver: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Canonical owner of speculative audio for each distinct draft. Removing
+    /// a draft transfers finalization ownership or cancels its worker on drop.
+    voice_drafts: Mutex<HashMap<MultiDraftKey, crate::tts::SpeechJob>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     #[cfg(test)]
@@ -1216,10 +1067,7 @@ pub(crate) enum UpdateDisposition {
 }
 
 enum AttachmentMaterialization {
-    Ready {
-        content: String,
-        attachment: zeroclaw_api::media::MediaAttachment,
-    },
+    Ready(zeroclaw_api::media::MediaAttachment),
     SkipPermanent,
     RetryTransient,
 }
@@ -2767,7 +2615,8 @@ impl TelegramChannel {
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-            pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            send_text_with_voice_resolver: Arc::new(|| false),
+            voice_drafts: Mutex::new(HashMap::new()),
             proxy_url: None,
             #[cfg(test)]
             fixture_http_client: None,
@@ -2805,6 +2654,15 @@ impl TelegramChannel {
         voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         self.voice_peer_resolver = voice_peer_resolver;
+        self
+    }
+
+    /// Resolve whether voice replies retain text from canonical channel config.
+    pub fn with_send_text_with_voice_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.send_text_with_voice_resolver = resolver;
         self
     }
 
@@ -2903,6 +2761,11 @@ impl TelegramChannel {
     /// does not cover.
     fn destination_is_voice_peer(&self, recipient: &str) -> bool {
         (self.voice_peer_resolver)().iter().any(|p| p == recipient)
+    }
+
+    fn voice_reply_is_exclusive(&self, recipient: &str, force_voice: bool) -> bool {
+        !(self.send_text_with_voice_resolver)()
+            && (force_voice || self.destination_is_voice_peer(recipient))
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -3007,8 +2870,9 @@ impl TelegramChannel {
             return Ok(());
         }
 
-        // A voice-configured peer (`output_modality = "voice"`) has opted out of
-        // text streaming: multi_message's permanent per-turn narration is a
+        // Unless send_text_with_voice is enabled, a voice-configured peer
+        // (`output_modality = "voice"`) has opted out of text streaming:
+        // multi_message's permanent per-turn narration is a
         // text-delivery affordance. Such a peer receives its reply as one unit at
         // finalize — a voice note by default, or the complete text if the agent
         // routes this reply to text — never mid-turn permanent narration. This is
@@ -3022,7 +2886,7 @@ impl TelegramChannel {
         // `finalize_multi_message_draft` (which does see `suppress_voice`) delivers
         // the complete text, the accumulated narration and the final answer, to a
         // text-routed voice peer.
-        if self.destination_is_voice_peer(recipient) {
+        if self.voice_reply_is_exclusive(recipient, false) {
             return Ok(());
         }
 
@@ -3162,7 +3026,7 @@ impl TelegramChannel {
         // while narration streams, and narration is published as separate,
         // permanent messages — so it stays text and is not retracted; that route
         // makes only the final answer a voice note (see the `send()` contract).
-        let voice_only = !suppress_voice && self.destination_is_voice_peer(recipient);
+        let voice_only = !suppress_voice && self.voice_reply_is_exclusive(recipient, false);
 
         let key = Self::multi_draft_key(recipient, message_id);
         let flush_lock = {
@@ -3171,7 +3035,7 @@ impl TelegramChannel {
                 // No draft to finalize: deliver voice for the final text only,
                 // matching the non-multi-message finalize path.
                 if !suppress_voice {
-                    self.try_queue_voice_reply(recipient, &text, true, false);
+                    self.try_queue_voice_reply(recipient, &text, Some(message_id), false);
                 }
                 return Ok(());
             };
@@ -3184,7 +3048,7 @@ impl TelegramChannel {
             let mut drafts = self.multi_message_drafts.lock();
             let Some(draft) = drafts.remove(&key) else {
                 if !suppress_voice {
-                    self.try_queue_voice_reply(recipient, &text, true, false);
+                    self.try_queue_voice_reply(recipient, &text, Some(message_id), false);
                 }
                 return Ok(());
             };
@@ -3311,11 +3175,10 @@ impl TelegramChannel {
             }
         }
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&text);
         // `finalize_draft` receives the final agent-turn text (`delivered_response`),
         // not the draft updater's accumulated multi-turn buffer. Intermediate turns
         // are emitted via `flush_draft_turn`; send the final turn in full.
-        let remainder = sanitize_multi_message_visible_text(&text_without_markers);
+        let remainder = sanitize_multi_message_visible_text(&text);
 
         if !remainder.is_empty() && !voice_only {
             self.pace_multi_message_send(last_sent_at).await;
@@ -3328,23 +3191,12 @@ impl TelegramChannel {
                 .await?;
         }
 
-        // Attachments are permanent Bot API sends, so they fall under the same
-        // voice-only guard as narration and final text: an unsuppressed voice
-        // peer receives only the voice note. A `suppress_voice = true` (text
-        // routed) peer still gets its media, matching ordinary text delivery.
-        if !voice_only {
-            for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
-            }
-        }
-
         // Queue the voice reply only after the pending narration and the final
         // text have been delivered, so a resend failure or a failed final send is
         // never overtaken by an immediate TTS reply (send_via modality="text"
         // still suppresses it entirely).
         if !suppress_voice {
-            self.try_queue_voice_reply(recipient, &text, true, false);
+            self.try_queue_voice_reply(recipient, &text, Some(message_id), false);
         }
 
         Ok(())
@@ -4205,180 +4057,159 @@ impl TelegramChannel {
             || self.destination_is_voice_peer(recipient)
     }
 
-    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool, force: bool) {
-        if (!force && !self.is_voice_chat(recipient)) || self.tts_manager.is_none() {
+    fn discard_voice_draft(&self, recipient: &str, draft_id: &str) {
+        self.voice_drafts
+            .lock()
+            .remove(&Self::multi_draft_key(recipient, draft_id));
+    }
+
+    fn try_queue_voice_reply(
+        &self,
+        recipient: &str,
+        content: &str,
+        draft_id: Option<&str>,
+        force: bool,
+    ) {
+        // Take ownership before every exit path, including policy suppression
+        // and empty/unspeakable final text, so speculation cannot outlive a turn.
+        let job = draft_id.and_then(|id| {
+            self.voice_drafts
+                .lock()
+                .remove(&Self::multi_draft_key(recipient, id))
+        });
+        if !force && !self.is_voice_chat(recipient) {
             return;
         }
-
-        // Only queue substantive natural-language replies for voice.
-        // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
+        let Some(tts_manager) = self.tts_manager.clone() else {
+            return;
+        };
         if let Some(reason) = crate::util::voice_reply_skip_reason(content) {
-            // Stable literal per the logging contract: the classification and
-            // per-event measurements ride solely in `attributes` above.
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
-                    .with_attrs(::serde_json::json!({
-                        "recipient": recipient,
-                        "reason": reason,
-                        "content_len": content.len(),
-                        "immediate": immediate,
-                    })),
+                    .with_attrs(
+                        ::serde_json::json!({"reason": reason, "content_len": content.len()})
+                    ),
                 "voice reply skipped"
             );
             return;
         }
-
+        let job = job.unwrap_or_else(|| crate::tts::SpeechJob::start(tts_manager.clone()));
+        let text = content.to_owned();
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        let recipient = recipient.to_owned();
         let voice_chats = self.voice_chats.clone();
         let voice_peer_resolver = self.voice_peer_resolver.clone();
         let api_base = self.api_base.clone();
         let bot_token = self.bot_token.clone();
-        let Some(tts_manager) = self.tts_manager.clone() else {
-            return;
-        };
-
-        if immediate {
-            // Finalize path: text is already the final answer — no debounce.
-            let text = content.to_string();
-            let recipient = recipient.to_string();
-            let proxy_url = self.proxy_url.clone();
-            zeroclaw_spawn::spawn!(async move {
-                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
-                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
-                    vc.remove(&recipient);
-                }
-                match Self::synthesize_and_send_voice(
-                    &api_base,
-                    &bot_token,
-                    proxy_url.as_deref(),
-                    &chat_id,
-                    thread_id.as_deref(),
-                    &text,
-                    &tts_manager,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!("voice reply sent ({} chars)", text.len())
-                        );
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                            "TTS voice reply failed"
-                        );
-                    }
-                }
-            });
-            return;
-        }
-
-        // Send path: debounce to coalesce multi-part tool-chain responses.
-        if let Ok(mut pv) = self.pending_voice.lock() {
-            pv.insert(
-                recipient.to_string(),
-                (content.to_string(), std::time::Instant::now()),
-            );
-        }
-
-        let pending = self.pending_voice.clone();
-        let recipient = recipient.to_string();
         let proxy_url = self.proxy_url.clone();
         zeroclaw_spawn::spawn!(async move {
-            // Wait 10 seconds — long enough for the agent to finish its
-            // full tool chain and send the final answer.
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-            // Atomic check-and-remove: only one task gets the value
-            let to_voice = pending.lock().ok().and_then(|mut pv| {
-                if let Some((_, ts)) = pv.get(&recipient)
-                    && ts.elapsed().as_secs() >= 8
-                {
-                    return pv.remove(&recipient).map(|(text, _)| text);
+            match job.finish(&text).await {
+                Ok(parts) => {
+                    Self::deliver_voice_parts(
+                        &api_base,
+                        &bot_token,
+                        proxy_url.as_deref(),
+                        &chat_id,
+                        thread_id.as_deref(),
+                        &recipient,
+                        &voice_chats,
+                        &voice_peer_resolver,
+                        parts,
+                        &tts_manager,
+                    )
+                    .await
                 }
-                None
-            });
-
-            if let Some(text) = to_voice {
-                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
-                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
-                    vc.remove(&recipient);
-                }
-                match Self::synthesize_and_send_voice(
-                    &api_base,
-                    &bot_token,
-                    proxy_url.as_deref(),
-                    &chat_id,
-                    thread_id.as_deref(),
-                    &text,
-                    &tts_manager,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!("voice reply sent ({} chars)", text.len())
-                        );
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                            "TTS voice reply failed"
-                        );
-                    }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                        "TTS voice reply failed"
+                    );
                 }
             }
         });
     }
 
-    /// Synthesize text to speech and send as a Telegram voice note (static version for spawned tasks).
-    async fn synthesize_and_send_voice(
+    /// Discard the ephemeral voice-chat registration and upload one turn's
+    /// audio as a single voice note, logging the outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_voice_parts(
         api_base: &str,
         bot_token: &str,
         proxy_url: Option<&str>,
         chat_id: &str,
         thread_id: Option<&str>,
-        text: &str,
+        recipient: &str,
+        voice_chats: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        voice_peer_resolver: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        parts: Vec<Vec<u8>>,
         tts_manager: &crate::tts::TtsManager,
-    ) -> anyhow::Result<()> {
-        let audio_bytes = tts_manager.synthesize_opus(text).await?;
-        let audio_len = audio_bytes.len();
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"audio_len": audio_len})),
-            "synthesized bytes of audio"
-        );
-
-        if audio_bytes.is_empty() {
-            anyhow::bail!("TTS returned empty audio");
+    ) {
+        if parts.is_empty() {
+            return;
         }
 
-        // synthesize_opus already transcodes to OGG/Opus via ffmpeg internally
+        // A one-off voice note must not leave the chat stuck in voice-reply
+        // mode; only a configured voice peer keeps the registration.
+        let is_config_voice_peer = voice_peer_resolver().iter().any(|p| p == recipient);
+        if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
+            vc.remove(recipient);
+        }
+
+        let segment_count = parts.len();
+        match Self::send_voice_parts(
+            api_base,
+            bot_token,
+            proxy_url,
+            chat_id,
+            thread_id,
+            parts,
+            tts_manager,
+        )
+        .await
+        {
+            Ok(audio_len) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "audio_len": audio_len,
+                            "segments": segment_count,
+                        })),
+                    "voice reply sent"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                    "TTS voice reply failed"
+                );
+            }
+        }
+    }
+
+    /// Concatenate a turn's ordered audio parts into one OGG/Opus container and
+    /// upload it as a Telegram voice note. Returns the uploaded byte length.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_voice_parts(
+        api_base: &str,
+        bot_token: &str,
+        proxy_url: Option<&str>,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        parts: Vec<Vec<u8>>,
+        tts_manager: &crate::tts::TtsManager,
+    ) -> anyhow::Result<usize> {
+        // Re-mux, not byte concatenation: each part is a complete container.
+        let audio_bytes = tts_manager.concat_parts_to_opus(&parts).await?;
+        let audio_len = audio_bytes.len();
+        anyhow::ensure!(!audio_bytes.is_empty(), "TTS returned empty audio");
+
         let (method, field, filename, mime) = telegram_audio_send_spec("opus")?;
 
         let url = format!("{api_base}/bot{bot_token}/{method}");
@@ -4406,14 +4237,7 @@ impl TelegramChannel {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("{method} failed: status={status}, body={body}");
         }
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"audio_len": audio_len})),
-            "sent voice note ( bytes)"
-        );
-        Ok(())
+        Ok(audio_len)
     }
 
     async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
@@ -4467,8 +4291,8 @@ impl TelegramChannel {
     async fn resolve_after_deadline(
         &self,
         approval_id: &str,
-        rx: &mut tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
-    ) -> zeroclaw_api::channel::AttributedApprovalResponse {
+        rx: &mut tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult>,
+    ) -> zeroclaw_api::channel::ApprovalReplyResult {
         let claimed = self
             .pending_approvals
             .lock()
@@ -4476,18 +4300,20 @@ impl TelegramChannel {
             .remove(approval_id)
             .is_some();
         if claimed {
-            return zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
-                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            return Ok(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             );
         }
         match tokio::time::timeout(Self::CALLBACK_CLAIM_GRACE, rx).await {
-            Ok(Ok(response)) => {
-                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
-            }
-            _ => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
-                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            Ok(Ok(response)) => response,
+            _ => Ok(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             ),
         }
     }
@@ -5196,7 +5022,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .then_some(sender_identity)
     }
 
-    /// Download and persist one attachment, returning only its prompt marker.
+    /// Download and persist one attachment, returning its typed metadata.
     /// Authorization, mention gating, captions, replies, and forwarding are
     /// intentionally handled by the caller so an album applies them once.
     async fn materialize_attachment_content(
@@ -5315,26 +5141,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return AttachmentMaterialization::RetryTransient;
         }
 
-        // Preserve the typed envelope as the source of truth for both the
-        // rendered marker and downstream attachment classification. Albums
-        // collect these envelopes alongside their ordered content markers.
+        // Preserve the typed envelope as the source of truth for downstream
+        // attachment classification. Albums collect these envelopes in order.
         let mut media_attachment = zeroclaw_api::media::MediaAttachment {
             file_name: display_filename,
             data: file_data,
             mime_type: attachment.mime_type.clone(),
-            marker: None,
+            reference: None,
         };
-        let marker_kind = attachment_marker_kind(&media_attachment);
-        media_attachment.marker = Some(zeroclaw_api::media::RenderedMarker {
+        let kind = attachment_kind(&media_attachment);
+        media_attachment.reference = Some(zeroclaw_api::media::AttachmentReference {
             target: local_path.display().to_string(),
-            kind: marker_kind,
+            kind,
         });
-        let content = format_attachment_content(&media_attachment, &local_path);
-
-        AttachmentMaterialization::Ready {
-            content,
-            attachment: media_attachment,
-        }
+        AttachmentMaterialization::Ready(media_attachment)
     }
 
     fn finalize_attachment_message(
@@ -5437,10 +5257,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .materialize_attachment_content(&attachment, &chat_id, message_id, false)
             .await
         {
-            AttachmentMaterialization::Ready {
-                content,
-                attachment,
-            } => (content, attachment),
+            AttachmentMaterialization::Ready(attachment) => (String::new(), attachment),
             AttachmentMaterialization::SkipPermanent => {
                 return UpdateDisposition::SkipPermanent;
             }
@@ -5543,7 +5360,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         };
 
-        let mut contents = Vec::with_capacity(ordered.len());
         let mut attachments = Vec::with_capacity(ordered.len());
         for update in ordered {
             let Some(message) = update.get("message") else {
@@ -5559,13 +5375,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .materialize_attachment_content(&attachment, &chat_id, message_id, true)
                 .await
             {
-                AttachmentMaterialization::Ready {
-                    content,
-                    attachment,
-                } => {
-                    contents.push(content);
-                    attachments.push(attachment);
-                }
+                AttachmentMaterialization::Ready(attachment) => attachments.push(attachment),
                 AttachmentMaterialization::SkipPermanent => {}
                 AttachmentMaterialization::RetryTransient => {
                     return UpdateDisposition::RetryTransient;
@@ -5573,14 +5383,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
-        if contents.is_empty() {
+        if attachments.is_empty() {
             return UpdateDisposition::SkipPermanent;
         }
 
         self.finalize_attachment_message(
             anchor_message,
             sender_identity,
-            contents.join("\n\n"),
+            String::new(),
             gated_caption.as_deref(),
             attachments,
         )
@@ -5820,9 +5630,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
-            format!("{quote}\n\n[Voice] {text}")
+            format!("{quote}\n\n{text}")
         } else {
-            format!("[Voice] {text}")
+            text
         };
 
         // Prepend forwarding attribution when the message was forwarded
@@ -6017,19 +5827,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 self.voice_transcriptions
                     .lock()
                     .get(&format!("{cid}:{mid}"))
-                    .map(|t| format!("[Voice] {t}"))
-                    .unwrap_or_else(|| "[Voice message]".to_string())
+                    .cloned()
+                    .unwrap_or_else(|| "Voice message".to_string())
             } else {
-                "[Voice message]".to_string()
+                "Voice message".to_string()
             }
         } else if reply.get("photo").is_some() {
-            "[Photo]".to_string()
+            "Photo attachment".to_string()
         } else if reply.get("document").is_some() {
-            "[Document]".to_string()
+            "Document attachment".to_string()
         } else if reply.get("video").is_some() {
-            "[Video]".to_string()
+            "Video attachment".to_string()
         } else if reply.get("sticker").is_some() {
-            "[Sticker]".to_string()
+            "Sticker attachment".to_string()
         } else {
             "[Message]".to_string()
         };
@@ -6650,10 +6460,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     self.send_audio_by_url(chat_id, thread_id, target, None)
                         .await
                 }
-                TelegramAttachmentKind::Voice => {
-                    self.send_voice_by_url(chat_id, thread_id, target, None)
-                        .await
-                }
             };
 
             // If sending media by URL failed (e.g. Telegram can't fetch the URL,
@@ -6674,7 +6480,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     TelegramAttachmentKind::Document => "Document",
                     TelegramAttachmentKind::Video => "Video",
                     TelegramAttachmentKind::Audio => "Audio",
-                    TelegramAttachmentKind::Voice => "Voice",
                 };
                 let fallback_text = format!("{kind_label}: {target}");
                 self.send_text_chunks(&fallback_text, chat_id, thread_id, 0)
@@ -6712,7 +6517,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
             TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, path, None).await,
         }
     }
 
@@ -7173,7 +6977,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// dismiss the spinner, and rewrite the prompt with the outcome, dropping
     /// the buttons
     /// best-effort rewrite, a stale tap is a no-op
-    async fn handle_approval_callback(&self, cb: &serde_json::Value) {
+    async fn handle_approval_callback(&self, cb: &serde_json::Value) -> anyhow::Result<()> {
         use crate::util::PendingApprovalResolution;
 
         let cb_id = cb
@@ -7186,10 +6990,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or_default();
 
         let Some(rest) = cb_data.strip_prefix("approval:") else {
-            return;
+            return Ok(());
         };
         let Some((approval_id, action)) = rest.rsplit_once(':') else {
-            return;
+            return Ok(());
         };
 
         let response = match action {
@@ -7216,13 +7020,37 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 crate::util::resolve_pending_approval_with_tool(
                     &self.pending_approvals,
                     approval_id,
-                    response,
+                    crate::util::ApprovalReply::authenticated(
+                        response,
+                        self,
+                        cb["from"]["id"]
+                            .as_i64()
+                            .map(|id| id.to_string())
+                            .as_deref()
+                            .unwrap_or_default(),
+                    ),
                     responder_allowed,
                     chat_id,
                 )
-                .await
+                .await?
             }
-            _ => (PendingApprovalResolution::NotFound, None),
+            _ => {
+                let audit = self
+                    .pending_approvals
+                    .lock()
+                    .await
+                    .get(approval_id)
+                    .map(|pending| pending.audit.clone());
+                if let Some(audit) = audit {
+                    audit.record_rejection(
+                        if has_response { "wrong_destination" } else { "invalid_decision" },
+                        serde_json::json!({"decision": action, "responder_allowed": responder_allowed}),
+                    ).await?;
+                    (PendingApprovalResolution::Rejected, None)
+                } else {
+                    (PendingApprovalResolution::NotFound, None)
+                }
+            }
         };
 
         if matches!(resolution, PendingApprovalResolution::Rejected) {
@@ -7356,6 +7184,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
             }
         }
+        Ok(())
     }
 
     /// Fixed, bounded delay between retries of a transiently failing update.
@@ -7426,7 +7255,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 return UpdateOutcome::Advanced;
             }
 
-            self.handle_approval_callback(cb).await;
+            if let Err(error) = self.handle_approval_callback(cb).await {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error": error.to_string()})),
+                    "Telegram approval audit failed; retaining update for retry"
+                );
+                return Self::pause_for_transient_update(uid, transient_retry).await;
+            }
 
             // A callback_query is terminal for inbound processing: there is
             // no message to deliver downstream, so nothing can be lost by
@@ -7998,9 +7836,8 @@ impl Channel for TelegramChannel {
     }
 
     fn supports_turn_flush_narration(&self) -> bool {
-        // Telegram is the only channel that implements `flush_draft_turn` /
-        // `discard_draft_turn`; scope the orchestrator's narration-policy +
-        // flush-barrier path to it so channels that stream paragraphs another
+        // Enable the shared narration-policy / flush-barrier path only for
+        // Telegram's turn-based mode. Channels that stream paragraphs another
         // way (e.g. Matrix `update_draft`) do not run outbound hooks on phantom
         // flushes that deliver nothing.
         self.stream_mode == StreamMode::MultiMessage
@@ -8064,6 +7901,32 @@ impl Channel for TelegramChannel {
                 Ok(Some(draft_id))
             }
         }
+    }
+
+    async fn prepare_voice_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if !self.is_voice_chat(recipient)
+            || text.is_empty()
+            || crate::util::voice_reply_skip_reason(text)
+                .is_some_and(|reason| reason != "too_short")
+        {
+            self.discard_voice_draft(recipient, message_id);
+            return Ok(());
+        }
+        let Some(manager) = self.tts_manager.clone() else {
+            return Ok(());
+        };
+        let key = Self::multi_draft_key(recipient, message_id);
+        let mut drafts = self.voice_drafts.lock();
+        drafts
+            .entry(key)
+            .or_insert_with(|| crate::tts::SpeechJob::start(manager))
+            .update(text);
+        Ok(())
     }
 
     async fn update_draft(
@@ -8188,6 +8051,7 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.discard_voice_draft(recipient, message_id);
         if self.stream_mode != StreamMode::MultiMessage
             || !Self::is_multi_message_synthetic_draft(message_id)
         {
@@ -8241,10 +8105,17 @@ impl Channel for TelegramChannel {
         text: &str,
         suppress_voice: bool,
     ) -> anyhow::Result<()> {
+        if suppress_voice {
+            self.discard_voice_draft(recipient, message_id);
+        }
         if self.stream_mode == StreamMode::MultiMessage {
-            return self
+            let result = self
                 .finalize_multi_message_draft(recipient, message_id, text, suppress_voice)
                 .await;
+            if result.is_err() {
+                self.discard_voice_draft(recipient, message_id);
+            }
+            return result;
         }
 
         let text = &strip_tool_call_tags(text);
@@ -8253,7 +8124,7 @@ impl Channel for TelegramChannel {
         // Queue TTS voice reply — immediate mode since text is already final.
         // Skipped when suppress_voice is set (explicit text-only routing override).
         if !suppress_voice {
-            self.try_queue_voice_reply(recipient, text, true, false);
+            self.try_queue_voice_reply(recipient, text, Some(message_id), false);
         }
 
         // Clean up rate-limit tracking for this chat
@@ -8261,7 +8132,7 @@ impl Channel for TelegramChannel {
 
         // Voice-only peers: delete the draft placeholder and let the voice
         // bubble be the sole reply. Bypassed when suppress_voice forces text.
-        if !suppress_voice && self.destination_is_voice_peer(recipient) {
+        if !suppress_voice && self.voice_reply_is_exclusive(recipient, false) {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
                     .http_client()
@@ -8275,9 +8146,6 @@ impl Channel for TelegramChannel {
             }
             return Ok(());
         }
-
-        // Parse attachments before processing
-        let (text_without_markers, attachments) = parse_attachment_markers(text);
 
         // Parse message ID once for reuse
         let msg_id = match message_id.parse::<i64>() {
@@ -8295,37 +8163,6 @@ impl Channel for TelegramChannel {
                 None
             }
         };
-
-        // If we have attachments, delete the draft and send fresh messages
-        // (Telegram editMessageText can't add attachments)
-        if !attachments.is_empty() {
-            // Delete the draft message
-            if let Some(id) = msg_id {
-                let _ = self
-                    .http_client()
-                    .post(self.api_url("deleteMessage"))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": id,
-                    }))
-                    .send()
-                    .await;
-            }
-
-            // Send text without markers
-            if !text_without_markers.is_empty() {
-                self.finalize_send_chunks(&text_without_markers, &chat_id, thread_id.as_deref())
-                    .await?;
-            }
-
-            // Send attachments
-            for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
-            }
-
-            return Ok(());
-        }
 
         // If text exceeds limit, delete draft and send as chunked messages
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
@@ -8446,6 +8283,7 @@ impl Channel for TelegramChannel {
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.discard_voice_draft(recipient, message_id);
         let (chat_id, _) = Self::parse_reply_target(recipient);
         self.last_draft_edit.lock().remove(&chat_id);
 
@@ -8508,21 +8346,40 @@ impl Channel for TelegramChannel {
         // Voice chat mode: queue a voice note. Suppressed messages (errors,
         // system notices) are never voiced.
         if !message.suppress_voice {
-            self.try_queue_voice_reply(&message.recipient, &content, false, message.force_voice);
+            self.try_queue_voice_reply(&message.recipient, &content, None, message.force_voice);
         }
 
-        // Voice-only peers (or explicit force_voice): the voice note is the sole
-        // FINAL reply — skip the final text. In multi_message mode, narration
+        // Unless send_text_with_voice is enabled, voice-only peers (or explicit
+        // force_voice) receive the voice note as the sole FINAL reply. In multi_message mode, narration
         // already streamed earlier this turn is delivered as separate, permanent
         // messages that cannot be retracted; a per-turn voice route governs the
         // final answer only and does not convert or delete that narration.
         if !message.suppress_voice
-            && (self.destination_is_voice_peer(&message.recipient) || message.force_voice)
+            && self.voice_reply_is_exclusive(&message.recipient, message.force_voice)
         {
             return Ok(());
         }
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&content);
+        let text_without_markers = content.clone();
+        let attachments: Vec<TelegramAttachment> = message
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                let reference = attachment.reference.as_ref()?;
+                let kind = match reference.kind {
+                    zeroclaw_api::media::AttachmentKind::Image => TelegramAttachmentKind::Image,
+                    zeroclaw_api::media::AttachmentKind::Audio => TelegramAttachmentKind::Audio,
+                    zeroclaw_api::media::AttachmentKind::Video => TelegramAttachmentKind::Video,
+                    zeroclaw_api::media::AttachmentKind::Document => {
+                        TelegramAttachmentKind::Document
+                    }
+                };
+                Some(TelegramAttachment {
+                    kind,
+                    target: reference.target.clone(),
+                })
+            })
+            .collect();
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
@@ -8535,12 +8392,6 @@ impl Channel for TelegramChannel {
                 self.send_attachment(chat_id, thread_id, attachment).await?;
             }
 
-            return Ok(());
-        }
-
-        if let Some(attachment) = parse_path_only_attachment(&content) {
-            self.send_attachment(chat_id, thread_id, &attachment)
-                .await?;
             return Ok(());
         }
 
@@ -9097,18 +8948,14 @@ impl TelegramChannel {
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            approval_id.clone(),
-            crate::util::PendingApproval {
-                sender: tx,
-                destination: chat_id.to_string(),
-                tool_name: request.tool_name.clone(),
-            },
-        );
-        let mut guard = crate::util::PendingApprovalGuard::new(
+        let mut guard = crate::util::register_pending_approval(
             Arc::clone(&self.pending_approvals),
             approval_id.clone(),
-        );
+            tx,
+            chat_id.to_string(),
+            request.tool_name.clone(),
+        )
+        .await?;
 
         let send_prompt = async {
             let resp = self
@@ -9176,21 +9023,36 @@ impl TelegramChannel {
         };
 
         let send_result = if let Some(deadline) = absolute_deadline {
-            match tokio::time::timeout_at(deadline, send_prompt).await {
+            match tokio::time::timeout_at(
+                deadline,
+                zeroclaw_api::channel::await_approval_prompt_send(send_prompt, &mut rx),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => {
-                    let response = self.resolve_after_deadline(&approval_id, &mut rx).await;
+                    let response = self.resolve_after_deadline(&approval_id, &mut rx).await?;
                     guard.disarm();
                     return Ok(Some(response));
                 }
             }
         } else {
-            send_prompt.await
+            zeroclaw_api::channel::await_approval_prompt_send(send_prompt, &mut rx).await
         };
 
-        if let Err(error) = send_result {
-            guard.remove().await;
-            return Err(error);
+        match send_result {
+            Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Sent(())) => {}
+            Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Replied(response)) => {
+                guard.disarm();
+                return Ok(Some(response));
+            }
+            Err(error) if zeroclaw_api::session_events::capture::is_capture_stopped(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                guard.remove().await;
+                return Err(error);
+            }
         }
 
         // Wait for the user to tap a button. Direct callers supply the channel's
@@ -9209,9 +9071,7 @@ impl TelegramChannel {
         let result = match wait_result {
             Ok(Ok(response)) => {
                 guard.disarm();
-                Some(zeroclaw_api::channel::AttributedApprovalResponse::operator(
-                    response,
-                ))
+                Some(response?)
             }
             Ok(Err(_)) => {
                 // Sender dropped — clean up and deny. Nobody tapped.
@@ -9224,7 +9084,7 @@ impl TelegramChannel {
                 )
             }
             Err(_) => {
-                let response = self.resolve_after_deadline(&approval_id, &mut rx).await;
+                let response = self.resolve_after_deadline(&approval_id, &mut rx).await?;
                 guard.disarm();
                 Some(response)
             }
@@ -9254,6 +9114,7 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
     use zeroclaw_config::schema::{Config, TelegramConfig};
     use zeroclaw_runtime::LiveConfigAuthority;
 
@@ -12080,6 +11941,140 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn voice_reply_can_keep_text_across_delivery_modes_and_live_changes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, OpenAITtsProviderConfig, TelegramConfig, TtsProviderConfig,
+        };
+
+        for mode in [
+            StreamMode::Off,
+            StreamMode::Partial,
+            StreamMode::MultiMessage,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":1}})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/speech"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fixture-opus"))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let mut config = Config::default();
+            config.tts.enabled = true;
+            config
+                .channels
+                .telegram
+                .insert("test".into(), TelegramConfig::default());
+            config.agents.insert(
+                "fixture".into(),
+                AliasedAgentConfig {
+                    tts_provider: "openai.default".into(),
+                    channels: vec!["telegram.test".into()],
+                    ..Default::default()
+                },
+            );
+            config.providers.tts.openai.insert(
+                "default".into(),
+                OpenAITtsProviderConfig {
+                    base: TtsProviderConfig {
+                        api_key: Some("fixture-key".into()),
+                        uri: Some(format!("{}/v1/audio/speech", server.uri())),
+                        ..Default::default()
+                    },
+                },
+            );
+            let live = Arc::new(parking_lot::RwLock::new(config.clone()));
+            let channel = multi_message_test_channel("test", 0)
+                .with_streaming(mode, 0)
+                .with_api_base(server.uri())
+                .with_voice_peer_resolver(Arc::new(|| vec!["123".into()]))
+                .with_send_text_with_voice_resolver(Arc::new({
+                    let live = live.clone();
+                    move || live.read().channels.telegram["test"].send_text_with_voice
+                }))
+                .with_tts(&config);
+            // Change the canonical policy after construction: a channel must
+            // not retain its initial false value through a long-lived handle.
+            live.write()
+                .channels
+                .telegram
+                .get_mut("test")
+                .unwrap()
+                .send_text_with_voice = true;
+            let answer =
+                "Here is the complete answer, retained as both readable text and a voice note.";
+            if mode == StreamMode::Off {
+                // Sender-driven routing supplies force_voice for voice peers.
+                channel
+                    .send(&SendMessage::new(answer, "123").force_voice())
+                    .await
+                    .unwrap();
+            } else {
+                let id = channel
+                    .send_draft(&SendMessage::new("...", "123"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                channel.update_draft("123", &id, answer).await.unwrap();
+                channel
+                    .finalize_draft("123", &id, answer, false)
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let requests = server.received_requests().await.unwrap();
+                    if requests
+                        .iter()
+                        .any(|r| r.url.path().ends_with("/sendVoice"))
+                    {
+                        assert!(
+                            requests.iter().any(|r| {
+                                (r.url.path().ends_with("/sendMessage")
+                                    || r.url.path().ends_with("/editMessageText"))
+                                    && String::from_utf8_lossy(&r.body).contains(answer)
+                            }),
+                            "text must accompany voice in {mode:?}"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("voice upload must complete");
+            let tts_before = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/audio/speech")
+                .count();
+            channel
+                .send(&SendMessage::new(answer, "123").suppress_voice())
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                tts_before,
+                requests
+                    .iter()
+                    .filter(|r| r.url.path() == "/v1/audio/speech")
+                    .count(),
+                "explicit text-only routing must still suppress speech"
+            );
+        }
+    }
+
     /// Regression: an UNSUPPRESSED voice-only peer in MultiMessage mode must
     /// receive the voice note as the sole reply — no permanent intermediate
     /// narration (`flush_draft_turn`) and no final-answer `sendMessage`. Before
@@ -12297,14 +12292,9 @@ mod tests {
             sent_bodies.iter().any(|b| b.contains("FINAL_TOKEN")),
             "text-routed voice peer must receive the final answer; bodies: {sent_bodies:?}"
         );
-        // The attachment is delivered too — text-mode routing includes media.
-        assert!(
-            reqs.iter().any(|r| r.url.path().ends_with("/sendPhoto")),
-            "text-routed voice peer must receive the attachment; paths: {:?}",
-            reqs.iter()
-                .map(|r| r.url.path().to_string())
-                .collect::<Vec<_>>()
-        );
+        // Marker-looking text is ordinary text now; without a typed attachment,
+        // text-mode routing sends only the accumulated text.
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/sendPhoto")));
         // No voice note: suppress_voice=true is text-only.
         assert!(
             !reqs
@@ -16732,54 +16722,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_attachment_markers_extracts_multiple_types() {
-        let message = "Here are files [IMAGE:/tmp/a.png] and [DOCUMENT:https://example.com/a.pdf]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-
-        assert_eq!(cleaned, "Here are files  and");
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Image);
-        assert_eq!(attachments[0].target, "/tmp/a.png");
-        assert_eq!(attachments[1].kind, TelegramAttachmentKind::Document);
-        assert_eq!(attachments[1].target, "https://example.com/a.pdf");
-    }
-
-    #[test]
-    fn parse_attachment_markers_keeps_invalid_markers_in_text() {
-        let message = "Report [UNKNOWN:/tmp/a.bin]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-
-        assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_detects_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let image_path = dir.path().join("snap.png");
-        std::fs::write(&image_path, b"fake-png").unwrap();
-
-        let parsed = parse_path_only_attachment(image_path.to_string_lossy().as_ref())
-            .expect("expected attachment");
-
-        assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
-        assert_eq!(parsed.target, image_path.to_string_lossy());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_rejects_sentence_text() {
-        assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
-    }
-
-    #[test]
-    fn infer_attachment_kind_from_target_detects_document_extension() {
-        assert_eq!(
-            infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
-            Some(TelegramAttachmentKind::Document)
-        );
-    }
-
-    #[test]
     fn parse_update_message_uses_chat_id_as_reply_target() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -18104,6 +18046,10 @@ mod tests {
     fn telegram_contains_bot_mention_finds_mention() {
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @mybot",
+            "@mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "Hello @mybot",
             "mybot"
         ));
         assert!(TelegramChannel::contains_bot_mention(
@@ -18116,6 +18062,10 @@ mod tests {
         ));
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @MyBot, can you help?",
+            "mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "你好 @mybot，请处理",
             "mybot"
         ));
     }
@@ -18912,7 +18862,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @bob:\n> [Voice message]");
+        assert_eq!(ctx, "> @bob:\n> Voice message");
     }
 
     #[test]
@@ -19020,7 +18970,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @bob:\n> [Voice] Hello from voice");
+        assert_eq!(ctx, "> @bob:\n> Hello from voice");
     }
 
     #[test]
@@ -19407,7 +19357,7 @@ mod tests {
             panic!("expected Parsed voice message");
         };
         assert_eq!(message.platform_sender_id.as_deref(), Some("123"));
-        assert_eq!(message.content, "[Voice] hello from voice");
+        assert_eq!(message.content, "hello from voice");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -19712,9 +19662,15 @@ mod tests {
             .expect("timed out waiting for the attachment message")
             .expect("channel closed before delivering the attachment message");
         assert!(
-            msg.content.contains("report.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "report.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("report.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         let main_loop_bodies = telegram_main_loop_getupdates_bodies(&mock_server).await;
@@ -19949,9 +19905,16 @@ mod tests {
             .expect("timed out waiting for the recovered attachment")
             .expect("channel closed before delivering the recovered attachment");
         assert!(
-            recovered.content.contains("report.pdf"),
-            "the failed update must recover before the later update, got: {}",
-            recovered.content
+            recovered
+                .attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "report.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("report.pdf"))),
+            "the failed update must recover before the later update, got: {:?}",
+            recovered.attachments
         );
         let third_message = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -20152,9 +20115,15 @@ mod tests {
             .expect("timed out waiting for the queued attachment message")
             .expect("channel closed before delivering the queued attachment message");
         assert!(
-            msg.content.contains("queued.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "queued.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("queued.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         // Exactly one main-loop poll (timeout: 30) must have happened at the
@@ -20274,6 +20243,8 @@ mod tests {
             ch.pending_approvals.lock().await.insert(
                 format!("approval-{i}"),
                 crate::util::PendingApproval {
+                    registration_id: uuid::Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::current(),
                     sender,
                     destination: "-2001".to_string(),
                     tool_name: format!("tool-{i}"),
@@ -20804,9 +20775,15 @@ mod tests {
             .expect("timed out: a transient failure was wrongly skipped instead of retried")
             .expect("channel closed before delivering the retried attachment");
         assert!(
-            msg.content.contains("later.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "later.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("later.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         // More than one poll at the un-advanced offset proves it was held.
@@ -20890,9 +20867,15 @@ mod tests {
             .expect("timed out: a body-less 408 was acknowledged instead of retried")
             .expect("channel closed: the update behind a 408 was silently consumed");
         assert!(
-            msg.content.contains("held.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "held.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("held.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         // More than one poll at offset 0 proves the update was held, not
@@ -21364,13 +21347,13 @@ mod tests {
             .expect("extract_reply_context should return Some for voice reply");
 
         assert!(
-            ctx.contains(&format!("[Voice] {transcript}")),
+            ctx.contains(&format!("{transcript}")),
             "expected cached transcription in reply context, got: {ctx}"
         );
 
         // Must NOT contain the fallback placeholder
         assert!(
-            !ctx.contains("[Voice message]"),
+            !ctx.contains("Voice message"),
             "context should use cached transcription, not fallback placeholder, got: {ctx}"
         );
     }
@@ -21625,7 +21608,7 @@ mod tests {
             .expect("follow-up should dispatch")
             .expect("listener should remain connected");
         assert_eq!(album.id, "telegram_100_101");
-        assert_eq!(album.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(album.attachments.len(), 2);
         assert!(album.content.contains("compare these"));
         assert_eq!(follow_up.content, "after album");
         assert!(rx.try_recv().is_err(), "album must dispatch exactly once");
@@ -21844,7 +21827,7 @@ mod tests {
             .expect("album a should dispatch")
             .expect("listener should remain connected");
         assert_eq!(album_a.id, "telegram_100_101");
-        assert_eq!(album_a.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(album_a.attachments.len(), 2);
 
         // 3. Album B arrives as one single turn containing all 3 photos,
         // because its settlement was held until the saturated page boundary
@@ -21855,7 +21838,7 @@ mod tests {
             .expect("listener should remain connected");
         assert_eq!(album_b.id, "telegram_100_199");
         assert_eq!(
-            album_b.content.matches("[IMAGE:").count(),
+            album_b.attachments.len(),
             3,
             "album b must include all 3 photos across the page boundary in a single turn"
         );
@@ -22114,7 +22097,7 @@ mod tests {
             .expect("album a should dispatch")
             .expect("listener should remain connected");
         assert_eq!(album_a.id, "telegram_100_101");
-        assert_eq!(album_a.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(album_a.attachments.len(), 2);
 
         // 3. Album B arrives once, with the photo from update 99 and the photo
         // from update 101 in the same turn. Settling it from the replayed page
@@ -22125,7 +22108,7 @@ mod tests {
             .expect("listener should remain connected");
         assert_eq!(album_b.id, "telegram_100_199");
         assert_eq!(
-            album_b.content.matches("[IMAGE:").count(),
+            album_b.attachments.len(),
             2,
             "album b must include both photos spanning the page boundary in a single turn"
         );
@@ -22289,7 +22272,7 @@ mod tests {
             .expect("listener should remain connected");
         assert_eq!(album.id, "telegram_100_100");
         assert_eq!(
-            album.content.matches("[IMAGE:").count(),
+            album.attachments.len(),
             2,
             "both supported photos must arrive in one turn: {}",
             album.content
@@ -22455,21 +22438,21 @@ mod tests {
         );
 
         assert_eq!(
-            msg.content.matches("[IMAGE:").count(),
+            msg.attachments.len(),
             2,
             "both supported image markers must be present"
         );
-        let first_marker = msg
-            .content
-            .find("photo_-100_10")
-            .expect("first photo marker");
-        let second_marker = msg
-            .content
-            .find("photo_-100_12")
-            .expect("second photo marker");
         assert!(
-            first_marker < second_marker,
-            "image markers must stay in message_id order"
+            msg.attachments[0]
+                .reference_target()
+                .unwrap()
+                .contains("photo_-100_10")
+        );
+        assert!(
+            msg.attachments[1]
+                .reference_target()
+                .unwrap()
+                .contains("photo_-100_12")
         );
         assert_eq!(
             msg.content.matches("@mybot compare these").count(),
@@ -22566,7 +22549,14 @@ mod tests {
             "mention_only album whose only mention is on an unsupported member must still be admitted",
         );
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "the supported sibling must still be dispatched"
         );
     }
@@ -22746,7 +22736,7 @@ mod tests {
         );
         assert_eq!(msg.reply_target, "-100:77");
         assert_eq!(msg.thread_ts.as_deref(), Some("77"));
-        assert_eq!(msg.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(msg.attachments.len(), 2);
         assert_eq!(
             msg.attachments.len(),
             2,
@@ -22754,13 +22744,29 @@ mod tests {
         );
         assert!(msg.attachments.iter().all(|attachment| {
             attachment
-                .marker
+                .reference
                 .as_ref()
-                .is_some_and(|marker| marker.kind == zeroclaw_api::media::MarkerKind::Image)
+                .is_some_and(|marker| marker.kind == zeroclaw_api::media::AttachmentKind::Image)
                 && !attachment.data.is_empty()
         }));
-        let first_pos = msg.content.find("photo_-100_10.jpg").unwrap();
-        let second_pos = msg.content.find("photo_-100_11.jpg").unwrap();
+        let targets: Vec<&str> = msg
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.target.as_str())
+            })
+            .collect();
+        let first_pos = targets
+            .iter()
+            .position(|target| target.contains("photo_-100_10.jpg"))
+            .unwrap();
+        let second_pos = targets
+            .iter()
+            .position(|target| target.contains("photo_-100_11.jpg"))
+            .unwrap();
         assert!(
             first_pos < second_pos,
             "attachments follow message_id order"
@@ -22859,7 +22865,6 @@ mod tests {
             "both documents should materialize",
         );
 
-        assert_eq!(msg.content.matches("[Document: report.pdf]").count(), 2);
         assert_eq!(msg.attachments.len(), 2);
         assert!(
             msg.attachments
@@ -22872,15 +22877,27 @@ mod tests {
         let second_path = save_dir.join("document_100_11_report.pdf");
         assert_eq!(tokio::fs::read(&first_path).await.unwrap(), b"first");
         assert_eq!(tokio::fs::read(&second_path).await.unwrap(), b"second");
-        assert!(msg.content.contains(&first_path.display().to_string()));
-        assert!(msg.content.contains(&second_path.display().to_string()));
+        assert!(msg.attachments.iter().any(|attachment| {
+            attachment
+                .reference
+                .as_ref()
+                .is_some_and(|reference| reference.target == first_path.display().to_string())
+        }));
+        assert!(msg.attachments.iter().any(|attachment| {
+            attachment
+                .reference
+                .as_ref()
+                .is_some_and(|reference| reference.target == second_path.display().to_string())
+        }));
     }
 
     #[tokio::test]
     async fn media_group_rejects_mixed_sender_before_download() {
         use wiremock::MockServer;
 
-        let server = MockServer::start().await;
+        // A pooled listener can receive a late request from its previous fixture.
+        // This test asserts zero requests, so give it an exclusive listener.
+        let server = MockServer::builder().start().await;
         let workspace = tempfile::tempdir().unwrap();
         let channel = TelegramChannel::new(
             "fake-token".into(),
@@ -22913,7 +22930,7 @@ mod tests {
     async fn media_group_rejects_captionless_video_with_mixed_sender_or_thread_before_download() {
         use wiremock::MockServer;
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let workspace = tempfile::tempdir().unwrap();
         let channel = TelegramChannel::new(
             "fake-token".into(),
@@ -22982,22 +22999,6 @@ mod tests {
 
     // ── Attachment content format tests ──────────────────────────────
 
-    /// Build a typed envelope for content-format tests.
-    fn envelope(
-        file_name: &str,
-        mime_type: Option<&str>,
-        data: &[u8],
-    ) -> zeroclaw_api::media::MediaAttachment {
-        zeroclaw_api::media::MediaAttachment {
-            file_name: file_name.to_string(),
-            data: data.to_vec(),
-            mime_type: mime_type.map(str::to_string),
-            marker: None,
-        }
-    }
-
-    /// Photo attachments with image extension must use `[IMAGE:/path]` marker
-    /// so the multimodal pipeline validates vision capability on the model_provider.
     #[test]
     fn media_group_document_storage_names_are_safe_and_unique() {
         let display = safe_attachment_filename("../reports/report.pdf");
@@ -23008,310 +23009,36 @@ mod tests {
         );
     }
 
-    /// Photo attachments with image extension must use `[IMAGE:/path]` marker
-    /// so the multimodal pipeline validates vision capability on the model_provider.
     #[test]
-    fn attachment_photo_content_uses_image_marker() {
-        let local_path = std::path::Path::new("/tmp/workspace/photo_123_45.jpg");
-
-        let content =
-            format_attachment_content(&envelope("photo_123_45.jpg", None, &[]), local_path);
-
-        assert_eq!(content, "[IMAGE:/tmp/workspace/photo_123_45.jpg]");
-        assert!(content.starts_with("[IMAGE:"));
-        assert!(content.ends_with(']'));
-    }
-
-    #[test]
-    fn attachment_document_content_uses_document_label() {
-        let local_path = std::path::Path::new("/tmp/workspace/report.pdf");
-
-        let content = format_attachment_content(
-            &envelope("report.pdf", Some("application/pdf"), &[]),
-            local_path,
-        );
-
-        assert_eq!(content, "[Document: report.pdf] /tmp/workspace/report.pdf");
-        assert!(!content.contains("[IMAGE:"));
-    }
-
-    /// An image sent "as file" must get the `[IMAGE:]` marker even without an
-    /// image extension, as long as the loader can resolve the payload to a
-    /// format it accepts. The marker keeps the media pipeline from re-inlining
-    /// the same image as base64.
-    #[test]
-    fn image_document_content_uses_image_marker() {
-        let local_path = std::path::Path::new("/tmp/workspace/telegram_files/upload");
-
-        // Magic bytes only: no MIME, no extension. The loader sniffs the same
-        // bytes and reaches the same verdict.
-        let content = format_attachment_content(
-            &envelope("upload", None, &[0xFF, 0xD8, 0xFF, 0xE0]),
-            local_path,
-        );
-        assert_eq!(content, "[IMAGE:/tmp/workspace/telegram_files/upload]");
-
-        // The sender's declared MIME travels with the envelope but the loader
-        // never sees it for a path marker: it resolves extension then magic.
-        // A declared type alone therefore cannot earn a marker the loader
-        // would reject.
-        let content = format_attachment_content(
-            &envelope("upload", Some("image/jpeg"), b"not actually an image"),
-            local_path,
-        );
-        assert!(
-            content.starts_with("[Document:"),
-            "a declared MIME must not outvote the loader's own resolution: {content}"
-        );
-    }
-
-    /// Formats the multimodal loader cannot normalize must stay documents.
-    /// Marking them would be strictly worse than not marking them: preparation
-    /// drops the rejected marker for a "could not be loaded" note, and the
-    /// `[Document:]` line that would have kept the saved path reachable was
-    /// never emitted, so both the bytes and the path are lost.
-    #[test]
-    fn unloadable_image_formats_stay_documents() {
-        for (filename, data) in [
-            ("photo.heic", &b"\x00\x00\x00\x18ftypheic"[..]),
-            ("scan.tiff", &b"\x49\x49\x2a\x00rest"[..]),
-            (
-                "logo.svg",
-                &b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"[..],
-            ),
-            ("old.bmp", &b"BMxxxx"[..]),
-        ] {
-            let path_str = format!("/tmp/ws/{filename}");
-            let path = std::path::Path::new(&path_str);
-            let content = format_attachment_content(&envelope(filename, None, data), path);
-            assert!(
-                content.starts_with("[Document:"),
-                "{filename}: unloadable image must stay a document, got: {content}"
-            );
-            assert!(
-                content.contains(&path_str),
-                "{filename}: the saved path must remain reachable, got: {content}"
-            );
-        }
-    }
-
-    /// An extensionless upload whose magic bytes are an unloadable format is
-    /// rejected the same way, so sniffing cannot smuggle one past the gate.
-    #[test]
-    fn unloadable_magic_bytes_stay_documents() {
-        let path = std::path::Path::new("/tmp/ws/upload");
-        let content =
-            format_attachment_content(&envelope("upload", None, b"\x49\x49\x2a\x00rest"), path);
-        assert!(
-            content.starts_with("[Document:"),
-            "TIFF magic must not earn an image marker: {content}"
-        );
-    }
-
-    /// A `.md` upload is text, so no envelope signal ever classifies it as an
-    /// image and it must never produce an `[IMAGE:]` marker.
-    #[test]
-    fn markdown_file_never_produces_image_marker() {
-        let local_path = std::path::Path::new("/tmp/workspace/telegram_files/notes.md");
-
-        // No envelope signal says image, so even a Telegram misclassification
-        // (photo vs document) cannot produce an [IMAGE:] marker: the verdict
-        // comes from the envelope, not from Telegram's kind.
-        let content = format_attachment_content(
-            &envelope("notes.md", None, b"# heading\nbody text"),
-            local_path,
-        );
-        assert!(
-            !content.contains("[IMAGE:"),
-            "markdown must not get [IMAGE:] marker: {content}"
-        );
-        assert!(content.starts_with("[Document:"));
-    }
-
-    /// Non-image files fall back to `[Document:]` format regardless of how
-    /// Telegram classified them (the envelope decides, not the kind).
-    #[test]
-    fn non_image_attachment_falls_back_to_document_format() {
-        for (filename, ext_path) in [
-            ("file.md", "/tmp/ws/file.md"),
-            ("file.txt", "/tmp/ws/file.txt"),
-            ("file.pdf", "/tmp/ws/file.pdf"),
-            ("file.csv", "/tmp/ws/file.csv"),
-            ("file.json", "/tmp/ws/file.json"),
-            ("file.zip", "/tmp/ws/file.zip"),
-            ("file", "/tmp/ws/file"),
-        ] {
-            let path = std::path::Path::new(ext_path);
-            let content =
-                format_attachment_content(&envelope(filename, None, b"not image bytes"), path);
-            assert!(
-                !content.contains("[IMAGE:"),
-                "{filename}: non-image file should not get [IMAGE:] marker, got: {content}"
-            );
-            assert!(
-                content.starts_with("[Document:"),
-                "{filename}: should use [Document:] format, got: {content}"
-            );
-        }
-    }
-
-    /// Every extension the multimodal loader accepts produces an `[IMAGE:]`
-    /// marker. The list is exactly the loader's, not a wider "looks like an
-    /// image" set — see `unloadable_image_formats_stay_documents`.
-    #[test]
-    fn image_extensions_produce_image_marker() {
-        for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
-            let filename = format!("photo_1_2.{ext}");
-            let path_str = format!("/tmp/ws/{filename}");
-            let path = std::path::Path::new(&path_str);
-            let content = format_attachment_content(&envelope(&filename, None, &[]), path);
-            assert!(
-                content.starts_with("[IMAGE:"),
-                "{ext}: image should get [IMAGE:] marker, got: {content}"
-            );
-        }
-    }
-
-    #[test]
-    fn markdown_attachment_not_detected_by_multimodal_image_markers() {
-        let content = format_attachment_content(
-            &envelope("notes.md", None, b"# heading"),
-            std::path::Path::new("/tmp/ws/notes.md"),
-        );
-        let messages = vec![zeroclaw_providers::ChatMessage::user(content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&messages),
-            0,
-            "markdown file must not trigger image marker detection"
-        );
-    }
-
-    /// `count_image_markers` from the multimodal module must detect the
-    /// `[IMAGE:]` marker produced by photo attachment formatting.
-    #[test]
-    fn photo_image_marker_detected_by_multimodal() {
-        let photo_content = "[IMAGE:/tmp/workspace/photo_1_2.jpg]";
-        let messages = vec![zeroclaw_providers::ChatMessage::user(
-            photo_content.to_string(),
-        )];
-        let count = zeroclaw_providers::multimodal::count_image_markers(&messages);
+    fn photo_attachment_detected_by_multimodal() {
+        let messages = vec![
+            zeroclaw_providers::ChatMessage::user("").with_attachments(vec![AttachmentReference {
+                kind: AttachmentKind::Image,
+                target: "/tmp/workspace/photo_1_2.jpg".into(),
+            }]),
+        ];
+        let count = zeroclaw_providers::multimodal::count_image_attachments(&messages);
         assert_eq!(
             count, 1,
-            "multimodal should detect exactly one image marker"
+            "multimodal should detect exactly one image attachment"
         );
     }
 
     #[test]
-    fn photo_image_marker_with_caption() {
-        let local_path = std::path::Path::new("/tmp/workspace/photo_1_2.jpg");
-        let mut content = format!("[IMAGE:{}]", local_path.display());
+    fn photo_attachment_with_caption() {
         let caption = "Look at this screenshot";
-        use std::fmt::Write;
-        let _ = write!(content, "\n\n{caption}");
-
+        let messages = vec![
+            zeroclaw_providers::ChatMessage::user(caption).with_attachments(vec![
+                AttachmentReference {
+                    kind: AttachmentKind::Image,
+                    target: "/tmp/workspace/photo_1_2.jpg".into(),
+                },
+            ]),
+        ];
+        assert_eq!(messages[0].content, caption);
         assert_eq!(
-            content,
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nLook at this screenshot"
-        );
-
-        // Multimodal pipeline still detects the marker.
-        let messages = vec![zeroclaw_providers::ChatMessage::user(content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&messages),
+            zeroclaw_providers::multimodal::count_image_attachments(&messages),
             1
-        );
-    }
-
-    // ── E2E: attachment saves file and formats content ───────────────
-
-    #[test]
-    fn e2e_attachment_saves_file_and_formats_content() {
-        let workspace = tempfile::tempdir().expect("create temp workspace");
-
-        // ── Document attachment ──────────────────────────────────────
-        let doc_filename = "report.pdf";
-        let doc_path = workspace.path().join(doc_filename);
-        // Simulate downloaded file.
-        std::fs::write(&doc_path, b"%PDF-1.4 fake").expect("write doc fixture");
-        assert!(doc_path.exists(), "document file must exist on disk");
-
-        let doc_content = format_attachment_content(
-            &envelope(doc_filename, Some("application/pdf"), b"%PDF-1.4 fake"),
-            &doc_path,
-        );
-        assert!(
-            doc_content.starts_with("[Document: report.pdf]"),
-            "document label format mismatch: {doc_content}"
-        );
-        // Multimodal must NOT detect image markers in document content.
-        let doc_msgs = vec![zeroclaw_providers::ChatMessage::user(doc_content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&doc_msgs),
-            0,
-            "document content must not contain image markers"
-        );
-
-        // ── Photo attachment ─────────────────────────────────────────
-        let photo_filename = "photo_99_1.jpg";
-        let photo_path = workspace.path().join(photo_filename);
-        // Copy the JPEG fixture.
-        let fixture =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_photo.jpg");
-        std::fs::copy(&fixture, &photo_path).expect("copy photo fixture");
-        assert!(photo_path.exists(), "photo file must exist on disk");
-
-        let photo_bytes = std::fs::read(&photo_path).expect("read photo fixture");
-        let photo_content =
-            format_attachment_content(&envelope(photo_filename, None, &photo_bytes), &photo_path);
-        assert!(
-            photo_content.starts_with("[IMAGE:"),
-            "photo must use [IMAGE:] marker: {photo_content}"
-        );
-        assert!(
-            photo_content.ends_with(']'),
-            "photo marker must close with ]: {photo_content}"
-        );
-
-        // Multimodal detects the marker.
-        let photo_msgs = vec![zeroclaw_providers::ChatMessage::user(photo_content.clone())];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&photo_msgs),
-            1,
-            "multimodal must detect exactly one image marker in photo content"
-        );
-
-        // ── Photo with caption ───────────────────────────────────────
-        let mut captioned = photo_content;
-        use std::fmt::Write;
-        let _ = write!(captioned, "\n\nCheck this out");
-        let cap_msgs = vec![zeroclaw_providers::ChatMessage::user(captioned.clone())];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&cap_msgs),
-            1,
-            "caption must not break image marker detection"
-        );
-        assert!(
-            captioned.contains("Check this out"),
-            "caption text must be present in content"
-        );
-
-        // ── Markdown file sent as Photo────────────────
-        let md_filename = "notes.md";
-        let md_path = workspace.path().join(md_filename);
-        std::fs::write(&md_path, b"# Hello\nSome markdown").expect("write md fixture");
-        let md_content = format_attachment_content(
-            &envelope(md_filename, None, b"# Hello\nSome markdown"),
-            &md_path,
-        );
-        assert!(
-            !md_content.contains("[IMAGE:"),
-            "markdown must not get [IMAGE:] marker: {md_content}"
-        );
-        let md_msgs = vec![zeroclaw_providers::ChatMessage::user(md_content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&md_msgs),
-            0,
-            "markdown file must not trigger image marker detection"
         );
     }
 
@@ -23335,14 +23062,18 @@ mod tests {
             "Groq model_provider must not support vision"
         );
 
-        // Build a message with an [IMAGE:] marker (as photo attachment would).
-        let messages = vec![zeroclaw_providers::ChatMessage::user(
-            "[IMAGE:/tmp/photo.jpg]\n\nDescribe this image".to_string(),
-        )];
-        let marker_count = zeroclaw_providers::multimodal::count_image_markers(&messages);
-        assert_eq!(marker_count, 1, "must detect image marker in photo content");
+        let messages = vec![
+            zeroclaw_providers::ChatMessage::user("Describe this image").with_attachments(vec![
+                AttachmentReference {
+                    kind: AttachmentKind::Image,
+                    target: "/tmp/photo.jpg".into(),
+                },
+            ]),
+        ];
+        let attachment_count = zeroclaw_providers::multimodal::count_image_attachments(&messages);
+        assert_eq!(attachment_count, 1);
 
-        // The combination of marker_count > 0 && !supports_vision() means
+        // The combination of attachment_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
         // the model_provider, and the channel will send "⚠️ Error: ..." to the user.
     }
@@ -24099,7 +23830,14 @@ mod tests {
         assert_eq!(msg.attachments[0].kind(), MediaKind::Image);
         assert_eq!(msg.attachments[0].data, photo_bytes);
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "content marker must still be emitted for the multimodal pipeline: {}",
             msg.content
         );
@@ -24167,7 +23905,14 @@ mod tests {
         // [Document:], so the media pipeline recognizes the file as already
         // marked instead of re-inlining it as base64.
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "image document must get an [IMAGE:] marker: {}",
             msg.content
         );
@@ -24237,12 +23982,22 @@ mod tests {
         // the content marker so downstream marker-based consumers (media
         // pipeline dedup) agree with the typed envelope.
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "extensionless image document must get an [IMAGE:] marker: {}",
             msg.content
         );
         assert!(
-            msg.content.contains("upload"),
+            msg.attachments[0]
+                .reference_target()
+                .unwrap()
+                .contains("upload"),
             "marker must carry the saved file path: {}",
             msg.content
         );
@@ -24659,6 +24414,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -24678,7 +24435,8 @@ mod tests {
                     ch.is_any_user_allowed(["other-user", "1002"]),
                     "-2001",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Rejected,
             );
             assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
@@ -24692,7 +24450,8 @@ mod tests {
                 ch.is_any_user_allowed(["operator", "1001"]),
                 "-2002",
             )
-            .await,
+            .await
+            .unwrap(),
             crate::util::PendingApprovalResolution::Rejected,
         );
         assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
@@ -24705,15 +24464,21 @@ mod tests {
                 ch.is_any_user_allowed(["operator", "1001"]),
                 "-2001",
             )
-            .await,
+            .await
+            .unwrap(),
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
 
         let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
             "approve-id".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: approve_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -24727,10 +24492,14 @@ mod tests {
                 ch.is_any_user_allowed(["operator", "1001"]),
                 "-2001",
             )
-            .await,
+            .await
+            .unwrap(),
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approve_rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[test]
@@ -24827,6 +24596,8 @@ mod tests {
         channel.pending_approvals.lock().await.insert(
             "approval-id".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: approval_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -24940,6 +24711,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -24953,8 +24726,11 @@ mod tests {
             "data": format!("approval:{approval_id}:approve"),
         });
 
-        ch.handle_approval_callback(&callback).await;
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        ch.handle_approval_callback(&callback).await.unwrap();
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -25204,6 +24980,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: resp_tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -25224,7 +25002,10 @@ mod tests {
 
         let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
         assert!(matches!(outcome, UpdateOutcome::Advanced));
-        assert_eq!(resp_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            resp_rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             rx.try_recv().is_err(),
             "a callback_query is terminal: no downstream message may be delivered"
@@ -25398,7 +25179,7 @@ mod tests {
             "message": { "message_id": 55, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
-        ch.handle_approval_callback(&callback).await;
+        ch.handle_approval_callback(&callback).await.unwrap();
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "no editMessageText may be sent");
@@ -25409,23 +25190,36 @@ mod tests {
 
     #[tokio::test]
     async fn routed_approval_times_out_when_prompt_delivery_exceeds_route_budget() {
-        use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path_regex(r"/bot[^/]+/sendMessage$"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(250))
-                    .set_body_json(serde_json::json!({
-                        "ok": true,
-                        "result": { "message_id": 66 }
-                    })),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/botfake-token/sendMessage",
+            axum::routing::post({
+                let sent = Arc::clone(&sent);
+                let release = Arc::clone(&release);
+                let requests = Arc::clone(&requests);
+                move || {
+                    let sent = Arc::clone(&sent);
+                    let release = Arc::clone(&release);
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        sent.notify_one();
+                        release.notified().await;
+                        axum::Json(serde_json::json!({
+                            "ok": true,
+                            "result": { "message_id": 66 }
+                        }))
+                    }
+                }
+            }),
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
         let ch = TelegramChannel::new(
             "fake-token".into(),
@@ -25433,7 +25227,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(format!("http://{address}"))
         .with_approval_timeout_secs(120);
 
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
@@ -25442,11 +25236,38 @@ mod tests {
             raw_arguments: None,
             position: None,
         };
-        let attributed = ch
-            .request_approval_attributed_with_timeout("12345", &request, Duration::from_millis(100))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut waiter = Box::pin(ch.request_approval_attributed_with_timeout(
+            "12345",
+            &request,
+            Duration::from_millis(100),
+        ));
+        let sent = sent.notified();
+        tokio::pin!(sent);
+        let hang_guard = std::time::Instant::now();
+        // Keep the paused clock from auto-advancing while real HTTP I/O starts.
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut sent => break,
+                result = &mut waiter => panic!("approval ended before prompt arrived: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert!(
+                hang_guard.elapsed() < LISTEN_HANG_GUARD,
+                "prompt never arrived"
+            );
+        }
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ch.pending_approvals.lock().await.len(), 1);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        // Tokio timers fire on millisecond ticks; cross the deadline by one tick.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let attributed = waiter.await.unwrap().unwrap();
+        assert_eq!(started.elapsed(), Duration::from_millis(101));
 
         assert_eq!(
             attributed.response,
@@ -25457,6 +25278,10 @@ mod tests {
             zeroclaw_api::channel::ApprovalSource::TimedOut
         );
         assert!(ch.pending_approvals.lock().await.is_empty());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.notify_one();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -25527,7 +25352,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(550)).await;
         pending
             .sender
-            .send(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+            .send(Ok(
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                    zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+                ),
+            ))
             .expect("claimed callback response receiver must remain live");
 
         let attributed = waiter.await.unwrap().unwrap().unwrap();
@@ -25558,6 +25387,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "a1".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -25566,9 +25397,13 @@ mod tests {
         // the callback claims the entry first and its response is already in
         // flight on the channel when the deadline fires
         let pending = ch.pending_approvals.lock().await.remove("a1").unwrap();
-        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = pending.sender.send(Ok(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ),
+        ));
 
-        let outcome = ch.resolve_after_deadline("a1", &mut rx).await;
+        let outcome = ch.resolve_after_deadline("a1", &mut rx).await.unwrap();
         assert_eq!(outcome.response, ChannelApprovalResponse::Approve);
         assert!(ch.pending_approvals.lock().await.is_empty());
     }
@@ -25589,13 +25424,15 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "a2".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
             },
         );
 
-        let outcome = ch.resolve_after_deadline("a2", &mut rx).await;
+        let outcome = ch.resolve_after_deadline("a2", &mut rx).await.unwrap();
         assert_eq!(outcome.response, ChannelApprovalResponse::Deny);
         assert!(
             ch.pending_approvals.lock().await.is_empty(),

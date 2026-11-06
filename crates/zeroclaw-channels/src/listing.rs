@@ -19,6 +19,11 @@ struct ChannelCompileSpec {
 // in the config crate's canonical channel inventory and that keys do not drift.
 const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
     ChannelCompileSpec {
+        schema_name: Some("SimpleX"),
+        type_keys: &["simplex"],
+        compiled: cfg!(feature = "channel-simplex"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Telegram"),
         type_keys: &["telegram"],
         compiled: cfg!(feature = "channel-telegram"),
@@ -294,6 +299,11 @@ mod tests {
     use super::{CHANNEL_COMPILE_SPECS, ChannelsConfig};
     use super::{compiled_channels, configured_uncompiled_channels, is_channel_type_compiled};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn empty_qr_pairing_channel_is_not_supported() {
+        assert!(super::qr_pairing_channel("").is_none());
+    }
 
     #[cfg(feature = "default-channels")]
     #[test]

@@ -2012,6 +2012,9 @@ fn v3_channel_types_covers_every_typed_channel_slot() {
     // they're folded into another channel type by a dedicated walker
     // step that runs before the alias-wrap loop.
     let folded_into_sibling: HashSet<&str> = ["feishu"].into_iter().collect();
+    // These channels were introduced with the aliased current schema and
+    // never had a V2 singular block. Keep the historical V2 walker frozen.
+    let introduced_after_v3: HashSet<&str> = ["simplex"].into_iter().collect();
 
     let typed_channel_slots: Vec<String> = Config::map_key_sections()
         .into_iter()
@@ -2030,6 +2033,7 @@ fn v3_channel_types_covers_every_typed_channel_slot() {
         .iter()
         .filter(|slot| !listed.contains(slot.as_str()))
         .filter(|slot| !folded_into_sibling.contains(slot.as_str()))
+        .filter(|slot| !introduced_after_v3.contains(slot.as_str()))
         .collect();
     missing.sort();
     assert!(
@@ -2041,6 +2045,23 @@ fn v3_channel_types_covers_every_typed_channel_slot() {
          under `folded_into_sibling` here.\n\nMissing slots: {:?}",
         missing
     );
+    for slot in introduced_after_v3 {
+        assert!(typed_channel_slots.iter().any(|s| s == slot));
+        assert!(!listed.contains(slot));
+    }
+}
+
+#[test]
+fn current_simplex_alias_round_trips_without_a_historical_alias_fold() {
+    let mut config = v3_config();
+    config
+        .channels
+        .simplex
+        .insert("personal".into(), Default::default());
+    let raw = toml::to_string(&config).unwrap();
+    let restored = migrate_to_current(&raw).unwrap();
+    assert!(restored.channels.simplex.contains_key("personal"));
+    assert!(!restored.channels.simplex.contains_key("default"));
 }
 
 // ─────────────────────────────────────────────────────────────

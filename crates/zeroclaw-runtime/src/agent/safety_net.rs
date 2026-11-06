@@ -53,6 +53,7 @@ fn mem_none(workspace: &Path) -> Arc<dyn Memory> {
 
 pub(super) fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(text.into()),
         tool_calls: vec![],
         usage: None,
@@ -71,6 +72,7 @@ pub(super) fn tool_call(id: &str, name: &str) -> ToolCall {
 
 pub(super) fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(String::new()),
         tool_calls: calls,
         usage: None,
@@ -109,6 +111,7 @@ pub(super) fn build_cost_context(
         CostTracker::new(
             zeroclaw_config::schema::CostConfig::default(),
             tmpdir.path(),
+            "jsonl",
         )
         .expect("CostTracker::new"),
     );
@@ -627,7 +630,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         history: &mut history,
         // Test transcripts start fresh: no prior trim, no crumb.
         history_has_trim_breadcrumb: &mut false,
-        injected_memory_preamble: &mut None,
+
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
@@ -1044,7 +1047,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 history: &mut history,
                 // Test transcripts start fresh: no prior trim, no crumb.
                 history_has_trim_breadcrumb: &mut false,
-                injected_memory_preamble: &mut None,
+
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -2855,7 +2858,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
         ),
         history: &mut history,
         history_has_trim_breadcrumb: &mut false,
-        injected_memory_preamble: &mut None,
+
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
@@ -3153,7 +3156,12 @@ async fn usage_event_coherent_tuple_vision_route() {
         let img_path = std::env::temp_dir()
             .join(format!("matrix_vision_{vision_window:?}.png").replace(['(', ')', ' '], "_"));
         std::fs::write(&img_path, b"fake-png-data").expect("write temp image");
-        let prompt = format!("Analyze this image: [IMAGE:{}]", img_path.display());
+        let prompt = ChatMessage::user("Analyze this image:").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (img_path.display()).to_string(),
+            },
+        ]);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
         let mut capture_agent = agent;
         let handle = zeroclaw_spawn::spawn!(async move {
@@ -3521,6 +3529,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
         crate::cost::CostTracker::new(
             zeroclaw_config::schema::CostConfig::default(),
             tmpdir.path(),
+            "jsonl",
         )
         .expect("CostTracker::new"),
     );
@@ -4060,7 +4069,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
         ),
         history: &mut history,
         history_has_trim_breadcrumb: &mut false,
-        injected_memory_preamble: &mut None,
+
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,

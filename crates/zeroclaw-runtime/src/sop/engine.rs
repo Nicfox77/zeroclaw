@@ -2338,13 +2338,41 @@ impl SopEngine {
         event: SopEvent,
         initiator: Option<&str>,
     ) -> Result<SopRunAction> {
+        self.start_run_for(sop_name, event, initiator, None)
+    }
+
+    /// [`Self::start_run_owned`] for a run started in a session pinned to its
+    /// owner: `memory_owner` is recorded on the run, so wherever it is driven
+    /// (including resumed on the headless driver after an approval) its audit
+    /// rows and its steps' memory stay on that owner's plane.
+    pub fn start_run_for(
+        &mut self,
+        sop_name: &str,
+        event: SopEvent,
+        initiator: Option<&str>,
+        memory_owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
+    ) -> Result<SopRunAction> {
         // A start is a two-phase operation: reserve the exec slot through the
         // authoritative store CAS (no side effect yet), then activate the reserved
         // slot into a live run and dispatch its first step. The phases are split so the
         // AMQP multi-match path can reserve the WHOLE matched batch before activating
         // any of it (see `dispatch`). A single start runs both phases back-to-back.
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event, initiator)
+        self.activate_reserved_run(reservation, event, initiator, memory_owner)
+    }
+
+    /// Scope a synchronous RPC effect to a view of the canonical store that
+    /// cannot wait behind a connection/writer lock while authority is held.
+    /// Restore the ordinary store on success and on every returned error.
+    pub(crate) fn with_nonblocking_store<T>(
+        &mut self,
+        effect: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let view = self.store.nonblocking()?;
+        let ordinary = std::mem::replace(&mut self.store, view);
+        let result = effect(self);
+        self.store = ordinary;
+        result
     }
 
     /// Start a headless-triggered run with a dispatch-decided execution mode.
@@ -2360,7 +2388,7 @@ impl SopEngine {
         let mut reservation = self.reserve_run_slot(sop_name)?;
         reservation.set_decisions(decisions);
         reservation.set_decided_mode(decided_mode);
-        self.activate_reserved_run(reservation, event, None)
+        self.activate_reserved_run(reservation, event, None, None)
     }
 
     /// Phase 1 of a start: reserve `sop_name`'s exec slot through the authoritative
@@ -2435,6 +2463,7 @@ impl SopEngine {
         reservation: StartReservation,
         event: SopEvent,
         initiator: Option<&str>,
+        memory_owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
     ) -> Result<SopRunAction> {
         let StartReservation {
             run_id,
@@ -2449,6 +2478,7 @@ impl SopEngine {
             run_id: run_id.clone(),
             sop_name: sop.name.clone(),
             initiating_agent: initiator.map(str::to_string),
+            memory_owner,
             trigger_event: event,
             frame_marker_id: new_marker_id(),
             status: SopRunStatus::Running,
@@ -5075,7 +5105,7 @@ impl SopEngine {
         // Reserve + activate through the shared two-phase start path (identical run_id
         // prefix, logging, and dispatch to the pre-refactor inline body).
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event, None)
+        self.activate_reserved_run(reservation, event, None, None)
     }
 
     pub fn drive_headless_deterministic(
@@ -5569,6 +5599,23 @@ impl SopEngine {
         };
         let result = self.capabilities.execute_step(ctx, step, input);
         self.metrics.record_capability_executed(&sop.name);
+        if let Err(error) = &result
+            && zeroclaw_api::session_events::capture::is_capture_stopped(error)
+        {
+            let mut fail_closed = step.clone();
+            fail_closed.on_failure = super::step_contract::StepFailure::Fail;
+            let message = error.to_string();
+            return self.record_deterministic_step_result(
+                run_id,
+                sop,
+                &fail_closed,
+                SopStepStatus::Failed,
+                message.clone(),
+                serde_json::Value::String(message),
+                started_at,
+                Some(now_iso8601()),
+            );
+        }
         let completed_at = Some(now_iso8601());
         match result {
             Ok(result) if result.success => self.record_deterministic_step_result(
@@ -9024,6 +9071,44 @@ mod tests {
     }
 
     #[test]
+    fn native_capture_unknown_never_routes_to_retry_or_failure_goto() {
+        struct UnknownLlm(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl super::super::capability::LlmGenerateAdapter for UnknownLlm {
+            fn generate(&self, _: Option<&str>, _: &str) -> std::result::Result<String, String> {
+                Err("fixture_unknown".into())
+            }
+            fn generate_typed(&self, _: Option<&str>, _: &str) -> Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::Error::msg("fixture_remote_outcome_unknown")
+                    .context(zeroclaw_api::session_events::capture::SessionCaptureStopped))
+            }
+        }
+        for policy in [StepFailure::Retry { max: 3 }, StepFailure::Goto { step: 2 }] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+            registry.register(super::super::capability::LlmGenerateCapability::new(Some(
+                Arc::new(UnknownLlm(calls.clone())),
+            )));
+            let mut sop = capability_checkpoint_sop("native-unknown");
+            sop.steps[0].capability = Some("llm.generate".into());
+            sop.steps[0].capability_input =
+                Some(serde_json::json!({"instruction":"fixture generation"}));
+            sop.steps[0].on_failure = policy;
+            let mut engine = engine_with_sops(vec![sop]).with_capabilities(Arc::new(registry));
+            let action = engine
+                .start_deterministic_run("native-unknown", manual_event())
+                .expect("durable failure");
+            let run_id = extract_run_id(&action).to_owned();
+            let action = engine
+                .drive_headless_deterministic(&run_id, action)
+                .expect("drive capability");
+            assert!(matches!(action, SopRunAction::Failed { .. }), "{action:?}");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(engine.active_runs().is_empty());
+        }
+    }
+
+    #[test]
     fn failed_step_retries_until_policy_limit() {
         let mut sop = test_sop("route-retry", SopExecutionMode::Auto, SopPriority::Normal);
         sop.steps[0].on_failure = StepFailure::Retry { max: 2 };
@@ -11515,6 +11600,7 @@ mod tests {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
                 initiating_agent: None,
+                memory_owner: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -11569,6 +11655,7 @@ mod tests {
                     run_id: run_id.to_string(),
                     sop_name: "s1".to_string(),
                     initiating_agent: None,
+                    memory_owner: None,
                     trigger_event: manual_event(),
                     frame_marker_id: "m".to_string(),
                     status: SopRunStatus::WaitingApproval,
@@ -11616,6 +11703,7 @@ mod tests {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
                 initiating_agent: None,
+                memory_owner: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::Running,
@@ -12303,6 +12391,7 @@ mod tests {
                 run_id: format!("restore-{i}"),
                 sop_name: "s1".to_string(),
                 initiating_agent: None,
+                memory_owner: None,
                 trigger_event: manual_event(),
                 frame_marker_id: format!("marker-{i}"),
                 status: SopRunStatus::Running,
@@ -12838,6 +12927,7 @@ mod tests {
             run_id: "run-001".into(),
             sop_name: "pump-shutdown".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-001".into(),
             status: SopRunStatus::Running,
@@ -12871,6 +12961,7 @@ mod tests {
                 run_id: "run-001".into(),
                 sop_name: name.into(),
                 initiating_agent: None,
+                memory_owner: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "marker-001".into(),
                 status: SopRunStatus::Running,
@@ -13761,6 +13852,7 @@ mod tests {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -13818,6 +13910,7 @@ mod tests {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -13890,6 +13983,7 @@ mod tests {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -15658,6 +15752,7 @@ mod tests {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
                 initiating_agent: None,
+                memory_owner: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -18677,6 +18772,7 @@ type = "manual"
             run_id: "r-restore".to_string(),
             sop_name: "deploy".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -18725,6 +18821,7 @@ type = "manual"
             run_id: "r-persist".to_string(),
             sop_name: "deploy".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -19325,6 +19422,7 @@ type = "manual"
             run_id: "r-done".to_string(),
             sop_name: "deploy".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

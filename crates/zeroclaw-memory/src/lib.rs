@@ -1,10 +1,10 @@
 #![allow(clippy::to_string_in_format_args)]
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
 
-/// Opening delimiter for recalled memory injected into provider context.
-pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
 /// Closing delimiter for recalled memory injected into provider context.
-pub const MEMORY_CONTEXT_CLOSE: &str = "[/Memory context]";
+pub use zeroclaw_api::model_provider::MEMORY_CONTEXT_CLOSE;
+/// Opening delimiter for recalled memory injected into provider context.
+pub use zeroclaw_api::model_provider::MEMORY_CONTEXT_OPEN;
 
 pub mod agent_scoped;
 pub mod agent_scoped_markdown;

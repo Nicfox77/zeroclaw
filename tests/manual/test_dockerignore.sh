@@ -51,6 +51,8 @@ MUST_EXCLUDE=(
     "LICENSE"
     ".env"
     ".tmp_*"
+    "tmp/"
+    ".cache/"
 )
 
 for pattern in "${MUST_EXCLUDE[@]}"; do

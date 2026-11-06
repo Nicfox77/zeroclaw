@@ -27,6 +27,7 @@ enum PacedOp {
         message_id: String,
         text: String,
         suppress_voice: bool,
+        force_voice: bool,
     },
 }
 
@@ -57,9 +58,16 @@ impl PacedOp {
                 message_id,
                 text,
                 suppress_voice,
+                force_voice,
             } => {
                 inner
-                    .finalize_draft(&recipient, &message_id, &text, suppress_voice)
+                    .finalize_draft_with_modality(
+                        &recipient,
+                        &message_id,
+                        &text,
+                        suppress_voice,
+                        force_voice,
+                    )
                     .await
             }
         }
@@ -413,6 +421,30 @@ impl Channel for PacedChannel {
         self.inner.update_draft(recipient, message_id, text).await
     }
 
+    async fn stream_voice_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        phase: usize,
+        text: &str,
+        finished: bool,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .stream_voice_draft(recipient, message_id, phase, text, finished)
+            .await
+    }
+
+    async fn prepare_voice_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        self.inner
+            .prepare_voice_draft(recipient, message_id, text)
+            .await
+    }
+
     async fn update_draft_progress(
         &self,
         recipient: &str,
@@ -488,6 +520,29 @@ impl Channel for PacedChannel {
             message_id: message_id.to_string(),
             text: text.to_string(),
             suppress_voice,
+            force_voice: false,
+        })
+        .await
+    }
+
+    fn supports_voice_draft_finalization(&self) -> bool {
+        self.inner.supports_voice_draft_finalization()
+    }
+
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        force_voice: bool,
+    ) -> Result<()> {
+        self.paced_dispatch(PacedOp::FinalizeDraft {
+            recipient: recipient.to_string(),
+            message_id: message_id.to_string(),
+            text: text.to_string(),
+            suppress_voice,
+            force_voice,
         })
         .await
     }
@@ -590,6 +645,17 @@ impl Channel for PacedChannel {
         timeout: Duration,
     ) -> Result<Option<String>> {
         self.inner.request_choice(question, choices, timeout).await
+    }
+
+    async fn request_choice_outcome(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: Duration,
+    ) -> Result<zeroclaw_api::channel::ChannelChoiceOutcome> {
+        self.inner
+            .request_choice_outcome(question, choices, timeout)
+            .await
     }
 
     async fn request_multi_choice(

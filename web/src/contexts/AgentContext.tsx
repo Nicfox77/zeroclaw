@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import type {
   ApprovalDecision,
+  AttachmentReference,
   PendingApproval,
   SessionMessagesResponse,
   WsMessage,
@@ -51,6 +52,8 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
   content: string;
+  attachments?: AttachmentReference[];
+  fileIds?: string[];
   thinking?: string;
   markdown?: boolean;
   toolCall?: ToolCallInfo;
@@ -74,7 +77,7 @@ export interface ChatMessage {
 
 export interface AgentContextValue {
   messages: ChatMessage[];
-  sendMessage: (content: string) => void;
+  sendMessage: (content: string, attachments?: AttachmentReference[]) => void;
   connected: boolean;
   error: string | null;
   typing: boolean;
@@ -191,7 +194,7 @@ export interface SessionSocket {
   connect(): void;
   disconnect(): void;
   readonly connected: boolean;
-  sendMessage(content: string): void;
+  sendMessage(content: string, attachments?: AttachmentReference[]): void;
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
 }
 
@@ -199,7 +202,7 @@ export interface AgentSessionRuntime {
   createSocket(options: { agentAlias: string; sessionId: string }): SessionSocket;
   getMessages(sessionId: string): Promise<SessionMessagesResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
-  rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
+  rename(sessionId: string, name: string): Promise<{ session_id: string; title: string }>;
   mintId(): string;
 }
 
@@ -287,6 +290,9 @@ export function AgentProvider({
   const sessionPersistenceRef = useRef(sessionPersistence);
   const typingRef = useRef(typing);
   const sessionRuntimeRef = useRef(sessionRuntime);
+  // The server owns routing to an opt-in shared conversation. Reuse the
+  // ordinary session transition after its callback has been declared below.
+  const canonicalSessionRef = useRef<((id: string) => void) | null>(null);
   activeSessionIdRef.current = sessionId;
   sessionPersistenceRef.current = sessionPersistence;
   typingRef.current = typing;
@@ -396,6 +402,10 @@ export function AgentProvider({
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
       case 'session_start':
+        if (msg.session_id && msg.session_id !== activeSessionIdRef.current) {
+          canonicalSessionRef.current?.(msg.session_id);
+        }
+        break;
       case 'connected':
         break;
 
@@ -905,10 +915,10 @@ export function AgentProvider({
     };
   }, [modelInfoVersion, agentAlias]);
 
-  const sendMessage = useCallback((content: string) => {
+  const sendMessage = useCallback((content: string, attachments: AttachmentReference[] = []) => {
     if (!wsRef.current?.connected) return;
     try {
-      wsRef.current.sendMessage(content);
+      wsRef.current.sendMessage(content, attachments);
 
       setTyping(true);
       foldTurnStream({ type: 'turn_start' });
@@ -919,6 +929,7 @@ export function AgentProvider({
           id: generateUUID(),
           role: 'user',
           content,
+          attachments,
           timestamp: new Date(),
           local: true,
         },
@@ -1079,8 +1090,6 @@ export function AgentProvider({
   }, [foldTurnStream]);
 
   const clearAllMessages = useCallback(() => {
-    resetTranscriptState();
-
     const sid = activeSessionIdRef.current;
     // Socket identity at the moment of the clear. If it changes while the
     // delete is in flight, a session switch (or another rebuild) has taken over
@@ -1102,12 +1111,18 @@ export function AgentProvider({
         // session persistence is disabled, or any transport failure, must not
         // block the local clear or the reconnect below.
         await sessionRuntimeRef.current.delete(sid);
-      } catch {
+      } catch (error) {
+        if (error instanceof ApiError && error.envelope.code === 'MAIN_SESSION_PROTECTED') {
+          if (activeSessionIdRef.current === sid) setError(error.envelope.message);
+          return;
+        }
         // Persistence disabled or request failed — proceed with the reconnect
         // so the live in-memory context is reset regardless.
       }
 
       if (wsRef.current !== wsAtClear) return;
+
+      resetTranscriptState();
 
       // Rebuild the socket so the backend constructs a new Agent with no seeded
       // history. Detach the old socket's callbacks first so its onClose does
@@ -1132,7 +1147,7 @@ export function AgentProvider({
         ws.connect();
       }
     })();
-  }, [agentAlias, attachSocketCallbacks, foldTurnStream]);
+  }, [agentAlias, attachSocketCallbacks, resetTranscriptState]);
 
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -1163,8 +1178,8 @@ export function AgentProvider({
     if (nextSessionId === currentSessionId) return false;
     // Unknown is deliberately denied alongside false. A failed or in-flight
     // hydration cannot prove there will be a persisted route back. The sole
-    // forced caller is a completed delete whose target is now active: that
-    // conversation no longer exists, so staying put is not a valid fallback.
+    // forced callers are a completed delete whose target is now active and
+    // the server's canonical session routing response during connection.
     if (!force && sessionPersistenceRef.current !== true) return false;
 
     if (typingRef.current) {
@@ -1196,6 +1211,8 @@ export function AgentProvider({
     onSessionChange?.(nextSessionId);
     return true;
   }, [agentAlias, onSessionChange, resetTranscriptState]);
+
+  canonicalSessionRef.current = (id: string) => { transitionToSession(id, true); };
 
   const goToSession = useCallback((nextSessionId: string): boolean => (
     transitionToSession(nextSessionId)

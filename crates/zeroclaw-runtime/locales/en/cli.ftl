@@ -418,6 +418,7 @@ channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured 
 channel-whatsapp-web-feature-missing-build =     Build/run with: cargo build --features whatsapp-web
 channel-whatsapp-web-feature-missing-install =     If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web
 channel-whatsapp-web-feature-missing-error = WhatsApp Web channel requires the 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)
+channel-simplex-not-configured-error = The SimpleX channel is not configured.
 
 channel-wecom-ws-stream-bootstrap = Working on it, please wait.
 channel-wecom-ws-stop-ack = Stopped the current message.
@@ -709,7 +710,7 @@ cli-quickstart-terminal-too-narrow = Quickstart needs a terminal at least {$min_
 cli-quickstart-terminal-too-short = Quickstart needs a terminal at least {$min_height} rows tall; the current terminal is {$height} rows. Make the terminal taller and try again.
 cli-quickstart-terminal-resized = The terminal changed from {$initial_width}x{$initial_height} to {$current_width}x{$current_height} while the Quickstart checklist was open. Reopen the checklist to continue.
 cli-quickstart-empty-checklist = Quickstart cannot open an empty checklist.
-cli-quickstart-cancelled = Quickstart cancelled. No config written.
+cli-quickstart-cancelled = Quickstart cancelled. Nothing was configured.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
 cli-quickstart-create-agent = ── Create agent
 cli-quickstart-create-agent-locked = ── Create agent (locked — fill every selector first)
@@ -1113,6 +1114,8 @@ cli-plugin-list-entry-failed = {$name} v{$version} — {$description} [does not 
 cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [no component to load]
 cli-config-migration-assumed-v1 = warning: {$path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it).
 cli-config-retired-key-removed = warning: dropped retired config key `{$key}` from {$path}: {$reason}
+cli-config-capped-key-lowered = warning: lowered config key `{$key}` in {$path} to its maximum: {$reason}
+cli-config-capped-reason-pairing-code-ttl = a pairing code stays redeemable for at most 600 seconds (10 minutes)
 cli-config-retired-reason-nevis = the Nevis IAM integration was removed; configure `[oidc.<alias>]` with `[users]` and `[permission_profiles]` instead
 cli-config-retired-reason-agent-tunable = agent-inline runtime tunables are no longer read; runtime profiles are authoritative, so set this key on the agent's `[runtime_profiles.<profile>]` instead
 cli-config-retired-reason-summary-model = the deprecated bare model id had no provider identity and was never read; `summary_provider` replaced it (context compression itself is not currently implemented in the runtime)
@@ -1127,6 +1130,7 @@ cli-config-retired-reason-global-fallback = the global fallback lists were remov
 cli-config-retired-reason-tts-default = there is no global default TTS provider; set `tts_provider` on each `[agents.<alias>]` instead
 cli-config-retired-reason-global-transcription = there is no global default transcription provider; set `transcription_provider` on each `[agents.<alias>]` instead
 cli-config-retired-reason-identity = identity is set per agent; move it to `[agents.<alias>.identity]`
+cli-config-retired-reason-pairing-max-pending = the gateway keeps one pending pairing code at a time, and issuing a new code cancels the previous one
 cli-config-migration-inferred-v3 = warning: {$path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file.
 cli-config-env-override-retired = warning: ignored `{$variable}`, which sets a retired config key: {$reason}
 cli-config-migration-pending = warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {$path}.
@@ -1379,6 +1383,8 @@ channel-runtime-progress-compacting-context = Compacting context
 channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-main-session-protected = This connection uses the continuous main conversation. Disable main_session before starting fresh.
+gateway-main-session-protected = The continuous main conversation cannot be deleted while main_session is enabled.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
 channel-runtime-stop-folded-followup = Nothing to stop here: this reply was merged into the earlier message it answers, which is still being processed. Send /stop in that conversation to cancel it.
@@ -1600,8 +1606,8 @@ cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: m
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
 cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
 cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
-cli-agent-vision-unsupported-by-fallback = received {$marker_count} image marker(s), but fallback model_provider={$fallback_name} does not support vision input
-cli-agent-vision-unsupported-by-provider = received {$marker_count} image marker(s), but this model_provider does not support vision input
+cli-agent-vision-unsupported-by-fallback = received {$marker_count} image reference(s), but fallback model_provider={$fallback_name} does not support vision input
+cli-agent-vision-unsupported-by-provider = received {$marker_count} image reference(s), but this model_provider does not support vision input
 cli-agent-error-provider-context-window = The request is too large for the selected model. Reduce the conversation or choose a model with a larger context window.
 cli-agent-error-provider-credentials-missing = The selected model provider has no configured credentials. Add its API key or choose another provider.
 cli-agent-error-provider-credentials-missing-named = The model provider {$provider} has no configured credentials. Add its API key or choose another provider.
@@ -1647,6 +1653,7 @@ sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: exe
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-principal-ceiling-required = Procedure execution requires an administrator until headless steps preserve the caller's principal restrictions.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
@@ -1740,11 +1747,25 @@ delegate-owned-background-unavailable = Background delegation and task managemen
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
+cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
 
 skill-http-request-timeout = HTTP request timed out
+sop-store-busy = SOP storage is busy or unavailable; retry the request.
+sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
+sop-rpc-definition-unavailable = The procedure definition is no longer available.
+cli-sop-run-unavailable = SOP run unavailable in this session.
+cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
+cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+channel-simplex-voice-note-failed = I couldn’t process that voice note. Please try again, or send your message as text.
+channel-simplex-voice-reply-failed = I couldn’t send the voice reply. The text response is available above.
+
+channel-simplex-playback-interrupted = [Live audio delivery report] The user interrupted spoken output. Completed segments at the sender: { $completed }. Interrupted segment (full text, only partly played): { $partial }. Playback stopped approximately { $played } ms into its { $duration } ms audio. Queued audio was discarded. Do not assume the user heard the remaining response. This is sender playback timing; phone/network buffering can shift the audible cutoff. The original generated response remains in history.
+channel-simplex-live-recognition-failed = Live speech recognition stopped. Please call again or send your message as text.

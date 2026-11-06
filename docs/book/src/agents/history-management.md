@@ -1,5 +1,128 @@
 # History management
 
+## Optional continuous main conversation
+
+An agent can use one durable main conversation across authenticated dashboard
+connections and explicitly bound Telegram direct chats. Other agents and
+unbound connections retain their normal session isolation. Enable this
+separately from the summary deck:
+
+```toml
+[agents.assistant.main_session]
+enabled = true
+web = true
+
+[agents.assistant.main_session.telegram]
+# Bot alias = owner's numeric Telegram user ID (illustrative value).
+personal = "10001"
+```
+
+Use your configured agent and bot aliases. The agent must already own
+`telegram.personal`, and its existing peer allowlist must admit that user.
+The binding uses Telegram's adapter-stamped numeric identity and only joins
+that user's direct chat; groups, topics, other bots and display usernames do
+not join. Dashboard connections must authenticate as a paired operator or
+administrator. Joining a conversation grants no additional tool permissions.
+All opted-in dashboard operator connections share this agent's main history;
+use a separate agent for a separate person's conversation.
+
+Gateway `require_pairing` must remain enabled for the Web binding. Both gateway
+and channel session persistence must be enabled for their respective bindings.
+They use the existing native session store under the
+same data directory, with the ID `main-session-<agent-alias>`. The daemon
+shares its execution coordinator across transports, so each turn refreshes
+the latest committed context after acquiring its execution lane. Concurrent
+messages are serialized; a stale browser or channel cache cannot replace a
+newer connection's conversation. The dashboard adopts the server's canonical
+session ID and loads its permanent history on reconnect. A Telegram exchange
+is visible on dashboard history reload; this option does not add live
+cross-channel transcript broadcasting.
+
+The main conversation is exempt from automatic idle expiry. Telegram `/new`
+and `/clear`, and dashboard deletion, refuse to reset it while the option is
+enabled. New dashboard session IDs resolve back to the same conversation.
+Summary rotation bounds the model's active context while original history
+continues to grow on disk. This is a continuous logical conversation, not an
+unlimited provider context window.
+
+Configure this on a dedicated personal agent. Existing isolated sessions are
+not merged automatically. Restart the daemon and reconnect clients after
+changing bindings. Disabling `main_session.enabled` restores ordinary routing;
+the main history stays retained and can be rejoined by enabling it again.
+Explicit history erasure and installation backups remain separate operator
+actions. The default is disabled, so existing installations keep their current
+session routing.
+
+## Optional asynchronous summary deck
+
+Native sessions can retain recent verbatim turns plus a rotating deck of older
+summaries. This policy is independent of permanent history: original messages,
+tool exchanges, identities and timestamps remain in the append-only session
+store when either raw context or an old summary leaves the provider request.
+
+Enable it on the runtime profile used by your agent:
+
+```toml
+[runtime_profiles.personal.summary_deck]
+enabled = true
+summary_share = 0.15
+trigger_ratio = 0.8
+max_summary_tokens = 1000
+timeout_secs = 60
+# Optional configured model-provider alias; otherwise use the session route.
+# provider = "openai.summarizer"
+```
+
+The default is disabled. Existing `max_context_tokens` and
+`context_compact_ratio` remain the overall budget controls. An explicit zero
+token budget disables automatic deck maintenance as well. Keep
+`max_history_messages` at four or more when enabling the deck.
+
+The implementation reserves 15% of the resolved input target for request
+overhead, then subtracts the current system messages. `summary_share` divides
+the remaining estimated token allowance between summaries and recent history.
+Summarization starts at `trigger_ratio` of the recent-history allowance, or
+the corresponding fraction of the whole-turn limit. Estimates use roughly
+four UTF-8 bytes per token, including structured tool arguments and reasoning;
+provider capacity enforcement remains authoritative. Source chunks, generated
+responses and the retained deck use the same byte-based fallback.
+
+One background job per session branch freezes an older range of completed
+turns, preserving the two newest turns and their complete tool exchanges.
+Inference runs without holding a SQLite transaction or the foreground turn
+lane. Oversized source ranges are split into bounded inference chunks without
+discarding their original messages. The generated summary is bounded and
+checked against its captured provider result before publication. The oldest
+cards leave the deck when its token allocation fills. Cards do not recursively
+fold the entire old deck into every new summary.
+
+Normal requests continue while inference runs. At the recent-context or turn
+limit, context preparation waits for the pending job. A failed, empty,
+oversized, unavailable or unauthorized summary never authorizes deleting the
+raw source. A protected turn that cannot fit still fails the normal capacity
+guard; an unlimited logical conversation does not enlarge a model's physical
+context window. Summaries are explicitly marked as generated historical data,
+carried in the protected user-role context slot for provider compatibility.
+They are never system instructions, approvals or long-term-memory writes.
+
+Source identities, captured inference output and the installed deck are
+durable session facts. A process crash cancels an unfinished local transform
+during normal session recovery; originals remain available and a subsequent
+request can schedule fresh summarization. It does not replay a provider or
+tool effect. A completed deck survives restart without regenerating it.
+Live policy and read/effect permissions are rechecked before publication.
+
+Summaries incur additional model calls. Their provider attempts are captured
+in session history and ordinary completed/failed attempt usage is recorded
+against the agent and session in the existing cost ledger. The foreground
+response's context meter still describes that response, not background usage.
+
+Turning the policy off stops new automatic summaries and retains the currently
+committed working context. Original history remains readable. Roll back the
+feature on the same native history foundation; reverting the foundation's
+one-way storage migration requires restoring its pre-migration backup, as
+described in [session events](../architecture/session-events.md).
+
 The runtime keeps conversation history for each agent session and sends a
 provider-facing working history to the model. Two complementary limits operate
 on different representations:
@@ -16,6 +139,39 @@ includes the assistant response and any tool calls and tool results before the
 next user message. Trimming therefore does not split a tool call from its
 result. A user message whose text happens to begin with `[Tool results]` is
 treated as part of the turn before it, not as a new turn.
+
+## Retained memory recall
+
+Recalled memories remain in the working context for all model providers. Each
+turn stores its selected snippets as a structured observation, separate from
+the user's literal message. Provider dispatch renders that observation as the
+existing `[Memory context]` block. Reconnects and restarts preserve it; normal
+turn trimming and summary-deck rotation determine when it leaves active context.
+
+Recall still runs against the new input using the existing scope, relevance,
+filtering and per-turn budgets. An unchanged observation already in active
+context is skipped before consuming the new-entry budget. Comparison uses the
+latest retained observation for each key, including its selected text and date.
+A changed value is appended with a later turn; earlier observations are never
+refreshed in place. Once its annotated turn leaves active context, a memory can
+be recalled again. Summaries may retain its meaning, but do not act as a second
+deduplication index.
+
+Between intentional context changes, adding a turn preserves earlier rendered
+recall blocks. This avoids memory-recall prefix edits that undermine provider
+prompt caching; cache availability and hits still depend on the provider.
+Compaction, tool-context collapse, system-prompt changes and other request
+changes can still invalidate a prefix. Retaining notes increases input tokens
+and can bring rotation forward. Their rendered bytes count toward context and
+summary budgets.
+
+The original transcript and user-message memory autosaves contain the raw user
+input, without injected recall. Current memory records and historical recall
+observations have different owners: editing or deleting a memory record does
+not rewrite a conversation that already received it. Native payload erasure
+can hide a stored observation, and summaries depending on it become unavailable.
+Erasing the original user source cannot resurrect it through a recall snapshot.
+There is no provider-specific toggle or additional configuration for this policy.
 
 ## Whole-turn retention
 
@@ -75,13 +231,23 @@ fallback remains available for safety calculations, but wire clients receive no
 `model_context_window` value for an unknown capacity.
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
-characters per token plus four framing tokens per message. This is a heuristic,
-not a provider tokenizer. Loadable `[IMAGE:...]` markers are charged a fixed
+UTF-8 bytes per token plus four framing tokens per message. Tool arguments,
+reasoning and structured message metadata contribute to this estimate. This is a heuristic,
+not a provider tokenizer. Loadable image attachments are charged a fixed
 per-image cost only in messages whose images are dispatched: user turns and the
 tool results of the current user turn. A tool result's images are the
 attachments the tool declared, not marker text in its output. Older tool
 results are priced as their message bytes, and system and
 assistant text is priced as text.
+
+Reported provider input-token usage calibrates the foreground request estimate
+conservatively upward for the same provider and model. Switching either route
+component resets that calibration. Usage describes the complete rendered request,
+including system text, tool schemas and protocol framing; it is not an immutable
+per-message token count. Different models can use different tokenizers, so stored
+messages and summary budgets still need an estimate before dispatch. Background
+summary usage remains in the cost ledger rather than calibrating a different
+foreground request.
 
 Proactive token-budget trimming runs before the first provider call of a turn
 when history already exceeds the effective budget and at provider-call

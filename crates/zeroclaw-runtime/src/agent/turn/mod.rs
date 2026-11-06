@@ -104,78 +104,15 @@ use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
-/// The injector's exact raw-history position, carried through prefix trims.
-#[derive(Clone)]
-pub struct MemoryPreamble {
-    pub preamble: String,
-    pub index: usize,
-}
-
-fn retention_layout(history: &[ChatMessage], crumb: bool) -> (usize, usize, bool) {
-    (
-        history.len(),
-        history
-            .iter()
-            .take_while(|message| message.role == "system")
-            .count(),
-        crumb,
-    )
-}
-
-fn remap_memory_after_trim(
-    injected: &mut Option<MemoryPreamble>,
-    before: (usize, usize, bool),
-    history: &[ChatMessage],
-    crumb: bool,
-) {
-    let inserted = usize::from(crumb && !before.2);
-    let dropped = before
-        .0
-        .saturating_add(inserted)
-        .saturating_sub(history.len());
-    let start = before.1 + usize::from(before.2);
-    if let Some(target) = injected {
-        if (start..start.saturating_add(dropped)).contains(&target.index) {
-            *injected = None;
-        } else if target.index >= start {
-            target.index = target
-                .index
-                .saturating_sub(dropped)
-                .saturating_add(inserted);
-        }
-    }
-}
-
 pub(crate) fn retained_context_snapshot(
-    injected: &Option<MemoryPreamble>,
     history: &[ChatMessage],
     breadcrumb: bool,
-) -> zeroclaw_api::agent::RetainedContextSnapshot {
-    retained_context_snapshot_with_memory(
-        history,
-        breadcrumb,
-        injected
-            .as_ref()
-            .map(|target| (target.preamble.as_str(), target.index)),
-    )
-}
-
-pub(crate) fn retained_context_snapshot_with_memory(
-    history: &[ChatMessage],
-    breadcrumb: bool,
-    injected: Option<(&str, usize)>,
 ) -> zeroclaw_api::agent::RetainedContextSnapshot {
     zeroclaw_api::agent::RetainedContextSnapshot {
         // Reuse the Agent's canonical replay path so native tool calls/results
         // stay typed and the owner-tracked memory provenance is honored by the
         // caller that has it. This is deliberately not a role-only projection.
-        retained_messages: injected
-            .map_or_else(
-                || crate::agent::Agent::replay_loop_messages_for_retention(history),
-                |(preamble, index)| {
-                    crate::agent::Agent::replay_loop_messages_with_memory(history, preamble, index)
-                },
-            )
+        retained_messages: crate::agent::Agent::replay_loop_messages_for_retention(history)
             .into_iter()
             .filter(|message| {
                 !matches!(
@@ -356,9 +293,7 @@ fn suppress_quarantined_provider_images(
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, message)| {
-            message.role == "user" && !message.content.trim_start().starts_with("[Tool results]")
-        })
+        .find(|(_, message)| message.role == "user")
         .map(|(index, message)| (index, message.clone()));
     let mut filtered =
         zeroclaw_providers::multimodal::omit_provider_image_ids(messages, quarantined);
@@ -396,9 +331,11 @@ mod provider_image_state_tests {
     use super::*;
 
     fn image_id(payload: &str) -> zeroclaw_providers::multimodal::ProviderImageId {
-        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user(format!(
-            "[IMAGE:data:image/png;base64,{payload}]"
-        ))])[0]
+        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user("")
+            .with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: format!("data:image/png;base64,{payload}").to_string(),
+            }])])[0]
     }
 
     fn image_ids(prefix: &str, count: usize) -> Vec<ProviderImageId> {
@@ -496,7 +433,12 @@ mod provider_image_state_tests {
     #[test]
     fn provider_image_recovery_view_includes_newest_unaccepted_image() {
         let image = "data:image/png;base64,AAAA";
-        let messages = vec![ChatMessage::user(format!("new [IMAGE:{image}]"))];
+        let messages = vec![ChatMessage::user("new").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: image.to_string(),
+            },
+        ])];
         let submitted = zeroclaw_providers::multimodal::provider_image_ids(&messages);
 
         let (recovery_messages, replaced) =
@@ -511,22 +453,32 @@ mod provider_image_state_tests {
     fn newest_user_resubmission_bypasses_only_its_own_suppression() {
         let image = "data:image/png;base64,AAAA";
         let messages = vec![
-            ChatMessage::user(format!("old [IMAGE:{image}]")),
+            ChatMessage::user("old").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image.to_string(),
+                },
+            ]),
             ChatMessage::assistant("retry it"),
-            ChatMessage::user(format!("new [IMAGE:{image}]")),
+            ChatMessage::user("new").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image.to_string(),
+                },
+            ]),
         ];
         let id = image_id("AAAA");
 
         let filtered = suppress_quarantined_provider_images(&messages, &[id], true);
 
-        assert!(!filtered[0].content.contains("[IMAGE:"));
-        assert!(filtered[2].content.contains("[IMAGE:"));
+        assert!(filtered[0].attachments.is_empty());
+        assert_eq!(filtered[2].attachments, messages[2].attachments);
 
         let continued = suppress_quarantined_provider_images(&messages, &[id], false);
         assert!(
             continued
                 .iter()
-                .all(|message| !message.content.contains("[IMAGE:"))
+                .all(|message| message.attachments.is_empty())
         );
     }
 }
@@ -874,18 +826,6 @@ pub struct ToolLoop<'a> {
     /// locale changes for the runtime's lifetime. Trim paths write back any
     /// crumb they insert through this reference.
     pub history_has_trim_breadcrumb: &'a mut bool,
-    /// Out-param the loop writes through when it injects a recalled-memory
-    /// preamble onto the last user message for this turn's provider request
-    /// only: the exact rendered block. Write-back strips that block solely
-    /// from the injected message's position in the mutated history buffer —
-    /// pre-injection canonical clones are replayed with no strip target, so
-    /// a genuine user text starting with the same block survives
-    /// byte-for-byte. The exact string (this turn's literal rendered
-    /// content, never a generic marker pattern) is what confirms the
-    /// recorded position still holds the injected message, following the
-    /// same recorded-not-inferred principle as
-    /// `history_has_trim_breadcrumb`.
-    pub injected_memory_preamble: &'a mut Option<MemoryPreamble>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -1157,14 +1097,58 @@ fn record_dispatch_trim(
 /// Drop at most one whole turn, then let the caller rebuild and recount the
 /// actual prepared request. Raw-history estimates cannot decide how many
 /// prepared turns fit, especially after hooks or multimodal expansion.
+async fn capture_oversized_dispatch_trim(
+    history: &mut Vec<ChatMessage>,
+    crumb_present: &mut bool,
+    reported_tokens: u64,
+    budget: usize,
+) -> Result<PreDispatchTrimResult> {
+    use zeroclaw_api::session_events::capture::{
+        ContextTransformIntent, current_provider_admission,
+    };
+    let capture = if budget > 0 && reported_tokens > budget as u64 {
+        match current_provider_admission() {
+            Some(port) => {
+                port.begin_context_transform(ContextTransformIntent {
+                    reason_key: "pre_dispatch_budget_trim".into(),
+                    algorithm_version: "whole-turn-budget/v1".into(),
+                    budget: budget as u64,
+                })
+                .await?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let result =
+        surface_oversized_dispatch_if_needed(history, crumb_present, reported_tokens, budget);
+    if let Some(capture) = capture {
+        if result.dropped_messages > 0 {
+            capture
+                .complete_snapshot(zeroclaw_api::session_events::capture::ContextSnapshot {
+                    messages: (history.clone())
+                        .into_iter()
+                        .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                        .collect(),
+                    history_has_trim_breadcrumb: Some(*crumb_present),
+                })
+                .await?;
+        } else {
+            capture
+                .failed("retention floor prevents local budget trim".into())
+                .await?;
+        }
+    }
+    Ok(result)
+}
+
 fn surface_oversized_dispatch_if_needed(
-    injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     crumb_present: &mut bool,
     measured_population: u64,
     context_token_budget: usize,
 ) -> PreDispatchTrimResult {
-    let before = retention_layout(history, *crumb_present);
     let outcome;
     let mut dropped_messages = 0;
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
@@ -1180,7 +1164,6 @@ fn surface_oversized_dispatch_if_needed(
             outcome = PreDispatchOutcome::Trimmed;
         }
     }
-    remap_memory_after_trim(injected_memory_preamble, before, history, *crumb_present);
     PreDispatchTrimResult {
         outcome,
         dropped_messages,
@@ -1191,7 +1174,6 @@ fn surface_oversized_dispatch_if_needed(
 
 #[allow(clippy::too_many_arguments)]
 async fn enforce_reported_budget(
-    injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
     // Estimated token count of the exact message population that produced
@@ -1213,7 +1195,7 @@ async fn enforce_reported_budget(
     agent_alias: Option<&str>,
     turn_id: &str,
     // The multimodal boundary the NEXT request will re-normalize retained
-    // history through. A short `[IMAGE:...]` marker in raw history can become a
+    // history through. A short structured image attachments marker in raw history can become a
     // large base64 provider payload, so selection and the recount must describe
     // the same provider-facing population actually sent next — not the raw
     // transcript the marker-only estimate sees.
@@ -1248,7 +1230,6 @@ async fn enforce_reported_budget(
         return;
     }
     let pre_trim_estimated = reported_population_estimated;
-    let retention_before = retention_layout(history, *crumb_present);
     let taken_had_crumb = *crumb_present;
     let taken = std::mem::take(history);
     let taken_len = taken.len();
@@ -1303,7 +1284,7 @@ async fn enforce_reported_budget(
     refresh_prompt_anchor(&mut trimmed, next_use_native_tools);
     // Re-trim against the provider-facing population. The initial raw-based
     // selection can no-op (or under-trim) when image markers make the raw
-    // estimate look small: a short `[IMAGE:...]` marker in raw history becomes a
+    // estimate look small: a short structured image attachments marker in raw history becomes a
     // large base64 provider payload on the next request. Re-normalize the
     // retained set through the multimodal boundary; while the calibrated
     // prepared count still exceeds the budget, drop the oldest whole turn and
@@ -1411,12 +1392,6 @@ async fn enforce_reported_budget(
             zeroclaw_api::agent::TokenCountSource::Calibrated,
         );
         *history = trimmed;
-        remap_memory_after_trim(
-            injected_memory_preamble,
-            retention_before,
-            history,
-            *crumb_present,
-        );
         if let Some(tx) = event_tx {
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
@@ -1434,11 +1409,7 @@ async fn enforce_reported_budget(
                     tokens_before_source: Some(tokens_before_source),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                     unsatisfiable_floor: None,
-                    retained_context: Some(retained_context_snapshot(
-                        injected_memory_preamble,
-                        history,
-                        *crumb_present,
-                    )),
+                    retained_context: Some(retained_context_snapshot(history, *crumb_present)),
                 })
                 .await;
         }
@@ -1560,11 +1531,9 @@ impl<'a> TurnState<'a> {
     /// the cursor.  Wraps `append_tool_round_to_history` + canonical sync.
     fn append_tool_round(
         &mut self,
-        assistant_history_content: String,
+        assistant_history_content: ChatMessage,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
         individual_results: &[results_collect::ToolRoundResult],
-        tool_results: &str,
-        use_native_tools: bool,
     ) {
         let from = self.history.len();
         crate::agent::turn::history_append::append_tool_round_to_history(
@@ -1572,8 +1541,6 @@ impl<'a> TurnState<'a> {
             assistant_history_content,
             native_tool_calls,
             individual_results,
-            tool_results,
-            use_native_tools,
         );
         if let Some(ref mut canonical) = self.canonical {
             canonical.extend_from_slice(&self.history[from..]);
@@ -1654,7 +1621,89 @@ pub fn run_tool_call_loop(
     run_tool_call_loop_impl(p, None, None, None)
 }
 
-async fn run_tool_call_loop_impl<'a>(
+fn run_tool_call_loop_impl<'a>(
+    p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> futures_util::future::BoxFuture<'a, Result<String>> {
+    Box::pin(async move {
+        use zeroclaw_api::session_events::capture::{
+            EngineTurnInput, current_provider_admission, current_session_execution,
+        };
+        if current_provider_admission().is_none()
+            && let Some(port) = current_session_execution()
+        {
+            let input = EngineTurnInput {
+                execution_workspace: None,
+                reply_route: None,
+                turn_id: p.turn_id.to_owned(),
+                agent_alias: p.agent_alias.map(str::to_owned),
+                ingress: p.ingress.clone(),
+                parts: zeroclaw_api::session_events::capture::EngineInputPart::text_and_files(
+                    p.memory
+                        .as_ref()
+                        .map(|memory| memory.query.clone())
+                        .or_else(|| {
+                            p.history
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == "user")
+                                .map(|message| message.content.clone())
+                        })
+                        .ok_or_else(|| {
+                            anyhow::Error::msg("session turn has no observed user input")
+                        })?,
+                    vec![],
+                ),
+                provider_ref: p.exec.model_access.provider_name.to_owned(),
+                model: p.exec.model_access.model.to_owned(),
+            };
+            let history = p.history;
+            let crumb = p.history_has_trim_breadcrumb;
+            let engine = async move {
+                let result = run_tool_call_loop_inner(
+                    ToolLoop {
+                        history: &mut *history,
+                        history_has_trim_breadcrumb: &mut *crumb,
+                        ..p
+                    },
+                    initial_ingress,
+                    seed_reported_usage,
+                    repetition_guard,
+                )
+                .await;
+                if let Some(admission) = current_provider_admission() {
+                    use zeroclaw_api::session_events::capture::{
+                        ContextSnapshot, ContextTransformIntent,
+                    };
+                    let transform = admission
+                        .begin_context_transform(ContextTransformIntent {
+                            reason_key: "turn_history_projection".into(),
+                            algorithm_version: "engine-history/v1".into(),
+                            budget: 0,
+                        })
+                        .await?
+                        .ok_or_else(|| anyhow::Error::msg("native context capture missing"))?;
+                    transform
+                        .complete_snapshot(ContextSnapshot {
+                            messages: (history.clone())
+                                .into_iter()
+                                .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                                .collect(),
+                            history_has_trim_breadcrumb: Some(*crumb),
+                        })
+                        .await?;
+                }
+                result
+            };
+            return port.execute(input, Box::pin(engine)).await;
+        }
+        run_tool_call_loop_inner(p, initial_ingress, seed_reported_usage, repetition_guard).await
+    })
+}
+
+async fn run_tool_call_loop_inner<'a>(
     mut p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
@@ -1670,7 +1719,7 @@ async fn run_tool_call_loop_impl<'a>(
         exec,
         history: raw_history,
         history_has_trim_breadcrumb,
-        injected_memory_preamble,
+
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -1756,6 +1805,25 @@ async fn run_tool_call_loop_impl<'a>(
 
     turn_state.sync_pending();
 
+    // Session-owned maintenance is shared by Web, channel and Agent callers.
+    // Previously retained recall observations participate in normal rotation.
+    if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution() {
+        let prepared = port
+            .prepare_context(zeroclaw_api::session_events::capture::ContextSnapshot {
+                messages: crate::agent::agent::Agent::replay_loop_messages_for_retention(
+                    turn_state.history,
+                ),
+                history_has_trim_breadcrumb: Some(turn_state.crumb_present),
+            })
+            .await?;
+        *turn_state.history = prepared
+            .messages
+            .iter()
+            .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
+            .collect();
+        turn_state.crumb_present = prepared.history_has_trim_breadcrumb.unwrap_or(false);
+    }
+
     let ingress_policy_cfg = IngressPolicy::default();
 
     // Stamp the initiating internal principal into the turn trace, keyed by
@@ -1815,15 +1883,12 @@ async fn run_tool_call_loop_impl<'a>(
             has_session,
             turn_memory.suppress,
         ) && let Some(last_user_idx) = turn_state.history.iter().rposition(|m| m.role == "user")
-            // Idempotence: a model-switch retry re-enters the engine with the
-            // same history; the preamble must not stack.
-            && !turn_state.history[last_user_idx]
-                .content
-                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+            // A retry reuses the typed observation, never a marker parsed from user text.
+            && turn_state.history[last_user_idx].recalled_memory.is_none()
         {
             let scopes: Vec<Option<&str>> =
                 turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
-            let context = crate::agent::memory_inject::render_memory_context(
+            let context = crate::agent::memory_inject::recall_memory_context(
                 turn_memory.handle,
                 observer,
                 &turn_memory.query,
@@ -1836,15 +1901,26 @@ async fn run_tool_call_loop_impl<'a>(
                     turn_id,
                     channel_name,
                 },
+                turn_state.history,
             )
             .await;
-            if !context.is_empty() {
-                let existing = &turn_state.history[last_user_idx].content;
-                turn_state.history[last_user_idx].content = format!("{context}{existing}");
-                *injected_memory_preamble = Some(MemoryPreamble {
-                    preamble: context,
-                    index: last_user_idx,
-                });
+            if !context.entries.is_empty() {
+                // Keep the canonical current-turn delta and its request view in
+                // sync. Historical messages and earlier recall snapshots are unchanged.
+                if let Some(canonical) = &mut turn_state.canonical
+                    && let Some(current) = canonical
+                        .iter_mut()
+                        .rev()
+                        .find(|message| message.role == "user")
+                {
+                    let input = &turn_state.history[last_user_idx];
+                    anyhow::ensure!(
+                        current.content == input.content && current.timestamp == input.timestamp,
+                        "recalled_memory_input_mismatch"
+                    );
+                    current.recalled_memory = Some(context.clone());
+                }
+                turn_state.history[last_user_idx].recalled_memory = Some(context);
             }
         }
     }
@@ -2025,8 +2101,8 @@ async fn run_tool_call_loop_impl<'a>(
                     // (do not append it) when it is.
                     IngressDecision::Drop { .. } => continue,
                 }
-                let msg = ChatMessage::user(steering_input.into_text());
-                has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
+                let msg = steering_input.into_message();
+                has_new_user_input |= msg.role != "tool";
                 turn_state.push_dual(msg);
             }
         }
@@ -2053,7 +2129,6 @@ async fn run_tool_call_loop_impl<'a>(
                         None => (None, None),
                     };
                     let summary_result = finish_after_max_iterations(
-                        injected_memory_preamble,
                         model_provider,
                         turn_state.history,
                         provider_name,
@@ -2253,7 +2328,9 @@ async fn run_tool_call_loop_impl<'a>(
             && provider_request_messages
                 .iter()
                 .zip(pre_hook_messages.iter())
-                .all(|(a, b)| a.role == b.role && a.content == b.content);
+                .all(|(a, b)| {
+                    a.role == b.role && a.content == b.content && a.timestamp == b.timestamp
+                });
         let hook_suffix = if hook_appended_suffix_only {
             provider_request_messages[pre_hook_messages.len()..].to_vec()
         } else {
@@ -2464,13 +2541,13 @@ async fn run_tool_call_loop_impl<'a>(
         // rebuilt post-hook request re-measured below is authoritative. A
         // floor is fatal only when the rebuilt request exceeds model capacity.
         // A newest turn above the proactive target can still be dispatched.
-        let mut trim_result = surface_oversized_dispatch_if_needed(
-            injected_memory_preamble,
+        let mut trim_result = capture_oversized_dispatch_trim(
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
             trim_budget,
-        );
+        )
+        .await?;
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
             || turn_state.crumb_present != crumb_before;
@@ -2502,9 +2579,9 @@ async fn run_tool_call_loop_impl<'a>(
             let mut tokens_after_dispatch = tokens_before_dispatch;
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
-                // Wire roles cannot identify turns: prompt-mode results are
-                // plain user messages. Remove precisely the durable source
-                // span, preserving prepared media and the hook suffix.
+                // The wire projection may change roles for text-only
+                // providers, so remove the durable source span from the
+                // structured history and preserve prepared media and hooks.
                 let removed_rows =
                     original_body_start..original_body_start + total_dropped_messages;
                 let mut trimmed_post_hook: Vec<_> = post_hook_snapshot
@@ -2568,13 +2645,13 @@ async fn run_tool_call_loop_impl<'a>(
                 // heuristic that decided the previous round stopped early.
                 let before_len = turn_state.history.len();
                 let before_crumb = turn_state.crumb_present;
-                trim_result = surface_oversized_dispatch_if_needed(
-                    injected_memory_preamble,
+                trim_result = capture_oversized_dispatch_trim(
                     turn_state.history,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
                     trim_budget,
-                );
+                )
+                .await?;
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
                 dropped_turns += usize::from(trim_result.dropped_messages > 0);
@@ -2614,7 +2691,6 @@ async fn run_tool_call_loop_impl<'a>(
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: exceeds_model_window.then_some(true),
                         retained_context: Some(retained_context_snapshot(
-                            injected_memory_preamble,
                             turn_state.history,
                             turn_state.crumb_present,
                         )),
@@ -2657,7 +2733,6 @@ async fn run_tool_call_loop_impl<'a>(
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: Some(true),
                         retained_context: Some(retained_context_snapshot(
-                            injected_memory_preamble,
                             turn_state.history,
                             turn_state.crumb_present,
                         )),
@@ -2812,6 +2887,18 @@ async fn run_tool_call_loop_impl<'a>(
             );
         }
 
+        use zeroclaw_api::session_events::capture::{
+            ProviderRouteSource, scope_provider_route_source,
+        };
+        let route_source = if hook_selected_model.is_some() {
+            ProviderRouteSource::BeforeCallHook
+        } else if vision_model_provider_box.is_some() {
+            ProviderRouteSource::Vision
+        } else if dispatch_model.starts_with("hint:") {
+            ProviderRouteSource::Routing
+        } else {
+            ProviderRouteSource::Configured
+        };
         let ProviderCallOutcome {
             chat_result,
             attempts,
@@ -2820,25 +2907,28 @@ async fn run_tool_call_loop_impl<'a>(
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            provider_dispatch_model,
-            zeroclaw_api::model_provider::ChatRequest {
-                messages: &provider_request_messages,
-                tools: request_tools,
-                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .try_with(Clone::clone)
-                    .ok()
-                    .flatten(),
-            },
-            image_recovery_messages.as_deref(),
-            should_consume_provider_stream,
-            policy,
-            iteration,
-            use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+        } = scope_provider_route_source(
+            route_source,
+            call_provider(
+                &ctx,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                provider_dispatch_model,
+                zeroclaw_api::model_provider::ChatRequest {
+                    messages: &provider_request_messages,
+                    tools: request_tools,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
+                image_recovery_messages.as_deref(),
+                should_consume_provider_stream,
+                policy,
+                iteration,
+                use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+            ),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -2981,7 +3071,6 @@ async fn run_tool_call_loop_impl<'a>(
                 emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
-                    injected_memory_preamble,
                     turn_state.history,
                     &e,
                     iteration,
@@ -2993,7 +3082,7 @@ async fn run_tool_call_loop_impl<'a>(
                     turn_id,
                     &mut turn_state.crumb_present,
                 )
-                .await;
+                .await?;
                 if recovered.recovered() {
                     continue;
                 }
@@ -3275,7 +3364,6 @@ async fn run_tool_call_loop_impl<'a>(
                 // modifying `before_llm_call` hook merely to estimate a request
                 // that will never be sent.
                 Box::pin(enforce_reported_budget(
-                    injected_memory_preamble,
                     turn_state.history,
                     reported as usize,
                     reported_population_estimated,
@@ -3355,10 +3443,12 @@ async fn run_tool_call_loop_impl<'a>(
             mut executable_indices,
             mut executable_calls,
             mut stream_calls,
+            capture_handles,
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
             activated_tools,
+            excluded_tools,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,
@@ -3392,12 +3482,13 @@ async fn run_tool_call_loop_impl<'a>(
                             repetition::call_signature(&name, &call.arguments) == warned_call
                         });
                 if recovery && recovery_admitted {
-                    call_prep::abandon_unexecuted_prepared_contexts(
+                    let _ = call_prep::abandon_unexecuted_prepared_contexts(
                         &ctx,
                         iteration,
                         &[call_idx],
                         std::slice::from_ref(&call),
                         &[],
+                        &capture_handles,
                     )
                     .await;
                     let outcome = crate::agent::tool_execution::ToolExecutionOutcome {
@@ -3490,6 +3581,10 @@ async fn run_tool_call_loop_impl<'a>(
             knobs.provider_attempt_allowlist.clone(),
             execution,
         );
+        let execution = zeroclaw_api::session_events::capture::scope_tool_batch(
+            capture_handles.clone(),
+            execution,
+        );
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
@@ -3509,8 +3604,9 @@ async fn run_tool_call_loop_impl<'a>(
                     &executable_indices,
                     &executable_calls,
                     &[],
+                    &capture_handles,
                 )
-                .await;
+                .await?;
                 return Err(e);
             }
         };
@@ -3577,8 +3673,9 @@ async fn run_tool_call_loop_impl<'a>(
                 &executable_indices,
                 &executable_calls,
                 &executed_completed_indices,
+                &capture_handles,
             )
-            .await;
+            .await?;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -3628,7 +3725,6 @@ async fn run_tool_call_loop_impl<'a>(
 
         let CollectedResults {
             individual_results,
-            tool_results,
             detection_relevant_output,
         } = collect_tool_results(
             ordered_results,
@@ -3660,8 +3756,6 @@ async fn run_tool_call_loop_impl<'a>(
             assistant_history_content,
             &native_tool_calls,
             &individual_results,
-            &tool_results,
-            use_native_tools,
         );
 
         if cancelled_mid_batch {
@@ -3770,7 +3864,6 @@ async fn run_tool_call_loop_impl<'a>(
         None => (None, None),
     };
     let summary_result = finish_after_max_iterations(
-        injected_memory_preamble,
         model_provider,
         turn_state.history,
         provider_name,
@@ -3921,6 +4014,11 @@ fn sop_step_excluded_tools(
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
     pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    /// The owner whose private plane the running session's memory is pinned
+    /// to, or `None` for an unowned session. A re-assembled step agent's
+    /// memory is that owner's plane for the step agent, never the step
+    /// agent's shared plane.
+    pub memory_owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
     /// The capabilities and principal the enclosing turn was built from. A
     /// cross-agent step re-assembles its agent through them, so the step
     /// stays on the turn's provider, memory and tool sources. `None` only on
@@ -4004,6 +4102,40 @@ impl OwnedAgentExecution {
     }
 }
 
+/// The memory a SOP step agent runs over. A step of an owned session or run
+/// keeps the owner: the step agent's memory is the owner's plane for that
+/// agent, the same plane `memory/*` serves for this owner and agent, and a
+/// registry the factory builds over it is pinned to it. An unowned step gets
+/// the step agent's own memory.
+pub(crate) async fn step_agent_memory(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    api_key: Option<&str>,
+    owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+) -> Result<Arc<dyn zeroclaw_memory::Memory>> {
+    Ok(owned_step_memory(
+        zeroclaw_memory::create_memory_for_agent(config, alias, api_key).await?,
+        alias,
+        owner,
+    ))
+}
+
+/// `memory` on the owner's plane for `alias`, or unchanged for an unowned
+/// step.
+fn owned_step_memory(
+    memory: Arc<dyn zeroclaw_memory::Memory>,
+    alias: &str,
+    owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+) -> Arc<dyn zeroclaw_memory::Memory> {
+    match owner {
+        Some(owner) => Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            memory,
+            owner.clone().with_agent(Some(alias.to_string())),
+        )),
+        None => memory,
+    }
+}
+
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
 /// would: the agent's security policy, memory, gated tool registry (through the
 /// one [`crate::tools::scoped::ScopedToolRegistry::assemble`] seam, connecting
@@ -4026,6 +4158,7 @@ pub(crate) async fn assemble_owned_execution(
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
+    memory_owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
 ) -> Result<OwnedAgentExecution> {
     assemble_owned_execution_with_capabilities(
         config,
@@ -4036,6 +4169,7 @@ pub(crate) async fn assemble_owned_execution(
         sop_engine,
         sop_audit,
         parent_approval,
+        memory_owner,
         None,
     )
     .await
@@ -4053,6 +4187,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
+    memory_owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
     execution_admission: Option<AgentExecutionAdmission>,
 ) -> Result<OwnedAgentExecution> {
     if let Some(admission) = execution_admission.as_ref() {
@@ -4085,7 +4220,11 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
                 "SOP step agent '{alias}' has no configured risk profile"
             ))
         })?;
-    let memory = capabilities.agent_memory(config, alias).await?;
+    let memory = owned_step_memory(
+        capabilities.agent_memory(config, alias).await?,
+        alias,
+        memory_owner,
+    );
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
     // tools via `crate::agent::run`, which builds its runtime from
@@ -4122,7 +4261,6 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             execution_capability: execution_admission
                 .as_ref()
                 .map(AgentExecutionAdmission::capability),
-            acp_sessions: None,
         })?,
         None => crate::tools::supplied_registry_base()?,
     };
@@ -4186,15 +4324,19 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
                 "SOP step agent '{alias}' has no resolved model provider"
             ))
         })?;
-    let (model_provider, provider_name, model, _model_route_resolver) =
-        crate::agent::agent::build_session_model_provider_with_capabilities(
-            capabilities,
-            config,
-            alias,
-            &provider_ref,
-            None,
-            principal,
-        )?;
+    let zeroclaw_providers::factory::SessionModelProvider {
+        provider: model_provider,
+        provider_ref: provider_name,
+        model,
+        ..
+    } = crate::agent::agent::build_session_model_provider_with_capabilities(
+        capabilities,
+        config,
+        alias,
+        &provider_ref,
+        None,
+        principal,
+    )?;
     // The step agent's own configured temperature — the same source the
     // headless driver reads for `crate::agent::run`.
     let temperature = config
@@ -4420,23 +4562,75 @@ async fn drive_live_sop_actions(
                     // that agent's execution context; same-agent steps keep the
                     // parent context unchanged.
                     let step_alias = step.agent.as_deref();
+                    // The run's owner, stored on the run, decides where its audit
+                    // rows and its steps' memory go, whichever session resumes
+                    // it. A run owned by someone other than this session's owner
+                    // runs under that owner: its step agent is re-assembled over
+                    // the owner's plane even when it is this loop's own agent.
+                    let run_owner = {
+                        let guard = match queued.engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard
+                            .get_run(&run_id)
+                            .and_then(|run| run.memory_owner.clone())
+                    };
+                    let run_audit =
+                        crate::sop::audit::audit_for_run(queued.audit.clone(), run_owner.as_ref());
+                    let session_owner = sop_reassembly
+                        .as_ref()
+                        .and_then(|reassembly| reassembly.memory_owner.clone());
+                    let foreign_owner = run_owner.is_some() && run_owner != session_owner;
                     // `agent_alias` is this loop's EFFECTIVE identity: a
                     // re-assembled sub-loop runs with its step agent as its own
                     // alias, so this comparison is correct at every nesting
                     // depth — a depth >= 2 step naming the outer agent compares
                     // against the re-assembled child's alias and re-assembles
                     // instead of inheriting the child's scope.
-                    let needs_reassembly = step_needs_reassembly(agent_alias, step_alias);
+                    let needs_reassembly =
+                        step_needs_reassembly(agent_alias, step_alias) || foreign_owner;
+                    let reassembly_alias = step_alias.or(agent_alias);
+                    // A foreign owner's execution is memoized apart from this
+                    // session's own, and keyed by the owner's whole scope: the
+                    // execution's memory and audit are on that scope's plane, so
+                    // runs of one principal in another agent, namespace or tenant
+                    // never share it.
+                    let cache_key = reassembly_alias.map(|alias| match &run_owner {
+                        Some(owner) if foreign_owner => format!(
+                            "{alias}\u{0}{}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+                            owner.principal_id, owner.agent_alias, owner.namespace, owner.tenant_id
+                        ),
+                        _ => alias.to_string(),
+                    });
                     let mut assembly_error: Option<anyhow::Error> = None;
                     if needs_reassembly {
-                        let alias =
-                            step_alias.expect("needs_reassembly implies a step agent alias");
+                        // A foreign-owned step with no agent to run as (it names
+                        // none and this loop has no identity) gets the empty alias,
+                        // which fails assembly below, so the step is refused.
+                        let alias = reassembly_alias.unwrap_or_default();
+                        let cache_key = cache_key.as_deref().unwrap_or_default();
                         if let Some(reassembly) = sop_reassembly.as_ref() {
-                            let cache_matches = exec_cache.get(alias).is_some_and(|owned| {
+                            let cache_matches = exec_cache.get(cache_key).is_some_and(|owned| {
                                 owned.matches_admission(execution_admission.as_ref())
                             });
                             if !cache_matches {
+                                let step_owner =
+                                    run_owner.as_ref().or(reassembly.memory_owner.as_ref());
                                 let assembled = match reassembly.capabilities {
+                                    // The bound principal selects the step's provider
+                                    // credentials. Never pair them with another
+                                    // principal's memory and audit.
+                                    Some(bound)
+                                        if step_owner.is_some_and(|owner| {
+                                            bound.principal.as_ref().map(|p| p.as_str())
+                                                != Some(owner.principal_id.as_str())
+                                        }) =>
+                                    {
+                                        Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                                            "cli-sop-step-owner-principal-mismatch",
+                                        )))
+                                    }
                                     Some(bound) => {
                                         assemble_owned_execution_with_capabilities(
                                             execution_config.as_deref().unwrap_or(reassembly.config),
@@ -4445,8 +4639,9 @@ async fn drive_live_sop_actions(
                                             bound.principal.as_ref(),
                                             alias,
                                             Arc::clone(&queued.engine),
-                                            queued.audit.clone(),
+                                            run_audit.clone(),
                                             approval,
+                                            step_owner,
                                             execution_admission.clone(),
                                         )
                                         .await
@@ -4459,8 +4654,9 @@ async fn drive_live_sop_actions(
                                             None,
                                             alias,
                                             Arc::clone(&queued.engine),
-                                            queued.audit.clone(),
+                                            run_audit.clone(),
                                             approval,
+                                            step_owner,
                                             execution_admission.clone(),
                                         )
                                         .await
@@ -4468,7 +4664,7 @@ async fn drive_live_sop_actions(
                                 };
                                 match assembled {
                                     Ok(owned) => {
-                                        exec_cache.insert(alias.to_string(), owned);
+                                        exec_cache.insert(cache_key.to_string(), owned);
                                     }
                                     Err(e) => assembly_error = Some(e),
                                 }
@@ -4518,9 +4714,7 @@ async fn drive_live_sop_actions(
                         // re-assembled step agent when reassembly applied,
                         // otherwise the parent turn's (byte-identical to today).
                         let owned = if needs_reassembly {
-                            exec_cache.get(
-                                step_alias.expect("needs_reassembly implies a step agent alias"),
-                            )
+                            cache_key.as_deref().and_then(|key| exec_cache.get(key))
                         } else {
                             None
                         };
@@ -4653,7 +4847,11 @@ async fn drive_live_sop_actions(
                                         .expect("owned implies a reassembly handle")
                                         .config,
                                 ),
-                                step_alias.expect("needs_reassembly implies a step agent alias"),
+                                // A step that names no agent but runs under a
+                                // foreign owner is re-assembled as this loop's
+                                // agent, so the alias it ran as is the
+                                // re-assembly alias, not the step's own.
+                                reassembly_alias.expect("a re-assembled step has an agent alias"),
                                 &sop_excluded_tools,
                             ) {
                                 Ok(prompt) => {
@@ -4696,7 +4894,7 @@ async fn drive_live_sop_actions(
                             // future is built inside the run-attribution scope and
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
-                            let mut nested_memory_preamble: Option<MemoryPreamble> = None;
+
                             let step_result = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
@@ -4781,7 +4979,7 @@ async fn drive_live_sop_actions(
                                     ),
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
-                                    injected_memory_preamble: &mut nested_memory_preamble,
+
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
@@ -4814,7 +5012,7 @@ async fn drive_live_sop_actions(
                                     // sub-loop, with the delegating agent kept
                                     // alongside as the parent correlation.
                                     agent_alias: if owned.is_some() {
-                                        step_alias
+                                        reassembly_alias
                                     } else {
                                         agent_alias
                                     },
@@ -4869,7 +5067,7 @@ async fn drive_live_sop_actions(
                     // assembly — the record names who SHOULD have run it),
                     // otherwise this loop's own agent.
                     let effective_agent = if needs_reassembly {
-                        step_alias.map(str::to_string)
+                        reassembly_alias.map(str::to_string)
                     } else {
                         agent_alias.map(str::to_string)
                     };
@@ -4900,7 +5098,7 @@ async fn drive_live_sop_actions(
                         step_result.clone(),
                     )?;
                     crate::sop::executor::audit_sop_step(
-                        queued.audit.as_deref(),
+                        run_audit.as_deref(),
                         &run_id,
                         &step_result,
                         finished_run.as_ref(),
@@ -5349,7 +5547,6 @@ mod reported_budget_tests {
     // below calls the production function with an explicit turn identity.
     #[allow(clippy::too_many_arguments)]
     async fn enforce_reported_budget(
-        injected_memory_preamble: &mut Option<MemoryPreamble>,
         history: &mut Vec<ChatMessage>,
         reported_input_tokens: usize,
         reported_population_estimated: usize,
@@ -5365,7 +5562,6 @@ mod reported_budget_tests {
         crumb_present: &mut bool,
     ) {
         super::enforce_reported_budget(
-            injected_memory_preamble,
             history,
             reported_input_tokens,
             reported_population_estimated,
@@ -5425,7 +5621,6 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let observer = TrimObserver::default();
         super::enforce_reported_budget(
-            &mut None,
             &mut history,
             estimated * 4,
             estimated,
@@ -5463,7 +5658,6 @@ mod reported_budget_tests {
         let reported = estimated * 4;
         let budget = reported / 2;
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5500,7 +5694,6 @@ mod reported_budget_tests {
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             estimated,
             estimated,
@@ -5530,7 +5723,6 @@ mod reported_budget_tests {
         // model's 100-token context budget and must not trim history.
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             80,
             estimated,
@@ -5559,7 +5751,6 @@ mod reported_budget_tests {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         enforce_reported_budget(
-            &mut None,
             &mut history,
             usize::MAX,
             usize::MAX,
@@ -5587,7 +5778,6 @@ mod reported_budget_tests {
         let budget = reported / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5651,7 +5841,6 @@ mod reported_budget_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5697,7 +5886,7 @@ mod reported_budget_tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
         // `estimate_history_tokens` now charges the same fixed per-image cost
-        // whether a `[IMAGE:...]` marker holds a path or the base64 payload
+        // whether a structured image attachments marker holds a path or the base64 payload
         // preparation resolves it to, so the raw and prepared populations for
         // this history are equal by design (see `IMAGE_TOKEN_ESTIMATE`).
         // Selection and the emitted recount must still describe the
@@ -5715,11 +5904,14 @@ mod reported_budget_tests {
             STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
         )
         .unwrap();
-        let marker = format!("[IMAGE:{}]", image_path.display());
+        let attachment = zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: image_path.display().to_string(),
+        };
         let big = "x".repeat(2000);
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user(format!("turn1 {marker}")),
+            ChatMessage::user("turn1").with_attachments(vec![attachment]),
             ChatMessage::assistant("a1".to_string()),
             ChatMessage::user(format!("turn2 {big}")),
             ChatMessage::assistant("a2".to_string()),
@@ -5746,7 +5938,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             prepared_estimated,
@@ -5834,7 +6025,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5909,7 +6099,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -5978,7 +6167,6 @@ mod reported_budget_tests {
         let budget = estimated / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6055,7 +6243,6 @@ mod reported_budget_tests {
         let taken: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6121,7 +6308,6 @@ mod reported_budget_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut crumb_present = false;
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6268,7 +6454,6 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6358,7 +6543,6 @@ mod reported_budget_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
-            &mut None,
             &mut history,
             reported,
             estimated,
@@ -6451,7 +6635,6 @@ mod trim_budget_tests {
         let mut crumb_present = false;
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         let result = surface_oversized_dispatch_if_needed(
-            &mut None,
             &mut history,
             &mut crumb_present,
             tokens_before as u64,
@@ -6464,7 +6647,6 @@ mod trim_budget_tests {
             "the breadcrumb itself must push the kept history over budget ({final_tokens} > {budget})"
         );
         let floor = surface_oversized_dispatch_if_needed(
-            &mut None,
             &mut history,
             &mut crumb_present,
             final_tokens as u64,
@@ -6586,12 +6768,16 @@ mod active_route_context_tests {
             ChatMessage::system("system"),
             ChatMessage::user(format!("old question {large}")),
             ChatMessage::assistant(format!("old answer {large}")),
-            ChatMessage::user("inspect [IMAGE:/tmp/image.png]"),
+            ChatMessage::user("inspect").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "/tmp/image.png".to_string(),
+                },
+            ]),
         ];
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         assert!(tokens_before < text_limits.context_token_budget);
         let trim = surface_oversized_dispatch_if_needed(
-            &mut None,
             &mut history,
             &mut false,
             tokens_before as u64,
@@ -6636,6 +6822,7 @@ mod active_route_context_tests {
         };
         let call_ctx = base_ctx.for_route("custom.vision", "vision-model", vision_limits);
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: Some(TokenUsage {
@@ -6865,6 +7052,7 @@ vision_model_provider = "custom.vision"
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: None,
                         tool_calls: vec![ToolCall {
                             id: "c1".into(),
@@ -6877,6 +7065,7 @@ vision_model_provider = "custom.vision"
                     })
                 } else {
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("text follow-up".into()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -6918,9 +7107,9 @@ vision_model_provider = "custom.vision"
                 // The producer declares its image; under the attachment
                 // contract nothing in the result text is promoted.
                 Ok(ToolResult::ok("here it is").with_attachment(
-                    zeroclaw_api::media::RenderedMarker {
+                    zeroclaw_api::media::AttachmentReference {
                         target: self.path.clone(),
-                        kind: zeroclaw_api::media::MarkerKind::Image,
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
                     },
                 ))
             }
@@ -7025,7 +7214,7 @@ vision_model_provider = "custom.vision"
             ),
             history: &mut history,
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7306,14 +7495,28 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader =
-            assemble_owned_execution(&config, None, "reader", Arc::clone(&engine), None, None)
-                .await
-                .expect("reader assembles");
-        let writer =
-            assemble_owned_execution(&config, None, "writer", Arc::clone(&engine), None, None)
-                .await
-                .expect("writer assembles");
+        let reader = assemble_owned_execution(
+            &config,
+            None,
+            "reader",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("reader assembles");
+        let writer = assemble_owned_execution(
+            &config,
+            None,
+            "writer",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -7333,6 +7536,186 @@ mod sop_step_reassembly_tests {
         // With no parent approval manager the child is non-interactive
         // (auto-deny), matching the headless driver.
         assert!(reader.approval.is_non_interactive());
+    }
+
+    /// A config with a step agent `stepper` on SQLite memory whose policy
+    /// admits the memory tools, as a cross-agent SOP step names it.
+    fn memory_step_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig,
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["memory_store".to_string(), "memory_recall".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Sqlite,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Run `tool` of a re-assembled step's registry with `args`.
+    async fn run_step_tool(
+        owned: &OwnedAgentExecution,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> zeroclaw_api::tool::ToolResult {
+        owned
+            .tools_registry
+            .iter()
+            .find(|t| t.name() == tool)
+            .unwrap_or_else(|| panic!("the step registry has {tool}"))
+            .execute(args)
+            .await
+            .unwrap()
+    }
+
+    /// A cross-agent step of an owned session re-assembles the step agent on
+    /// the owner's plane for that agent, never the step agent's shared plane.
+    ///
+    /// Its `memory_store` either lands on that plane or, where the step agent's
+    /// backend cannot scope by principal (per-agent SQLite does not forward the
+    /// principal-scoped calls yet), is refused before any effect. Either way
+    /// nothing reaches the step agent's shared plane or another principal's,
+    /// and `memory_recall` does not reach the step agent's shared rows.
+    #[tokio::test]
+    async fn an_owned_sessions_reassembled_step_keeps_the_owner_for_the_step_agent() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        step_shared
+            .store(
+                "shared-row",
+                "STEP-SHARED-SECRET",
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+
+        let owned = assemble_owned_execution(
+            &config,
+            None,
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+            Some(&owner),
+        )
+        .await
+        .expect("the step agent assembles");
+
+        let stored = run_step_tool(
+            &owned,
+            "memory_store",
+            serde_json::json!({"key": "p-marker", "content": "P-MARKER"}),
+        )
+        .await;
+        assert!(
+            step_shared.get("p-marker").await.unwrap().is_none(),
+            "an owned session's step must not write the step agent's shared plane: {stored:?}"
+        );
+        let on_owner = owner.clone().with_agent(Some("stepper".to_string()));
+        if stored.success {
+            assert_eq!(
+                step_shared
+                    .get_for_principal(&on_owner, "p-marker")
+                    .await
+                    .unwrap()
+                    .expect("a successful store lands on the owner's plane for the step agent")
+                    .content,
+                "P-MARKER"
+            );
+        } else {
+            assert!(
+                stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("principal-scoped")),
+                "a refused store is refused for lack of principal scoping: {stored:?}"
+            );
+        }
+        let mallory = PrincipalScope::new("user:mallory").with_agent(Some("stepper".to_string()));
+        assert!(
+            step_shared
+                .get_for_principal(&mallory, "p-marker")
+                .await
+                .map(|row| row.is_none())
+                .unwrap_or(true)
+        );
+        let recalled = run_step_tool(
+            &owned,
+            "memory_recall",
+            serde_json::json!({"query": "STEP-SHARED-SECRET"}),
+        )
+        .await;
+        assert!(
+            !format!("{recalled:?}").contains("STEP-SHARED-SECRET"),
+            "the owned step must not recall the step agent's shared rows: {recalled:?}"
+        );
+    }
+
+    /// Control: an unowned session's step keeps the step agent's shared plane.
+    #[tokio::test]
+    async fn an_unowned_sessions_reassembled_step_keeps_the_shared_plane() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let owned = assemble_owned_execution(&config, None, "stepper", engine, None, None, None)
+            .await
+            .expect("the step agent assembles");
+        let stored = run_step_tool(
+            &owned,
+            "memory_store",
+            serde_json::json!({"key": "k", "content": "shared-row"}),
+        )
+        .await;
+        assert!(stored.success, "{stored:?}");
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            step_shared.get("k").await.unwrap().unwrap().content,
+            "shared-row"
+        );
     }
 
     #[tokio::test]
@@ -7403,6 +7786,7 @@ mod sop_step_reassembly_tests {
             Some(live_config.handle()),
             "stepper",
             Arc::clone(&engine),
+            None,
             None,
             None,
         )
@@ -7502,6 +7886,7 @@ mod sop_step_reassembly_tests {
             Arc::clone(&engine),
             None,
             Some(&parent),
+            None,
         )
         .await
         .expect("restricted assembles");
@@ -7566,6 +7951,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),
@@ -7644,6 +8030,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -7709,6 +8096,7 @@ mod sop_step_reassembly_tests {
                 temperature,
             ));
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("child-done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -8039,6 +8427,7 @@ mod sop_step_reassembly_tests {
         ) -> Result<ChatResponse> {
             if request.tools.is_none_or(<[_]>::is_empty) {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("local-cap-summary".into()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8047,6 +8436,7 @@ mod sop_step_reassembly_tests {
             }
 
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "budget-call".into(),
@@ -8155,7 +8545,7 @@ mod sop_step_reassembly_tests {
             on_delta: None,
             shared_budget: Some(budget),
             history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
+
             channel: None,
             collected_receipts: None,
             event_tx: None,
@@ -8210,8 +8600,23 @@ mod sop_step_reassembly_tests {
                 })
             }
         }
-        let carrier = r#"{"content":null,"tool_calls":[{"id":"call_parent","name":"echo","arguments":"{\"text\":\"hi\"}"}]}"#;
-        let result = r#"{"tool_call_id":"call_parent","content":"echo: hi"}"#;
+        let carrier = ChatMessage::assistant_tool_calls(
+            "",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_parent".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"hi"}"#.into(),
+                extra_content: None,
+            }],
+            None,
+        );
+        let result = ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: "call_parent".into(),
+            tool_name: "echo".into(),
+            content: "echo: hi".into(),
+            success: Some(true),
+            attachments: vec![],
+        });
         let step_prompt = "[SOP: Deploy (run r1) — Step 1 of 1]\n\nCurrent step: **report**\nWhen done, report your result.\n";
         let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
             NamedEchoTool,
@@ -8224,8 +8629,8 @@ mod sop_step_reassembly_tests {
             };
             let mut history = vec![
                 ChatMessage::user("parent request"),
-                ChatMessage::assistant(carrier),
-                ChatMessage::tool(result),
+                carrier.clone(),
+                result.clone(),
                 ChatMessage::user(interrupting_row),
                 ChatMessage::assistant("step done"),
                 ChatMessage::user("[Tool call parse error]\nresume"),
@@ -8246,8 +8651,10 @@ mod sop_step_reassembly_tests {
             .expect("the resumed parent completes");
             let captured = requests.lock().expect("capture lock");
             let sent = &captured[0].0;
-            let has_call = sent.iter().any(|m| m.content == carrier);
-            let has_result = sent.iter().any(|m| m.role == "tool" && m.content == result);
+            let has_call = sent.iter().any(|m| !m.tool_calls.is_empty());
+            let has_result = sent
+                .iter()
+                .any(|m| m.role == "tool" && m.content == result.content);
             assert_eq!(
                 (has_call, has_result),
                 (must_keep, must_keep),
@@ -8300,12 +8707,15 @@ mod sop_step_reassembly_tests {
                     request
                         .messages
                         .iter()
-                        .any(|m| m.content.contains("data:image/png;base64,")),
+                        .any(|m| m.attachments.iter().any(|attachment| attachment
+                            .target
+                            .starts_with("data:image/png;base64,"))),
                     self.2,
                     "summary must apply quarantine for the hook-selected model"
                 );
                 assert!(request.messages.iter().any(|m| m.content == "hook-rewrite"));
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("prepared summary".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -8330,7 +8740,9 @@ mod sop_step_reassembly_tests {
                 assert!(
                     messages
                         .iter()
-                        .any(|m| m.content.contains("data:image/png;base64,")),
+                        .any(|m| m.attachments.iter().any(|attachment| attachment
+                            .target
+                            .starts_with("data:image/png;base64,"))),
                     "hooks must see prepared images"
                 );
                 if self.cancel {
@@ -8357,11 +8769,16 @@ mod sop_step_reassembly_tests {
             ],
         )
         .unwrap();
-        let prompt = format!("describe [IMAGE:{}]", image.display());
+        let prompt = ChatMessage::user("describe").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image.display()).to_string(),
+            },
+        ]);
         let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
         let mut id_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let prepared = prepare_messages_for_iteration(
-            &[ChatMessage::user(prompt.clone())],
+            std::slice::from_ref(&prompt),
             &multimodal,
             false,
             Some(&mut id_cache),
@@ -8394,7 +8811,7 @@ mod sop_step_reassembly_tests {
                 change_model,
             }));
             let budget = ExecutionTreeBudget::root(1);
-            let mut history = vec![ChatMessage::user(prompt.clone())];
+            let mut history = vec![prompt.clone()];
             let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_image_state = ProviderImageState::default();
             provider_image_state.record_recovery(
@@ -8433,7 +8850,7 @@ mod sop_step_reassembly_tests {
                 assert!(!response.contains("maximum tool iterations"));
             }
             assert_eq!(
-                history[0].content, prompt,
+                history[0].content, prompt.content,
                 "preparation must not rewrite durable user history"
             );
             assert_eq!(
@@ -8442,7 +8859,7 @@ mod sop_step_reassembly_tests {
                 "hook cancellation must prevent dispatch"
             );
         }
-        let mut history = vec![ChatMessage::user(prompt)];
+        let mut history = vec![prompt.clone()];
         let result = run_budgeted_test_loop_with_hooks(
             &TextProvider,
             &mut history,
@@ -8645,12 +9062,36 @@ mod sop_step_reassembly_tests {
         String,
         crate::sop::types::SopRunAction,
     ) {
-        start_single_step_with_capability(Some(step_agent), None)
+        start_single_step_for(Some(step_agent), None, None)
     }
 
     fn start_single_step_with_capability(
         step_agent: Option<&str>,
         capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        start_single_step_for(step_agent, capability, None)
+    }
+
+    /// [`start_single_cross_agent_step`] for a run owned by `owner`.
+    fn start_single_cross_agent_step_for(
+        step_agent: &str,
+        owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        start_single_step_for(Some(step_agent), None, owner)
+    }
+
+    fn start_single_step_for(
+        step_agent: Option<&str>,
+        capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+        owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
     ) -> (
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         String,
@@ -8696,7 +9137,9 @@ mod sop_step_reassembly_tests {
             payload: None,
             timestamp: "2026-07-16T00:00:00Z".to_string(),
         };
-        let action = engine.start_run("cross-agent", event).expect("run starts");
+        let action = engine
+            .start_run_for("cross-agent", event, None, owner)
+            .expect("run starts");
         let run_id = match &action {
             SopRunAction::ExecuteStep { run_id, step, .. } => {
                 assert_eq!(
@@ -8780,11 +9223,54 @@ mod sop_step_reassembly_tests {
         multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
         capability_binding: Option<&crate::composition::BoundCapabilities>,
     ) {
+        drive_step_with_audit(
+            engine,
+            action,
+            None,
+            parent_provider,
+            parent_tools,
+            observer,
+            history,
+            history_has_trim_breadcrumb,
+            event_tx,
+            new_messages_out,
+            agent_alias,
+            sop_reassembly,
+            model_switch_callback,
+            exec_cache,
+            config,
+            multimodal_config,
+            capability_binding,
+        )
+        .await;
+    }
+
+    /// [`drive_step_full`] with the audit logger the queued action carries.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_step_with_audit(
+        engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+        audit: Option<Arc<crate::sop::SopAuditLogger>>,
+        parent_provider: &dyn ModelProvider,
+        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &dyn crate::observability::Observer,
+        history: &mut Vec<ChatMessage>,
+        history_has_trim_breadcrumb: Option<&mut bool>,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+        new_messages_out: Option<&mut Vec<ChatMessage>>,
+        agent_alias: Option<&str>,
+        sop_reassembly: Option<SopStepReassembly<'_>>,
+        model_switch_callback: Option<ModelSwitchCallback>,
+        exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
+        config: Option<&zeroclaw_config::schema::Config>,
+        multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+        capability_binding: Option<&crate::composition::BoundCapabilities>,
+    ) {
         use crate::sop::executor::QueuedSopAction;
 
         let queued = QueuedSopAction {
             engine: Arc::clone(&engine),
-            audit: None,
+            audit,
             action,
         };
         let mut local_history_has_trim_breadcrumb = false;
@@ -8843,6 +9329,509 @@ mod sop_step_reassembly_tests {
         )
         .await
         .expect("drive returns Ok");
+    }
+
+    /// Through the real driver: a cross-agent step of an owned session is
+    /// re-assembled from the handle's owner. The step agent's model call fails
+    /// here (no provider is reachable), but the driver has already assembled
+    /// and cached the step's execution, and that registry's memory tools are
+    /// on the owner's plane for the step agent, never its shared plane.
+    #[tokio::test]
+    async fn the_driver_reassembles_an_owned_sessions_step_under_its_owner() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
+        let handle = SopStepReassembly {
+            config: &config,
+            capabilities: None,
+            live_config: None,
+            memory_owner: Some(owner.clone()),
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        let owned = exec_cache
+            .get("stepper")
+            .expect("the driver re-assembled the step agent");
+
+        let stored = run_step_tool(
+            owned,
+            "memory_store",
+            serde_json::json!({"key": "d-marker", "content": "D-MARKER"}),
+        )
+        .await;
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        assert!(
+            step_shared.get("d-marker").await.unwrap().is_none(),
+            "the driven step must not write the step agent's shared plane: {stored:?}"
+        );
+        assert!(
+            stored.success
+                || stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("principal-scoped")),
+            "the driven step stores on the owner's plane or refuses for lack of principal scoping: {stored:?}"
+        );
+    }
+
+    /// The same through the bound-capabilities arm: a turn that carries
+    /// supplied capabilities re-assembles an owned session's step agent with
+    /// the capabilities' memory put on the owner's plane for the step agent.
+    #[tokio::test]
+    async fn a_bound_cross_agent_step_of_an_owned_session_keeps_its_owner() {
+        use crate::composition::test_support::RecordingProviders;
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        struct FixedMemory(Arc<dyn zeroclaw_memory::Memory>);
+        #[async_trait::async_trait]
+        impl crate::composition::MemorySource for FixedMemory {
+            async fn memory(
+                &self,
+                _request: &crate::composition::MemoryRequest<'_>,
+            ) -> anyhow::Result<Arc<dyn zeroclaw_memory::Memory>> {
+                Ok(Arc::clone(&self.0))
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = stepper_config(tmp.path());
+        let shared: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", &tmp.path().join("bound")).unwrap(),
+        );
+        let bound = crate::composition::BoundCapabilities {
+            capabilities: crate::composition::RuntimeCapabilities {
+                providers: Arc::new(RecordingProviders::default()),
+                memory: Arc::new(FixedMemory(Arc::clone(&shared))),
+                ..crate::composition::RuntimeCapabilities::config_backed_unobserved()
+            },
+            principal: Some(zeroclaw_api::principal::PrincipalId(
+                "user:alice".to_string(),
+            )),
+        };
+        let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
+        let handle = SopStepReassembly {
+            config: &config,
+            capabilities: Some(&bound),
+            live_config: None,
+            memory_owner: Some(owner.clone()),
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        let owned = exec_cache
+            .get("stepper")
+            .expect("the driver re-assembled the step agent");
+
+        let stored = run_step_tool(
+            owned,
+            "memory_store",
+            serde_json::json!({"key": "b-marker", "content": "B-MARKER"}),
+        )
+        .await;
+        assert!(stored.success, "{stored:?}");
+        assert!(
+            shared.get("b-marker").await.unwrap().is_none(),
+            "the bound step must not write the shared plane"
+        );
+        assert!(
+            shared
+                .get_for_principal(
+                    &owner.clone().with_agent(Some("stepper".to_string())),
+                    "b-marker"
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "the bound step writes the owner's plane for the step agent"
+        );
+    }
+
+    /// Runs of one principal in different namespaces or tenants are different
+    /// owners. An unowned session driving both must not serve the second run's
+    /// step from the execution it assembled for the first, whose tools write
+    /// the first scope's plane.
+    #[tokio::test]
+    async fn owned_runs_in_different_scopes_never_share_a_step_execution() {
+        use crate::composition::test_support::RecordingProviders;
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        struct FixedMemory(Arc<dyn zeroclaw_memory::Memory>);
+        #[async_trait::async_trait]
+        impl crate::composition::MemorySource for FixedMemory {
+            async fn memory(
+                &self,
+                _request: &crate::composition::MemoryRequest<'_>,
+            ) -> anyhow::Result<Arc<dyn zeroclaw_memory::Memory>> {
+                Ok(Arc::clone(&self.0))
+            }
+        }
+
+        let first = PrincipalScope::new("user:alice")
+            .with_agent(Some("outer".to_string()))
+            .with_namespace(Some("first".to_string()));
+        for second in [
+            first.clone().with_namespace(Some("second".to_string())),
+            first.clone().with_tenant(Some("second".to_string())),
+        ] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let config = stepper_config(tmp.path());
+            let shared: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+                zeroclaw_memory::SqliteMemory::new("sqlite", &tmp.path().join("bound")).unwrap(),
+            );
+            let bound = crate::composition::BoundCapabilities {
+                capabilities: crate::composition::RuntimeCapabilities {
+                    providers: Arc::new(RecordingProviders::default()),
+                    memory: Arc::new(FixedMemory(Arc::clone(&shared))),
+                    ..crate::composition::RuntimeCapabilities::config_backed_unobserved()
+                },
+                principal: Some(zeroclaw_api::principal::PrincipalId(
+                    "user:alice".to_string(),
+                )),
+            };
+            let mut exec_cache = std::collections::HashMap::new();
+            for owner in [&first, &second] {
+                let (engine, _run_id, action) =
+                    start_single_cross_agent_step_for("stepper", Some(owner.clone()));
+                let handle = SopStepReassembly {
+                    config: &config,
+                    capabilities: Some(&bound),
+                    live_config: None,
+                    memory_owner: None,
+                };
+                let parent_tools =
+                    crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+                let mut history = vec![ChatMessage::system("parent system prompt")];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    drive_step(
+                        Arc::clone(&engine),
+                        action,
+                        &TextProvider,
+                        &parent_tools,
+                        &crate::observability::NoopObserver {},
+                        &mut history,
+                        None,
+                        None,
+                        None,
+                        Some("outer"),
+                        Some(handle),
+                        None,
+                        &mut exec_cache,
+                    ),
+                )
+                .await
+                .expect("the driver settles");
+            }
+            assert_eq!(
+                exec_cache.len(),
+                2,
+                "{second:?}: each owner scope gets its own step execution"
+            );
+            let mut on_second = 0;
+            for (index, owned) in exec_cache.values().enumerate() {
+                let key = format!("scope-marker-{index}");
+                let stored = run_step_tool(
+                    owned,
+                    "memory_store",
+                    serde_json::json!({"key": key, "content": "SCOPE-MARKER"}),
+                )
+                .await;
+                assert!(stored.success, "{stored:?}");
+                let plane = second.clone().with_agent(Some("stepper".to_string()));
+                if shared
+                    .get_for_principal(&plane, &key)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    on_second += 1;
+                }
+            }
+            assert_eq!(
+                on_second, 1,
+                "{second:?}: one execution writes the second run's plane"
+            );
+        }
+    }
+
+    /// A bound turn's principal selects the step's provider credentials. A
+    /// step whose memory owner is another principal, or an owned step on an
+    /// anonymous bound turn, is refused before any provider is asked.
+    #[tokio::test]
+    async fn a_bound_cross_agent_step_refuses_a_foreign_memory_owner() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, recording_capabilities,
+        };
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        for principal in [
+            Some(zeroclaw_api::principal::PrincipalId(
+                "user:operator".to_string(),
+            )),
+            None,
+        ] {
+            let providers = Arc::new(RecordingProviders::default());
+            let memory = Arc::new(RecordingMemory::default());
+            let bound = crate::composition::BoundCapabilities {
+                capabilities: recording_capabilities(
+                    Arc::clone(&providers),
+                    Arc::clone(&memory),
+                    Arc::new(NoTools),
+                ),
+                principal: principal.clone(),
+            };
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = stepper_config(tmp.path());
+            let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+            let handle = SopStepReassembly {
+                config: &config,
+                capabilities: Some(&bound),
+                live_config: None,
+                memory_owner: Some(
+                    PrincipalScope::new("user:alice").with_agent(Some("outer".to_string())),
+                ),
+            };
+            let parent_tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+            let mut history = vec![ChatMessage::system("parent system prompt")];
+            let mut exec_cache = std::collections::HashMap::new();
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            )
+            .await;
+
+            let result = step1_result(&engine, &run_id);
+            assert_ne!(
+                result.status,
+                crate::sop::types::SopStepStatus::Completed,
+                "{principal:?}: {result:?}"
+            );
+            assert!(
+                exec_cache.is_empty(),
+                "{principal:?}: nothing was assembled"
+            );
+            assert!(
+                providers.seen.lock().is_empty(),
+                "{principal:?}: no provider is asked for another principal's step"
+            );
+            assert!(
+                memory.agents.lock().is_empty(),
+                "{principal:?}: no memory is opened for the refused step"
+            );
+            assert_eq!(
+                result.output,
+                crate::i18n::get_required_cli_string("cli-sop-step-owner-principal-mismatch"),
+                "{principal:?}: the refusal reads from the catalogue"
+            );
+            assert!(!result.output.starts_with('{'), "{}", result.output);
+        }
+    }
+
+    /// A run owned by alice, driven in a session that is not hers (an
+    /// unowned one here, as an operator's session approving her run would
+    /// be), runs under alice: its step agent is re-assembled over alice's
+    /// plane even though the step names this loop's own agent, and memoized
+    /// apart from the session's own execution.
+    #[tokio::test]
+    async fn another_sessions_driver_runs_an_owned_run_under_its_owner() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("stepper".to_string()));
+        let (engine, run_id, action) =
+            start_single_cross_agent_step_for("stepper", Some(owner.clone()));
+        let handle = SopStepReassembly {
+            config: &config,
+            capabilities: None,
+            live_config: None,
+            memory_owner: None,
+        };
+        // The driving session carries the daemon's shared audit logger.
+        let audit_memory: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", &tmp.path().join("audit")).unwrap(),
+        );
+        let shared_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&audit_memory)));
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step_with_audit(
+                Arc::clone(&engine),
+                action,
+                Some(shared_audit),
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("stepper"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                None,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        assert!(
+            !exec_cache.contains_key("stepper"),
+            "the owner's execution is not memoized as the session's own"
+        );
+        let category = zeroclaw_memory::MemoryCategory::Custom("sop".into());
+        let step_key = format!("sop_step_{run_id}_1");
+        let on_shared = audit_memory.list(Some(&category), None).await.unwrap();
+        assert!(
+            on_shared.iter().all(|row| row.key != step_key),
+            "the step is not audited through the session's shared logger"
+        );
+        let on_owner = audit_memory
+            .list_for_principal(&owner, Some(&category), None)
+            .await
+            .unwrap();
+        assert!(
+            on_owner.iter().any(|row| row.key == step_key),
+            "the step is audited on the run owner's plane"
+        );
+        let owned = exec_cache
+            .iter()
+            .find_map(|(key, owned)| (key != "stepper").then_some(owned))
+            .expect("the driver re-assembled the step agent under the run's owner");
+        let stored = run_step_tool(
+            owned,
+            "memory_store",
+            serde_json::json!({"key": "f-marker", "content": "F-MARKER"}),
+        )
+        .await;
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        assert!(
+            step_shared.get("f-marker").await.unwrap().is_none(),
+            "an owned run driven elsewhere must not write the step agent's shared plane: {stored:?}"
+        );
+        assert!(
+            stored.success
+                || stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("principal-scoped")),
+            "{stored:?}"
+        );
+    }
+
+    /// The same for a step that names no agent: an unowned session approving
+    /// alice's run re-assembles its own agent under alice for that step, and
+    /// the step's prompt and attribution name the agent it ran as instead of
+    /// assuming the step named one.
+    #[tokio::test]
+    async fn another_sessions_driver_runs_an_owned_runs_unnamed_step_as_its_own_agent() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("stepper".to_string()));
+        let (engine, run_id, action) = start_single_step_for(None, None, Some(owner));
+        let handle = SopStepReassembly {
+            config: &config,
+            capabilities: None,
+            live_config: None,
+            memory_owner: None,
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("stepper"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        assert!(
+            !exec_cache.contains_key("stepper") && exec_cache.len() == 1,
+            "the step agent is re-assembled under the run's owner, apart from the session's own"
+        );
+        let result = step1_result(&engine, &run_id);
+        assert_eq!(
+            result.effective_agent.as_deref(),
+            Some("stepper"),
+            "the step is attributed to the agent it ran as: {result:?}"
+        );
     }
 
     fn step1_result(
@@ -8912,6 +9901,7 @@ mod sop_step_reassembly_tests {
             config: &config,
             live_config: None,
             capabilities: Some(bound),
+            memory_owner: None,
         };
         let parent_provider = TextProvider;
         let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -9002,8 +9992,8 @@ mod sop_step_reassembly_tests {
     #[tokio::test]
     async fn a_same_agent_step_in_a_bound_loop_routes_vision_through_the_binding() {
         use crate::composition::test_support::{
-            IMAGE_TURN, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
-            capabilities_with_providers, counting_endpoint,
+            VISION_REFUSAL, VISION_REPLY, VisionRouteProviders, capabilities_with_providers,
+            counting_endpoint, image_turn,
         };
 
         let principal =
@@ -9037,10 +10027,12 @@ mod sop_step_reassembly_tests {
                 capabilities: capabilities_with_providers(Arc::clone(&providers) as _),
                 principal: Some(principal.clone()),
             };
-            let (engine, run_id, action) = start_single_same_agent_step(IMAGE_TURN);
+            let (engine, run_id, action) =
+                start_single_same_agent_step("describe the supplied image");
             let parent_tools =
                 crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
             let mut history = vec![ChatMessage::system("helper system prompt")];
+            history.push(image_turn());
             let mut exec_cache = std::collections::HashMap::new();
 
             drive_step_full(
@@ -9238,6 +10230,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -9341,6 +10334,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -9440,6 +10434,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -9505,6 +10500,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -9562,6 +10558,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -9627,6 +10624,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -9685,6 +10683,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -9825,6 +10824,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "00000000-0000-0000-0000-000000000099".into(),
@@ -9889,6 +10889,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
             capabilities: None,
         };
 
@@ -10185,6 +11186,7 @@ mod tool_lifecycle_abandonment_tests {
 
     fn text_response() -> ChatResponse {
         ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -10397,7 +11399,7 @@ mod tool_lifecycle_abandonment_tests {
         image_cache: Option<ToolLoopImageState<'_>>,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
-        let mut injected_preamble = None;
+
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -10438,7 +11440,7 @@ mod tool_lifecycle_abandonment_tests {
             },
             history,
             history_has_trim_breadcrumb: &mut crumb_present,
-            injected_memory_preamble: &mut injected_preamble,
+
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token,
@@ -10533,12 +11535,12 @@ mod tool_lifecycle_abandonment_tests {
             requests: Mutex::new(Vec::new()),
             error_message: "rejected request",
         };
-        let retained_user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let retained_user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
         let mut history = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user(format!("discarded-old-turn {}", "old ".repeat(10_000))),
             ChatMessage::assistant("old answer"),
-            ChatMessage::user(retained_user),
+            retained_user.clone(),
         ];
         let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let mut provider_state = ProviderImageState::default();
@@ -10586,11 +11588,9 @@ mod tool_lifecycle_abandonment_tests {
                 .iter()
                 .all(|m| !m.content.contains("discarded-old-turn"))
         );
-        assert!(
-            history
-                .iter()
-                .any(|m| m.role == "user" && m.content == retained_user)
-        );
+        assert!(history.iter().any(|m| m.role == "user"
+            && m.content == retained_user.content
+            && m.attachments == retained_user.attachments));
     }
 
     #[tokio::test]
@@ -10600,11 +11600,8 @@ mod tool_lifecycle_abandonment_tests {
                 requests: Mutex::new(Vec::new()),
                 error_message: "rejected request",
             };
-            let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
-            let mut history = vec![
-                ChatMessage::system("You are helpful."),
-                ChatMessage::user(user),
-            ];
+            let user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
+            let mut history = vec![ChatMessage::system("You are helpful."), user.clone()];
             let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_state = ProviderImageState::default();
             let registry = registry_with(Vec::new());
@@ -10647,11 +11644,9 @@ mod tool_lifecycle_abandonment_tests {
                 let error = result.expect_err("stateless callers keep the original error");
                 assert!(error.to_string().contains("rejected request"));
             }
-            assert!(
-                history
-                    .iter()
-                    .any(|message| message.role == "user" && message.content == user)
-            );
+            assert!(history.iter().any(|message| message.role == "user"
+                && message.content == user.content
+                && message.attachments == user.attachments));
             assert!(
                 history
                     .iter()
@@ -10667,12 +11662,12 @@ mod tool_lifecycle_abandonment_tests {
             requests: Mutex::new(Vec::new()),
             error_message: "prompt is too long",
         };
-        let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
         let mut history = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user(format!("old-context {}", "old ".repeat(10_000))),
             ChatMessage::assistant("old answer"),
-            ChatMessage::user(user),
+            user.clone(),
         ];
         let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let mut provider_state = ProviderImageState::default();
@@ -10716,11 +11711,9 @@ mod tool_lifecycle_abandonment_tests {
         );
         let route = ProviderImageState::route("scripted", "scripted-model");
         assert!(provider_state.quarantined(&route).is_empty());
-        assert!(
-            history
-                .iter()
-                .any(|message| message.role == "user" && message.content == user)
-        );
+        assert!(history.iter().any(|message| message.role == "user"
+            && message.content == user.content
+            && message.attachments == user.attachments));
     }
 
     #[tokio::test]
@@ -10816,6 +11809,7 @@ mod tool_lifecycle_abandonment_tests {
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     tool_call("call-a", "echo_first", serde_json::json!({"n": 1})),
@@ -10869,6 +11863,7 @@ mod tool_lifecycle_abandonment_tests {
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![tool_call(
                     "call-1",
@@ -10917,6 +11912,7 @@ mod tool_lifecycle_abandonment_tests {
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     tool_call("call-a", "interrupt_tool", serde_json::json!({"n": 1})),
@@ -11086,6 +12082,7 @@ mod tool_lifecycle_abandonment_tests {
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![tool_call(
                     "call-a",
@@ -11162,5 +12159,33 @@ mod tool_lifecycle_abandonment_tests {
             retained.lock().unwrap().is_empty(),
             "the cooperative dispatch releases exactly the retained entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod route_usage_calibration_tests {
+    use super::*;
+
+    #[test]
+    fn reported_input_usage_calibrates_only_its_provider_and_model() {
+        for (provider, model, reported, estimated, expected) in [
+            ("fixture", "model-a", 400, 200, 200),
+            ("fixture", "model-b", 400, 200, 100),
+            ("other", "model-a", 400, 200, 100),
+            ("fixture", "model-a", 400, 0, 100),
+            ("fixture", "model-a", 100, 200, 100),
+        ] {
+            let counter = DispatchTokenCounter::for_route(
+                Some(ReportedRequestUsage {
+                    provider_name: "fixture".into(),
+                    model: "model-a".into(),
+                    reported_tokens: reported,
+                    estimated_tokens: estimated,
+                }),
+                provider,
+                model,
+            );
+            assert_eq!(counter.count(100), expected, "{provider}/{model}");
+        }
     }
 }

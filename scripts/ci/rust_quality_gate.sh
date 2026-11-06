@@ -38,7 +38,7 @@ PROTECTED_METHODS='\.(chat|stream_chat|simple_chat|chat_with_system|chat_with_hi
 #   - Any code inside a `tests/` directory (`tests/live/` integration
 #     tests, `crates/*/tests/` integration tests).
 #   - Any line inside a `#[cfg(test)]` module: the gate uses the
-#     first `^#[cfg(test)]` line in each file as a boundary and drops
+#     first outer or inner `cfg(test)` attribute in each file as a boundary and drops
 #     matches at or below it.
 #   - `self.<method>(...)` self-calls (same Attributable instance;
 #     dispatcher wrap would be a redundant attribution layer).
@@ -77,10 +77,10 @@ VIOLATIONS=$(printf '%s\n' "$RG_OUTPUT" | awk -F: '
         }
         close(cmd)
         file_line_count[file] = lineno - 1
-        # Test boundary: first ^#[cfg(test)] line in the file.
+        # Test boundary: first outer or inner cfg(test) attribute in the file.
         test_boundary[file] = 999999999
         for (i = 1; i <= file_line_count[file]; i++) {
-            if (file_lines[file, i] ~ /^#\[cfg\(test\)\]/) {
+            if (file_lines[file, i] ~ /^#!?\[cfg\(test\)\]/) {
                 test_boundary[file] = i
                 break
             }

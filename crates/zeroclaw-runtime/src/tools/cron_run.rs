@@ -120,6 +120,11 @@ impl CronRunTool {
 
 #[async_trait]
 impl Tool for CronRunTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_run"
     }
@@ -486,7 +491,6 @@ mod tests {
             None,
             None,
             Some(execution_capability),
-            None,
         )
         .unwrap();
         if let Some(capabilities) = capabilities {

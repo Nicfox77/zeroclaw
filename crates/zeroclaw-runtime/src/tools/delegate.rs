@@ -59,6 +59,73 @@ fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
+async fn prepare_child_capture(
+    agent: &str,
+    prompt: &str,
+    mode: zeroclaw_api::session_events::ChildExecutionMode,
+    task_id: Option<String>,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::session_events::capture::ChildExecutionPort>>> {
+    let Some(parent) = zeroclaw_api::session_events::capture::current_provider_admission() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parent
+            .begin_child(zeroclaw_api::session_events::capture::ChildDispatchIntent {
+                relation: "delegate".into(),
+                target_agent: agent.into(),
+                prompt: prompt.into(),
+                execution_mode: mode,
+                task_id,
+            })
+            .await?,
+    ))
+}
+
+async fn run_child_capture<F>(
+    child: Option<Arc<dyn zeroclaw_api::session_events::capture::ChildExecutionPort>>,
+    engine: F,
+) -> anyhow::Result<ToolResult>
+where
+    F: Future<Output = anyhow::Result<ToolResult>> + Send,
+{
+    let Some(child) = child else {
+        return engine.await;
+    };
+    let mut observed = None;
+    let recorded = child
+        .execute(Box::pin(async {
+            let result = engine.await;
+            let value = match &result {
+                Ok(result) if result.success => Ok(result.output.as_str().to_owned()),
+                Ok(result) => Err(anyhow::Error::msg(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("child_execution_failed")
+                        .to_owned(),
+                )),
+                Err(error) => Err(anyhow::Error::msg(
+                    crate::agent::Agent::session_execution_diagnostic(error),
+                )),
+            };
+            observed = Some(result);
+            value
+        }))
+        .await;
+    if let Err(error) = recorded
+        && (zeroclaw_api::session_events::capture::is_capture_stopped(&error)
+            || error.chain().any(|source| {
+                source.is::<zeroclaw_kernel::session::SessionError>()
+                    || source.is::<zeroclaw_api::session_events::AppendError>()
+                    || source.is::<zeroclaw_api::session_events::ReadError>()
+            })
+            || observed.is_none())
+    {
+        return Err(error);
+    }
+    observed.ok_or_else(|| anyhow::Error::msg("child engine result missing"))?
+}
+
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -261,6 +328,41 @@ impl BackgroundResultState {
     }
 }
 
+/// Live authority of the RPC credential that admitted the owning session.
+type PrincipalAdmission = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Whether the registries a delegate builds withhold every tool that requires
+/// an unrestricted principal. Two signals feed it. The owning Agent sets
+/// `withheld` when it applies a non-admin principal's posture; descendants
+/// share it and it is never cleared. `admission` resolves the originating RPC
+/// credential's current authority each time a child registry is built, and a
+/// child builder takes a copy of it. Neither caches grants. Both absent is the
+/// existing non-RPC/operator construction.
+#[derive(Clone, Default)]
+struct UnrestrictedToolWithholding {
+    withheld: Arc<AtomicBool>,
+    admission: Arc<RwLock<Option<PrincipalAdmission>>>,
+}
+
+impl UnrestrictedToolWithholding {
+    /// The child builder's copy: it shares the flag and copies the admission
+    /// resolver bound when the child is built.
+    fn for_child(&self) -> Self {
+        Self {
+            withheld: Arc::clone(&self.withheld),
+            admission: Arc::new(RwLock::new(self.admission.read().clone())),
+        }
+    }
+
+    fn withholds(&self) -> bool {
+        if self.withheld.load(Ordering::SeqCst) {
+            return true;
+        }
+        let admission = self.admission.read().clone();
+        admission.is_some_and(|admit| !admit())
+    }
+}
+
 #[derive(Clone)]
 struct OwnedParentTools {
     tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
@@ -422,6 +524,9 @@ pub struct DelegateTool {
     operator_approval_available: bool,
     /// Parent tool registry for agentic sub-agents.
     parent_tools: OwnedParentTools,
+    /// Whether child registries withhold the tools that require an
+    /// unrestricted principal; see [`UnrestrictedToolWithholding`].
+    unrestricted_tools: UnrestrictedToolWithholding,
     /// Runtime adapter used to build target-owned registries for independent
     /// agentic delegation.
     runtime: Option<Arc<dyn crate::platform::RuntimeAdapter>>,
@@ -628,6 +733,7 @@ impl DelegateTool {
             background_task_management: true,
             operator_approval_available: true,
             parent_tools: OwnedParentTools::default(),
+            unrestricted_tools: UnrestrictedToolWithholding::default(),
             runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
@@ -688,6 +794,7 @@ impl DelegateTool {
             background_task_management: true,
             operator_approval_available: true,
             parent_tools: OwnedParentTools::default(),
+            unrestricted_tools: UnrestrictedToolWithholding::default(),
             runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
@@ -767,6 +874,24 @@ impl DelegateTool {
         self
     }
 
+    /// Bind descendants to the originating RPC credential's live authority.
+    pub(crate) fn set_principal_admission(&self, admission: PrincipalAdmission) {
+        *self.unrestricted_tools.admission.write() = Some(admission);
+    }
+
+    /// Withhold every tool that requires an unrestricted principal from every
+    /// child registry this delegate, and every delegate it spawns or nests,
+    /// builds. Never cleared, like the registry narrowing it accompanies.
+    pub(crate) fn withhold_unrestricted_tools(&self) {
+        self.unrestricted_tools
+            .withheld
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn withholds_unrestricted_tools(&self) -> bool {
+        self.unrestricted_tools.withholds()
+    }
+
     /// Return a shared handle to the parent tools list.
     /// Assembly filters its existing entries at gate time, not on every read.
     /// Trusted later writers are responsible for the context of their additions;
@@ -823,6 +948,17 @@ impl DelegateTool {
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
+    }
+
+    /// Refuse what [`Self::bind_principal_scope`] would refuse, without
+    /// binding: a scope other than the one already bound.
+    pub(crate) fn check_principal_scope(&self, scope: &PrincipalScope) -> anyhow::Result<()> {
+        match self.principal_scope.read().as_ref() {
+            Some(existing) if existing != scope => {
+                anyhow::bail!("delegate memory is already pinned to a different principal scope")
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Bind the owning session's principal scope. Binding the same scope again
@@ -1254,6 +1390,7 @@ impl DelegateTool {
                 let tracker = crate::cost::CostTracker::get_or_init_global(
                     config.cost.clone(),
                     &config.data_dir,
+                    &config.channels.session_backend,
                 )?;
                 let flags = tracker.enforcement_flags();
                 (tracker, flags)
@@ -1494,15 +1631,19 @@ impl DelegateTool {
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = config.or(self.root_config.as_deref()) {
             let binding = self.target_binding();
-            let (provider, provider_name, model_name, _resolver) =
-                crate::agent::agent::build_session_model_provider_with_capabilities(
-                    &binding.capabilities,
-                    config,
-                    agent_name,
-                    model_provider,
-                    None,
-                    binding.principal.as_ref(),
-                )?;
+            let zeroclaw_providers::factory::SessionModelProvider {
+                provider,
+                provider_ref: provider_name,
+                model: model_name,
+                ..
+            } = crate::agent::agent::build_session_model_provider_with_capabilities(
+                &binding.capabilities,
+                config,
+                agent_name,
+                model_provider,
+                None,
+                binding.principal.as_ref(),
+            )?;
             return Ok((provider, provider_name, model_name));
         }
         // A delegate bound to supplied capabilities resolves targets only
@@ -1756,7 +1897,6 @@ impl DelegateTool {
                 sop_audit: None,
                 live_config: self.live_config.clone(),
                 execution_capability: self.execution_capability.clone(),
-                acp_sessions: None,
             })?,
             None => crate::tools::supplied_registry_base()?,
         };
@@ -1817,6 +1957,12 @@ impl DelegateTool {
         // `retain` mutator - no unseal/reseal round-trip through a raw `Vec`.
         // Same set removed as before (`tool.name() != Self::NAME`).
         registry.retain(|tool| tool.name() != Self::NAME);
+        if self.withholds_unrestricted_tools() {
+            // Tools that cannot carry the caller's principal, and the skill
+            // aliases and builders that would restore them, must not be
+            // reintroduced by an independent target's factory.
+            registry.retain(|tool| !tool.requires_unrestricted_principal());
+        }
         Ok(IndependentTargetTools {
             tools: registry,
             deferred_section,
@@ -3039,6 +3185,44 @@ impl DelegateTool {
         admission: DelegateAdmission,
         execution_admission: Option<AgentExecutionAdmission>,
     ) -> anyhow::Result<ToolResult> {
+        let context = args
+            .get("context")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let captured_input = if context.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+        };
+        let child = prepare_child_capture(
+            agent_name,
+            &captured_input,
+            zeroclaw_api::session_events::ChildExecutionMode::Sync,
+            None,
+        )
+        .await?;
+        run_child_capture(
+            child,
+            self.execute_sync_with_target_admission_body(
+                agent_name,
+                prompt,
+                args,
+                admission,
+                execution_admission,
+            ),
+        )
+        .await
+    }
+
+    async fn execute_sync_with_target_admission_body(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+        execution_admission: Option<AgentExecutionAdmission>,
+    ) -> anyhow::Result<ToolResult> {
         if let Some(execution_admission) = execution_admission.as_ref() {
             execution_admission.revalidate()?;
         }
@@ -3375,6 +3559,13 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt_ref {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(
+            ChatMessage::user(&full_prompt).with_timestamp(chrono::Utc::now().timestamp_millis()),
+        );
         // A single-call background delegate has no tool loop to observe, so
         // its one model request and the reply are recorded here.
         if let Some(sink) = self.progress.as_deref() {
@@ -3383,7 +3574,7 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat_with_history(&messages, &model, temperature),
         )
         .await;
         if let Some(sink) = self.progress.as_deref() {
@@ -3693,6 +3884,31 @@ impl DelegateTool {
             });
         }
 
+        let child_capture = match prepare_child_capture(
+            agent_name,
+            &full_prompt,
+            zeroclaw_api::session_events::ChildExecutionMode::Background,
+            Some(task_id.clone()),
+        )
+        .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                // TaskRegistry owns the already-created task. Refused capture
+                // must settle it before returning; no detached worker exists.
+                Self::settle_background_task(
+                    task_control_plane.store.as_ref(),
+                    &result_path,
+                    initial_result,
+                    crate::control_plane::TaskStatus::Failed,
+                    Some(format!("{error:#}")),
+                    std::process::id(),
+                    task_control_plane.boot_id.clone(),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         let agents = Arc::clone(&self.agents);
         // Carried ceiling: the resolved target policy's effective per-hop
         // daily limit (`0` = inherit the global limit), read before the
@@ -3770,6 +3986,7 @@ impl DelegateTool {
         let supervisor_boot_id = terminal_owner_boot_id.clone();
         let memory = self.memory.clone();
         let principal_scope = Arc::clone(&self.principal_scope);
+        let unrestricted_tools = self.unrestricted_tools.for_child();
         let parent_session_key = current_tool_loop_session_key();
         // Receipt continuity for detached work: capture the launching turn's
         // generator so the background sub-loop signs with the same key. The
@@ -3855,6 +4072,7 @@ impl DelegateTool {
                     turn_token: None,
                     memory,
                     principal_scope,
+                    unrestricted_tools,
                     providers_models,
                     risk_profiles,
                     runtime_profiles,
@@ -3878,16 +4096,16 @@ impl DelegateTool {
 
                 let worker: std::pin::Pin<
                     Box<dyn Future<Output = anyhow::Result<ToolResult>> + Send + '_>,
-                > = Box::pin(inner.execute_sync_with_target_admission(
+                > = Box::pin(run_child_capture(child_capture.clone(),inner.execute_sync_with_target_admission_body(
                     &agent_name_owned,
                     &full_prompt,
                     &args_inner,
                     DelegateAdmission::Prevalidated,
                     target_execution_admission.clone(),
-                ));
+                )));
 
                 // Race the delegation against cancellation
-                let outcome = tokio::select! {
+                let mut outcome = tokio::select! {
                     () = child_token.cancelled() => {
                         Err("Cancelled by parent session".to_string())
                     }
@@ -3905,6 +4123,16 @@ impl DelegateTool {
                     }
                 };
 
+                if child_token.is_cancelled()
+                    && let Some(child) = child_capture
+                    && let Err(error) = async {
+                        child.request_cancellation("parent_task_cancelled_child_future").await?;
+                        child.interrupted("parent_task_cancelled_child_future").await
+                    }.await {
+                            // TaskRegistry still settles below. Capture failure
+                            // is retained as the task error, not ignored.
+                            outcome = Err(format!("session_capture_failed: {error:#}"));
+                }
                 drop(inner);
                 drop(args_inner);
                 drop(agent_name_owned);
@@ -4192,6 +4420,7 @@ impl DelegateTool {
             let step_scope = parent_step_scope.clone();
             let memory = self.memory.clone();
             let principal_scope = Arc::clone(&self.principal_scope);
+            let unrestricted_tools = self.unrestricted_tools.for_child();
             let task_control_plane = Arc::clone(&self.task_control_plane);
             let __zc_delegate_alias = agent_name.clone();
 
@@ -4211,6 +4440,21 @@ impl DelegateTool {
                 )
                 .map(|ctx| (agent_name.clone(), ctx));
 
+            let child_prompt = args_clone
+                .get("context")
+                .and_then(serde_json::Value::as_str)
+                .filter(|context| !context.is_empty())
+                .map_or_else(
+                    || prompt.clone(),
+                    |context| format!("[Context]\n{context}\n\n[Task]\n{prompt}"),
+                );
+            let child_capture = prepare_child_capture(
+                &agent_name,
+                &child_prompt,
+                zeroclaw_api::session_events::ChildExecutionMode::ParallelMember,
+                None,
+            )
+            .await?;
             handles.push(zeroclaw_spawn::spawn!(
                 async move {
                     let inner = DelegateTool {
@@ -4231,6 +4475,7 @@ impl DelegateTool {
                         turn_token: Some(turn_token),
                         memory,
                         principal_scope,
+                        unrestricted_tools,
                         providers_models,
                         risk_profiles,
                         runtime_profiles,
@@ -4265,12 +4510,15 @@ impl DelegateTool {
                                                         > + Send
                                                         + '_,
                                                 >,
-                                            > = Box::pin(inner.execute_sync_with_target_admission(
-                                                &agent_name,
-                                                &prompt,
-                                                &args_clone,
-                                                DelegateAdmission::Required,
-                                                target_execution_admission,
+                                            > = Box::pin(run_child_capture(
+                                                child_capture,
+                                                inner.execute_sync_with_target_admission_body(
+                                                    &agent_name,
+                                                    &prompt,
+                                                    &args_clone,
+                                                    DelegateAdmission::Required,
+                                                    target_execution_admission,
+                                                ),
                                             ));
                                             worker.await
                                         })
@@ -4597,6 +4845,11 @@ impl DelegateTool {
                 error: Some(format!("No result found for task_id '{task_id}'")),
             });
         };
+        if !state.is_pending()
+            && let Some(port) = zeroclaw_api::session_events::capture::current_provider_admission()
+        {
+            port.consume_child_result(task_id, &value).await?;
+        }
         let success = state.is_success() && task_error.is_none();
 
         Ok(ToolResult {
@@ -4679,6 +4932,23 @@ impl DelegateTool {
                             .into(),
                     )
                 };
+                if let Some(port) =
+                    zeroclaw_api::session_events::capture::current_provider_admission()
+                {
+                    for result in &results {
+                        if result
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|status| {
+                                !matches!(status, "pending" | "running" | "queued")
+                            })
+                            && let Some(task_id) =
+                                result.get("task_id").and_then(serde_json::Value::as_str)
+                        {
+                            port.consume_child_result(task_id, result).await?;
+                        }
+                    }
+                }
                 return Ok(ToolResult {
                     success,
                     output: serde_json::to_string_pretty(&json!({
@@ -5051,8 +5321,7 @@ impl DelegateTool {
             .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
-            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
-            .add_section(Box::new(crate::agent::prompt::DateTimeSection));
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection));
 
         let mut enriched = builder
             .build_with_approval_policy(&ctx, &always_ask_values)
@@ -5097,7 +5366,7 @@ impl DelegateTool {
         provider_type: &str,
         model: &str,
         model_provider: &dyn ModelProvider,
-        full_prompt: &str,
+        full_prompt: impl Into<ChatMessage>,
         temperature: Option<f64>,
     ) -> anyhow::Result<ToolResult> {
         self.execute_agentic_with_admission(
@@ -5121,7 +5390,7 @@ impl DelegateTool {
         provider_type: &str,
         model: &str,
         model_provider: &dyn ModelProvider,
-        full_prompt: &str,
+        full_prompt: impl Into<ChatMessage>,
         temperature: Option<f64>,
         admission: DelegateAdmission,
         target_config: Option<&Config>,
@@ -5150,7 +5419,7 @@ impl DelegateTool {
         provider_type: &str,
         model: &str,
         model_provider: &dyn ModelProvider,
-        full_prompt: &str,
+        full_prompt: impl Into<ChatMessage>,
         temperature: Option<f64>,
         admission: DelegateAdmission,
         approval_context: DelegateApprovalContext<'_>,
@@ -5293,6 +5562,9 @@ impl DelegateTool {
                     Ok(selected) => selected,
                     Err(_) => return Ok(Self::bounded_tools_refusal(agent_name)),
                 };
+                // `parent_tools` is the parent's build list, not its narrowed
+                // registry, so a withholding session filters it here too.
+                let withhold_unrestricted = self.withholds_unrestricted_tools();
                 // Snapshot actual objects once, with parent -> origin lock order.
                 // Neither guard survives a source call or an await.
                 let snapshot = {
@@ -5302,6 +5574,9 @@ impl DelegateTool {
                 let inherited = snapshot
                     .into_iter()
                     .filter(|(tool, _)| tool.name() != Self::NAME)
+                    .filter(|(tool, _)| {
+                        !withhold_unrestricted || !tool.requires_unrestricted_principal()
+                    })
                     .filter(|(tool, _)| self.security.is_tool_allowed(tool.name()))
                     .filter(|(tool, _)| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                     .collect::<Vec<_>>();
@@ -5417,6 +5692,7 @@ impl DelegateTool {
                         operator_approval_available: false,
                         parent_tools: self
                             .bounded_parent_tools(Arc::clone(&target_parent_tools), &target_policy),
+                        unrestricted_tools: self.unrestricted_tools.for_child(),
                         runtime: Some(Arc::clone(&bounded_runtime)),
                         multimodal_config: self.multimodal_config.clone(),
                         delegate_config: self.delegate_config.clone(),
@@ -5503,6 +5779,16 @@ impl DelegateTool {
                 assembled_bounded.registry
             }
         };
+        // Judge the originating credential again on the finished registry. Both
+        // modes awaited target memory or assembly since their first check, so
+        // a credential that lost administrator authority in the meantime must
+        // not hand the child the tools it now withholds. A target-bound delegate
+        // stays: it shares this withholding, so its children withhold too.
+        if self.withholds_unrestricted_tools() {
+            sub_tools.retain(|tool| {
+                tool.name() == Self::NAME || !tool.requires_unrestricted_principal()
+            });
+        }
 
         // A delegation from inside a headless SOP step carries that step's tool
         // boundary onto the target. Both modes reach it: bounded starts from the
@@ -5541,7 +5827,7 @@ impl DelegateTool {
             })
         });
 
-        // Build enriched system prompt with tools, skills, workspace, datetime context.
+        // Build stable system context; message time is provider-request metadata.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
         // the skill prompt content matches the target's skill tools; bounded delegation
         // keeps the caller's `self.workspace_dir`.
@@ -5598,12 +5884,14 @@ impl DelegateTool {
         // Delegate subagents start a fresh transcript: no prior trim, so no
         // crumb exists and none outlives this scoped loop.
         let mut subagent_crumb_present = false;
-        let mut subagent_injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> =
-            None;
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
-        history.push(ChatMessage::user(full_prompt.to_string()));
+        let mut message = full_prompt.into();
+        if message.timestamp.is_none() {
+            message.timestamp = Some(chrono::Utc::now().timestamp_millis());
+        }
+        history.push(message);
 
         let noop_observer = NoopObserver;
 
@@ -5718,7 +6006,7 @@ impl DelegateTool {
                 // Delegate subagents start a fresh transcript: no prior trim,
                 // so no crumb exists and none outlives this scoped loop.
                 history_has_trim_breadcrumb: &mut subagent_crumb_present,
-                injected_memory_preamble: &mut subagent_injected_memory_preamble,
+
                 channel_name: "delegate",
                 channel_reply_target: None,
                 cancellation_token: Some(self.turn_bound_child_token()),
@@ -7813,6 +8101,7 @@ mod tests {
                     .unwrap()
                     .push(tool_message.content.clone());
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -7820,6 +8109,7 @@ mod tests {
                 });
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "approval_probe".to_string(),
@@ -7870,6 +8160,7 @@ mod tests {
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -7877,6 +8168,7 @@ mod tests {
                 })
             } else {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_1".to_string(),
@@ -7944,6 +8236,7 @@ mod tests {
             if !tool_messages.is_empty() {
                 self.tool_messages.lock().unwrap().extend(tool_messages);
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -7952,6 +8245,7 @@ mod tests {
             }
 
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     ToolCall {
@@ -8027,6 +8321,7 @@ mod tests {
             if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
                 *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8034,6 +8329,7 @@ mod tests {
                 })
             } else {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_1".to_string(),
@@ -8081,6 +8377,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(
                     r#"<tool_call>{"name":"echo_tool","arguments":{"value":"ignored"}}</tool_call>"#
                         .to_string(),
@@ -8125,6 +8422,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "loop".to_string(),
@@ -8434,6 +8732,7 @@ mod tests {
                 None
             };
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: call.is_none().then(|| format!("{} completed", self.alias)),
                 tool_calls: call
                     .into_iter()
@@ -9811,7 +10110,6 @@ mod tests {
                 sop_audit: None,
                 live_config: None,
                 execution_capability: None,
-                acp_sessions: None,
             },
         )
         .unwrap();
@@ -9984,6 +10282,7 @@ mod tests {
             let tool_message_count = request.messages.iter().filter(|m| m.role == "tool").count();
             match tool_message_count {
                 0 => Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_store".to_string(),
@@ -10000,6 +10299,7 @@ mod tests {
                     reasoning_content: None,
                 }),
                 1 => Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_recall".to_string(),
@@ -10024,6 +10324,7 @@ mod tests {
                             .unwrap_or_default();
                     }
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("memory workflow done".to_string()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -10569,6 +10870,7 @@ mod tests {
                 );
                 assert_eq!(request.tools.is_none_or(<[_]>::is_empty), self.0 == Some(1));
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("independent completion".into()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -10626,8 +10928,8 @@ mod tests {
     #[tokio::test]
     async fn an_agentic_delegate_asks_the_owners_source_for_the_vision_route() {
         use crate::composition::test_support::{
-            IMAGE_TURN, StubProvider, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
-            capabilities_with_providers,
+            StubProvider, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
+            capabilities_with_providers, image_turn,
         };
 
         let principal =
@@ -10681,7 +10983,7 @@ mod tests {
                         "custom",
                         "delegate-test-model",
                         &StubProvider,
-                        IMAGE_TURN,
+                        image_turn(),
                         None,
                     )
                     .await;
@@ -11473,14 +11775,8 @@ mod tests {
         assert!(result.output.contains("tool count matched: 1"));
     }
 
-    /// The bounded agentic child turn gates image markers with the PARENT's
-    /// policy (`self.security`): a marker under the parent policy's
-    /// workspace on a non-vision provider refuses the child turn with the
-    /// capability error, before any provider dispatch. If the child
-    /// `ResolvedIo` regressed to `security: None`, the gate would fail
-    /// closed to the degrade and the child turn would succeed instead.
     #[tokio::test]
-    async fn bounded_agentic_child_refuses_policy_readable_marker_on_non_vision_provider() {
+    async fn bounded_agentic_child_keeps_literal_media_text_as_text() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should create");
         let image_path = workspace.path().join("shot.png");
         std::fs::write(&image_path, b"policy-readable marker fixture")
@@ -11511,15 +11807,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            !result.success,
-            "a policy-readable marker under the parent policy workspace must refuse \
-             the bounded child turn, got error: {:?}",
+            result.success,
+            "literal marker text cannot grant image semantics: {:?}",
             result.error
-        );
-        let error = result.error.as_deref().unwrap_or_default();
-        assert!(
-            error.contains("image marker") && error.contains("vision"),
-            "the refusal must surface the capability error text, got: {error}"
         );
     }
 
@@ -14386,6 +14676,7 @@ target = "memory_recall"
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("mcp done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -14393,6 +14684,7 @@ target = "memory_recall"
                 })
             } else {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_mcp".to_string(),
@@ -14444,6 +14736,7 @@ target = "memory_recall"
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("delegate saw tool".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -14483,6 +14776,7 @@ target = "memory_recall"
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: Vec::new(),
                 usage: None,
@@ -14532,6 +14826,7 @@ target = "memory_recall"
                 .any(|message| message.role == "tool")
             {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: Vec::new(),
                     usage: None,
@@ -14540,6 +14835,7 @@ target = "memory_recall"
             }
 
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),
@@ -14598,6 +14894,7 @@ target = "memory_recall"
                 "unexpected delegated tool count"
             );
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(format!("tool count matched: {actual_tools}")),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -14674,6 +14971,7 @@ target = "memory_recall"
                 temperature,
             });
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("delegate complete".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -15161,7 +15459,7 @@ target = "memory_recall"
     }
 
     #[test]
-    fn enriched_prompt_includes_tools_workspace_date() {
+    fn enriched_prompt_includes_tools_workspace_without_generated_date() {
         let config = AliasedAgentConfig {
             model_provider: "openrouter.test".into(),
             ..Default::default()
@@ -15201,8 +15499,8 @@ target = "memory_recall"
             "should contain workspace path"
         );
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
-            "should contain date section"
+            !prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
+            "system context must not contain a generated date"
         );
         assert!(!prompt.contains("CURRENT DATE & TIME"));
         assert!(!prompt.contains("Time:"));
@@ -16333,7 +16631,8 @@ target = "memory_recall"
             .error
             .as_deref()
             .expect("fixture provider failure retained");
-        assert!(error.contains("Ollama API error (400 Bad Request)"));
+        // This fixture uses the direct provider, without Reliable's aggregate.
+        assert!(error.contains("Ollama API error (400)"), "{error}");
         assert!(error.contains("background persistence fixture provider failure"));
         let snapshot = tool
             .background_control_plane()
@@ -18051,6 +18350,7 @@ target = "memory_recall"
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 return Ok(ChatResponse {
                     text: Some("middle finished after all".to_string()),
+                    output_blocks: vec![],
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
@@ -18058,6 +18358,7 @@ target = "memory_recall"
             }
             Ok(ChatResponse {
                 text: None,
+                output_blocks: vec![],
                 tool_calls: vec![ToolCall {
                     id: "call_leaf_bg".to_string(),
                     name: DelegateTool::NAME.to_string(),
@@ -18271,6 +18572,7 @@ target = "memory_recall"
             if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
                 *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("sub-delegation finished".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -18300,6 +18602,7 @@ target = "memory_recall"
                 }
             };
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),
@@ -19870,6 +20173,836 @@ command = "echo hi"
         );
     }
 
+    /// A parent build-list entry. With `nested` it stands in for a tool that
+    /// requires an unrestricted principal: a SOP entry point, a session-data
+    /// tool, a scheduler or a sub-agent spawner that rebuilds its own registry.
+    struct ParentToolProbe {
+        name: &'static str,
+        nested: bool,
+    }
+
+    #[async_trait]
+    impl Tool for ParentToolProbe {
+        fn requires_unrestricted_principal(&self) -> bool {
+            self.nested
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "parent tool probe"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "probe".into(),
+                error: None,
+            })
+        }
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ParentToolProbe);
+
+    /// Whether a captured provider request offers `name`, either listed in
+    /// the text-tool prompt or as a native tool spec.
+    fn offered_tool(request: &str, name: &str) -> bool {
+        request.contains(&format!("**{name}**"))
+            || request.contains(&format!("\"name\":\"{name}\""))
+    }
+
+    #[tokio::test]
+    async fn withheld_sop_tools_do_not_reach_delegate_children() {
+        // Bounded children start from the parent's build list, which still
+        // holds every tool the parent's own registry withheld. Background and
+        // parallel workers rebuild the delegate, so they must carry the
+        // withholding rather than start without it.
+        let server = start_tool_capturing_chat_server(4).await;
+        let DelegateMemoryFixture { _tmp, tool, .. } =
+            delegate_memory_fixture(Some(server.uri.clone())).await;
+        let probes = [
+            "sop_execute",
+            "sop_approve",
+            "sop_advance",
+            "sop_list",
+            "spawn_subagent",
+        ];
+        let mut config = tool
+            .root_config
+            .as_deref()
+            .expect("fixture root config")
+            .clone();
+        config
+            .risk_profiles
+            .get_mut("agentic_test")
+            .expect("fixture risk profile")
+            .allowed_tools
+            .extend(
+                probes
+                    .into_iter()
+                    .chain(["sop_workshop", "workshop__apply"])
+                    .map(String::from),
+            );
+        let workshop: Arc<dyn Tool> = Arc::new(crate::tools::sop_workshop::SopWorkshopTool::new(
+            Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                config.sop.clone(),
+            ))),
+            _tmp.path().to_path_buf(),
+        ));
+        let alias = crate::skills::SkillTool {
+            name: "apply".into(),
+            description: "Apply a shared SOP proposal".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: HashMap::new(),
+            target: Some("sop_workshop".into()),
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let workshop_alias: Arc<dyn Tool> =
+            Arc::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+                "workshop",
+                &alias,
+                Arc::clone(&workshop),
+                HashMap::new(),
+            ));
+        let parent_tools = probes
+            .into_iter()
+            .map(|name| {
+                Arc::new(ParentToolProbe {
+                    name,
+                    nested: name != "sop_list",
+                }) as Arc<dyn Tool>
+            })
+            .chain([workshop, workshop_alias])
+            .collect();
+        let config = Arc::new(config);
+        let tool = DelegateTool {
+            security: Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap()),
+            risk_profiles: Arc::new(config.risk_profiles.clone()),
+            root_config: Some(Arc::clone(&config)),
+            ..tool
+        }
+        .with_parent_tools(Arc::new(RwLock::new(parent_tools)));
+
+        let admin = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let live_admin = Arc::clone(&admin);
+        tool.set_principal_admission(Arc::new(move || live_admin.load(Ordering::SeqCst)));
+        let control = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(control.success, "control delegate failed: {control:?}");
+
+        admin.store(false, Ordering::SeqCst);
+        let sync = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(sync.success, "sync delegate failed: {sync:?}");
+        let parallel = tool
+            .execute(json!({"parallel": ["target"], "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(parallel.success, "parallel delegate failed: {parallel:?}");
+        let background = tool
+            .execute(json!({"agent": "target", "prompt": "run", "background": true}))
+            .await
+            .unwrap();
+        assert!(
+            background.success,
+            "background delegate failed: {background:?}"
+        );
+        let task_id = background
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let settled = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_eq!(
+            settled.status,
+            BackgroundTaskStatus::Completed,
+            "{settled:?}"
+        );
+
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4, "one provider request per delegation");
+        for name in [
+            "sop_approve",
+            "spawn_subagent",
+            "sop_workshop",
+            "workshop__apply",
+        ] {
+            assert!(
+                offered_tool(&requests[0], name),
+                "control: a child that withholds nothing is offered {name}"
+            );
+        }
+        for (request, path) in requests[1..].iter().zip(["sync", "parallel", "background"]) {
+            for name in ["sop_execute", "sop_approve", "sop_advance"]
+                .iter()
+                .chain(&["spawn_subagent", "sop_workshop", "workshop__apply"])
+            {
+                assert!(
+                    !offered_tool(request, name),
+                    "the {path} child was offered {name}"
+                );
+            }
+            assert!(
+                offered_tool(request, "sop_list"),
+                "the {path} child keeps sop_list"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn withheld_sop_tools_do_not_reach_independent_targets() {
+        // Independent targets rebuild their registry. Even without an SOP
+        // engine in this factory, they must not regain unguarded nested
+        // builders or aliases of those builders.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        async fn target_tool_names(tool: &DelegateTool) -> Vec<String> {
+            let policy = tool
+                .policy_for_target("target")
+                .expect("independent target policy resolves");
+            tool.independent_agentic_tools_for_target("target", policy)
+                .await
+                .expect("target-owned registry builds")
+                .tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect()
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        let skill_dir = target_ws.join("skills").join("peek");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "peek"
+description = "aliases an unguarded nested builder"
+version = "0.1.0"
+
+[[tools]]
+name = "history"
+description = "launch nested work"
+kind = "builtin"
+command = ""
+target = "spawn_subagent"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: [
+                    "shell",
+                    "spawn_subagent",
+                    "sessions_list",
+                    "sessions_history",
+                    "sessions_send",
+                    "sessions_current",
+                ]
+                .map(String::from)
+                .to_vec(),
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime));
+        let alias = crate::tools::skill_tool::composed_tool_name("peek", "history");
+
+        // A credential that is no longer an administrator withholds every
+        // tool that requires an unrestricted principal, the session-data
+        // tools included, and keeps the rest.
+        let withheld: Vec<&str> = crate::tools::SESSION_DATA_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(["spawn_subagent", alias.as_str()])
+            .collect();
+        let before = target_tool_names(&tool).await;
+        for name in &withheld {
+            assert!(
+                before.iter().any(|held| held == name),
+                "control: the target registry holds {name}: {before:?}"
+            );
+        }
+
+        tool.set_principal_admission(Arc::new(|| false));
+        let after = target_tool_names(&tool).await;
+        for name in &withheld {
+            assert!(
+                !after.iter().any(|held| held == name),
+                "a withholding target registry holds {name}: {after:?}"
+            );
+        }
+        for name in ["sessions_current", "shell"] {
+            assert!(
+                after.iter().any(|held| held == name),
+                "the target keeps {name}: {after:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn withheld_sop_tools_do_not_reach_an_independent_grandchild() {
+        // A bounded child delegates onward through the target-bound delegate
+        // its assembly builds. When that next hop is independent, the
+        // grandchild assembles its own registry from config, so the live resolver
+        // carried by the target-bound delegate must withhold the tools there.
+        let temp = TempDir::new().unwrap();
+        let leaf_reply =
+            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]});
+        let (server, captured) =
+            start_scripted_chat_server(&[leaf_reply.clone(), leaf_reply]).await;
+        let fixture = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller", "middle"],
+            3,
+            true,
+            false,
+        );
+        let mut config = (*fixture).clone();
+        config
+            .agents
+            .get_mut("middle")
+            .expect("fixture agent exists")
+            .delegates = vec![DelegateTargetConfig {
+            agent: "leaf".to_string(),
+            mode: DelegateExecutionMode::Independent,
+        }];
+        let config = Arc::new(config);
+        let tool = bounded_subdelegation_tool(&config).with_runtime(Arc::new(DelegateTestRuntime));
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        for withhold in [false, true] {
+            if withhold {
+                tool.set_principal_admission(Arc::new(|| false));
+            }
+            let provider = DelegateCallThenFinalModelProvider::new("leaf");
+            let result = tool
+                .execute_agentic(
+                    "middle",
+                    &middle_config,
+                    "custom.local",
+                    "test-model",
+                    &provider,
+                    "descend",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.success, "got: {:?}", result.error);
+            let tool_message = provider
+                .tool_message()
+                .expect("leaf's reply must be fed back to middle");
+            assert!(tool_message.contains("leaf finished"), "{tool_message:?}");
+        }
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "one leaf request per run: {requests:?}");
+        assert!(
+            offered_tool(&requests[0], "spawn_subagent"),
+            "control: the independent grandchild is offered the nested builder"
+        );
+        assert!(
+            !offered_tool(&requests[1], "spawn_subagent"),
+            "the non-admin independent grandchild must not rebuild unrestricted SOP tools"
+        );
+        assert!(offered_tool(&requests[1], "sessions_current"));
+    }
+
+    #[tokio::test]
+    async fn withheld_session_tools_do_not_reach_delegate_children() {
+        // Bounded children start from the parent's build list, which still
+        // holds every tool the parent's own registry withheld. Background and
+        // parallel workers rebuild the delegate, so they must carry the
+        // withholding rather than start without it.
+        let server = start_tool_capturing_chat_server(4).await;
+        let DelegateMemoryFixture { _tmp, tool, .. } =
+            delegate_memory_fixture(Some(server.uri.clone())).await;
+        let probes = [
+            "sessions_list",
+            "sessions_history",
+            "sessions_send",
+            "sessions_current",
+            "cron_add",
+            "spawn_subagent",
+        ];
+        let mut config = tool
+            .root_config
+            .as_deref()
+            .expect("fixture root config")
+            .clone();
+        config
+            .risk_profiles
+            .get_mut("agentic_test")
+            .expect("fixture risk profile")
+            .allowed_tools
+            .extend(probes.map(String::from));
+        let config = Arc::new(config);
+        let tool = DelegateTool {
+            security: Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap()),
+            risk_profiles: Arc::new(config.risk_profiles.clone()),
+            root_config: Some(Arc::clone(&config)),
+            ..tool
+        }
+        .with_parent_tools(Arc::new(RwLock::new(
+            probes
+                .into_iter()
+                .map(|name| {
+                    Arc::new(ParentToolProbe {
+                        name,
+                        nested: name != "sessions_current",
+                    }) as Arc<dyn Tool>
+                })
+                .collect(),
+        )));
+
+        let control = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(control.success, "control delegate failed: {control:?}");
+
+        tool.withhold_unrestricted_tools();
+        let sync = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(sync.success, "sync delegate failed: {sync:?}");
+        let parallel = tool
+            .execute(json!({"parallel": ["target"], "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(parallel.success, "parallel delegate failed: {parallel:?}");
+        let background = tool
+            .execute(json!({"agent": "target", "prompt": "run", "background": true}))
+            .await
+            .unwrap();
+        assert!(
+            background.success,
+            "background delegate failed: {background:?}"
+        );
+        let task_id = background
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let settled = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_eq!(
+            settled.status,
+            BackgroundTaskStatus::Completed,
+            "{settled:?}"
+        );
+
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4, "one provider request per delegation");
+        for name in ["sessions_history", "cron_add", "spawn_subagent"] {
+            assert!(
+                offered_tool(&requests[0], name),
+                "control: a child that withholds nothing is offered {name}"
+            );
+        }
+        for (request, path) in requests[1..].iter().zip(["sync", "parallel", "background"]) {
+            for name in crate::tools::SESSION_DATA_TOOL_NAMES
+                .iter()
+                .chain(&["cron_add", "spawn_subagent"])
+            {
+                assert!(
+                    !offered_tool(request, name),
+                    "the {path} child was offered {name}"
+                );
+            }
+            assert!(
+                offered_tool(request, "sessions_current"),
+                "the {path} child keeps sessions_current"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bounded_child_built_across_a_demotion_withholds_unrestricted_tools() {
+        // A bounded child's registry is finished only after the child waits
+        // for its target's memory and for assembly. The resolver here answers
+        // as an administrator for its first check only, as when the credential
+        // is demoted while the child is being built. The child the delegation
+        // starts must withhold what the demoted credential no longer carries.
+        let server = start_tool_capturing_chat_server(2).await;
+        let DelegateMemoryFixture { _tmp, tool, .. } =
+            delegate_memory_fixture(Some(server.uri.clone())).await;
+        let probes = [
+            "sessions_history",
+            "cron_add",
+            "spawn_subagent",
+            "sessions_current",
+        ];
+        let mut config = tool
+            .root_config
+            .as_deref()
+            .expect("fixture root config")
+            .clone();
+        config
+            .risk_profiles
+            .get_mut("agentic_test")
+            .expect("fixture risk profile")
+            .allowed_tools
+            .extend(probes.map(String::from));
+        let parent_tools = probes
+            .into_iter()
+            .map(|name| {
+                Arc::new(ParentToolProbe {
+                    name,
+                    nested: name != "sessions_current",
+                }) as Arc<dyn Tool>
+            })
+            .collect();
+        let config = Arc::new(config);
+        let tool = DelegateTool {
+            security: Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap()),
+            risk_profiles: Arc::new(config.risk_profiles.clone()),
+            root_config: Some(Arc::clone(&config)),
+            ..tool
+        }
+        .with_parent_tools(Arc::new(RwLock::new(parent_tools)));
+
+        tool.set_principal_admission(Arc::new(|| true));
+        let control = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(control.success, "control delegate failed: {control:?}");
+
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        tool.set_principal_admission(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst) == 0
+        }));
+        let demoted = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(demoted.success, "demoted delegate failed: {demoted:?}");
+
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "one provider request per delegation");
+        for name in ["sessions_history", "cron_add", "spawn_subagent"] {
+            assert!(
+                offered_tool(&requests[0], name),
+                "control: an administrator's child is offered {name}"
+            );
+            assert!(
+                !offered_tool(&requests[1], name),
+                "a child built across the demotion was offered {name}"
+            );
+        }
+        assert!(
+            offered_tool(&requests[1], "sessions_current"),
+            "the child keeps its ordinary tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn withheld_session_tools_do_not_reach_independent_targets() {
+        // An independent target assembles its own registry from config, so it
+        // holds the session-data tools, the sub-agent spawner, and any skill
+        // alias of them whatever the delegating session withheld.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        async fn target_tool_names(tool: &DelegateTool) -> Vec<String> {
+            let policy = tool
+                .policy_for_target("target")
+                .expect("independent target policy resolves");
+            tool.independent_agentic_tools_for_target("target", policy)
+                .await
+                .expect("target-owned registry builds")
+                .tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect()
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        let skill_dir = target_ws.join("skills").join("peek");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "peek"
+description = "aliases a session-data tool"
+version = "0.1.0"
+
+[[tools]]
+name = "history"
+description = "read another session"
+kind = "builtin"
+command = ""
+target = "sessions_history"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: [
+                    "shell",
+                    "spawn_subagent",
+                    "sessions_list",
+                    "sessions_history",
+                    "sessions_send",
+                    "sessions_current",
+                ]
+                .map(String::from)
+                .to_vec(),
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime));
+        let alias = crate::tools::skill_tool::composed_tool_name("peek", "history");
+
+        let withheld: Vec<&str> = crate::tools::SESSION_DATA_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(["spawn_subagent", alias.as_str()])
+            .collect();
+        let before = target_tool_names(&tool).await;
+        for name in &withheld {
+            assert!(
+                before.iter().any(|held| held == name),
+                "control: the target registry holds {name}: {before:?}"
+            );
+        }
+
+        tool.withhold_unrestricted_tools();
+        let after = target_tool_names(&tool).await;
+        for name in &withheld {
+            assert!(
+                !after.iter().any(|held| held == name),
+                "a withholding target registry holds {name}: {after:?}"
+            );
+        }
+        for name in ["sessions_current", "shell"] {
+            assert!(
+                after.iter().any(|held| held == name),
+                "the target keeps {name}: {after:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn withheld_session_tools_do_not_reach_an_independent_grandchild() {
+        // A bounded child delegates onward through the target-bound delegate
+        // its assembly builds. When that next hop is independent, the
+        // grandchild assembles its own registry from config, so the flag the
+        // target-bound delegate shares is all that withholds the tools there.
+        let temp = TempDir::new().unwrap();
+        let leaf_reply =
+            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]});
+        let (server, captured) =
+            start_scripted_chat_server(&[leaf_reply.clone(), leaf_reply]).await;
+        let fixture = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller", "middle"],
+            3,
+            true,
+            false,
+        );
+        let mut config = (*fixture).clone();
+        config
+            .agents
+            .get_mut("middle")
+            .expect("fixture agent exists")
+            .delegates = vec![DelegateTargetConfig {
+            agent: "leaf".to_string(),
+            mode: DelegateExecutionMode::Independent,
+        }];
+        let config = Arc::new(config);
+        let tool = bounded_subdelegation_tool(&config).with_runtime(Arc::new(DelegateTestRuntime));
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        for withhold in [false, true] {
+            if withhold {
+                tool.withhold_unrestricted_tools();
+            }
+            let provider = DelegateCallThenFinalModelProvider::new("leaf");
+            let result = tool
+                .execute_agentic(
+                    "middle",
+                    &middle_config,
+                    "custom.local",
+                    "test-model",
+                    &provider,
+                    "descend",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.success, "got: {:?}", result.error);
+            let tool_message = provider
+                .tool_message()
+                .expect("leaf's reply must be fed back to middle");
+            assert!(tool_message.contains("leaf finished"), "{tool_message:?}");
+        }
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "one leaf request per run: {requests:?}");
+        for name in ["sessions_history", "spawn_subagent"] {
+            assert!(
+                offered_tool(&requests[0], name),
+                "control: an independent grandchild that withholds nothing is offered {name}"
+            );
+        }
+        for name in crate::tools::SESSION_DATA_TOOL_NAMES
+            .iter()
+            .chain(&["spawn_subagent"])
+        {
+            assert!(
+                !offered_tool(&requests[1], name),
+                "the independent grandchild was offered {name}"
+            );
+        }
+        assert!(offered_tool(&requests[1], "sessions_current"));
+    }
+
     /// Captures the system prompt the nested independent loop receives and the
     /// tool results fed back, then finishes after one tool round.
     #[cfg(unix)]
@@ -19946,6 +21079,7 @@ command = "echo hi"
                 .collect();
             if tool_messages.is_empty() {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_echo".to_string(),
@@ -19959,6 +21093,7 @@ command = "echo hi"
             }
             self.tool_messages.lock().unwrap().extend(tool_messages);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -21631,6 +22766,7 @@ command = "rm independent-delegate-marker"
                 for tool in tools {
                     if self.forbidden_names.iter().any(|f| f == &tool.name) {
                         return Ok(ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some(format!("forbidden_tool_seen:{}", tool.name)),
                             tool_calls: Vec::new(),
                             usage: None,
@@ -21640,6 +22776,7 @@ command = "rm independent-delegate-marker"
                 }
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -22449,6 +23586,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: cost_tracking_enabled,
             track_per_agent,
@@ -22546,6 +23684,7 @@ command = "rm independent-delegate-marker"
                 ..CostConfig::default()
             },
             data_dir,
+            "jsonl",
         )
         .expect("reader tracker over the fixture ledger");
         tracker
@@ -22575,9 +23714,12 @@ command = "rm independent-delegate-marker"
     fn record_seed_spend(fixture: &DelegateCostFixture, usd: f64) {
         use crate::cost::CostTracker;
 
-        let tracker =
-            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
-                .expect("global cost tracker over the fixture ledger");
+        let tracker = CostTracker::get_or_init_global(
+            fixture.config.cost.clone(),
+            &fixture.data_dir,
+            &fixture.config.channels.session_backend,
+        )
+        .expect("global cost tracker over the fixture ledger");
         tracker
             .record_usage(crate::cost::TokenUsage::new(
                 "seed-model",
@@ -22597,9 +23739,12 @@ command = "rm independent-delegate-marker"
     fn record_agent_seed_spend(fixture: &DelegateCostFixture, alias: &str, usd: f64) {
         use crate::cost::CostTracker;
 
-        let tracker =
-            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
-                .expect("global cost tracker over the fixture ledger");
+        let tracker = CostTracker::get_or_init_global(
+            fixture.config.cost.clone(),
+            &fixture.data_dir,
+            &fixture.config.channels.session_backend,
+        )
+        .expect("global cost tracker over the fixture ledger");
         tracker
             .record_usage_with_agent(
                 crate::cost::TokenUsage::new(
@@ -22732,6 +23877,7 @@ command = "rm independent-delegate-marker"
                     ..zeroclaw_config::schema::CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );
@@ -23024,6 +24170,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -23134,6 +24281,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -23577,6 +24725,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -24111,6 +25260,7 @@ command = "rm independent-delegate-marker"
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if request.messages.iter().any(|m| m.role == "tool") {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("second provider call was reached".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -24118,6 +25268,7 @@ command = "rm independent-delegate-marker"
                 });
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_lower".to_string(),
@@ -24230,6 +25381,7 @@ command = "rm independent-delegate-marker"
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if call > self.tool_calls {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("later provider call was reached".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -24237,6 +25389,7 @@ command = "rm independent-delegate-marker"
                 });
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: format!("call_flip_{call}"),
@@ -24293,6 +25446,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );
@@ -24398,6 +25552,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );
@@ -24511,6 +25666,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );

@@ -143,6 +143,128 @@ pub(crate) fn dispatch_tool_name(name: &str, dispatch: ToolDispatchContext<'_>) 
     }
 }
 
+/// The active headless SOP step's exclusions merged over `dispatch`'s, or
+/// `None` outside a step. Sequential execution re-derives these per call, as a
+/// `tool_search` earlier in the batch may have activated a tool the step denies.
+fn step_scoped_exclusions(dispatch: ToolDispatchContext<'_>) -> Option<Vec<String>> {
+    crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+        let mut merged = dispatch.excluded_tools.to_vec();
+        crate::agent::loop_::merge_sop_step_exclusions(
+            &mut merged,
+            dispatch.tools_registry,
+            dispatch.activated_tools,
+            Some(&scope),
+        );
+        merged
+    })
+}
+
+fn record_tool_call_start(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+) {
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        arguments: Some(full_args.to_string()),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+}
+
+/// The answer sequential execution would give a call this turn cannot
+/// dispatch, recorded with the same observer events; `None` when the name
+/// resolves. Approval preparation uses it so nobody is asked to approve a
+/// call that would run nothing.
+pub(crate) fn undispatchable_tool_outcome(
+    call_name: &str,
+    call_arguments: &serde_json::Value,
+    tool_call_id: Option<&str>,
+    dispatch: ToolDispatchContext<'_>,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+) -> Option<ToolExecutionOutcome> {
+    let step_exclusions = step_scoped_exclusions(dispatch);
+    let dispatch = ToolDispatchContext {
+        excluded_tools: step_exclusions
+            .as_deref()
+            .unwrap_or(dispatch.excluded_tools),
+        ..dispatch
+    };
+    let unknown = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
+        DispatchResolution::Available(_) => return None,
+        DispatchResolution::Unavailable => false,
+        DispatchResolution::Unknown => true,
+    };
+    let full_args = call_arguments.to_string();
+    let tool_call_id_owned = tool_call_id.map(str::to_string);
+    record_tool_call_start(
+        call_name,
+        tool_call_id_owned.clone(),
+        &full_args,
+        meta,
+        observer,
+    );
+    // Nothing ran; execution's duration here is only the lookup.
+    let duration = Duration::ZERO;
+    Some(if unknown {
+        unknown_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            duration,
+        )
+    } else {
+        unavailable_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            duration,
+        )
+    })
+}
+
+fn unknown_tool_outcome(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    duration: Duration,
+) -> ToolExecutionOutcome {
+    let reason = format!("Unknown tool: {call_name}");
+    observer.record_event(&ObserverEvent::ToolCall {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        duration,
+        success: false,
+        arguments: Some(full_args.to_string()),
+        result: Some(scrub_credentials(&reason)),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+    ToolExecutionOutcome {
+        output: reason.clone(),
+        success: false,
+        error_reason: Some(reason),
+        duration,
+        receipt: None,
+        output_data: None,
+        attachments: Vec::new(),
+    }
+}
+
 fn unavailable_tool_outcome(
     call_name: &str,
     tool_call_id_owned: Option<String>,
@@ -177,32 +299,7 @@ fn unavailable_tool_outcome(
 
 // ── Outcome ──────────────────────────────────────────────────────────────
 
-pub struct ToolExecutionOutcome {
-    /// Text handed to the model and persisted to provider history. The
-    /// success path carries raw bytes; the failure paths of `execute_one_tool`
-    /// fold a tool's detailed error body (which can reflect a token or signed
-    /// URL) into this text and credential-scrub it before storing it here.
-    pub output: String,
-    /// Attachments the tool declared for this result (`ToolOutput::attachments`).
-    /// They reach history through the carrier grammar and are never recovered
-    /// by scanning `output`.
-    pub attachments: Vec<zeroclaw_api::media::RenderedMarker>,
-    /// Structured output when the tool declared one (`ToolOutput::data`).
-    /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
-    /// `output`. Stored raw — consumers scrub at their own rendering boundary.
-    pub output_data: Option<serde_json::Value>,
-    pub success: bool,
-    /// Raw, unscrubbed failure text for trusted in-process consumers (SOP step
-    /// capture, data-flow surfaces). Credential scrubbing is a rendering
-    /// concern applied at each human-facing surface (observer events,
-    /// post-execution log line, CLI progress) and, unlike this field, on the
-    /// model-visible `output`.
-    pub error_reason: Option<String>,
-    pub duration: Duration,
-    /// Cryptographic HMAC receipt proving this tool actually executed.
-    /// Present only when tool receipts are enabled in config.
-    pub receipt: Option<String>,
-}
+pub use zeroclaw_kernel::tool_execution::ToolExecutionOutcome;
 
 // ── Single tool execution ────────────────────────────────────────────────
 
@@ -253,15 +350,13 @@ async fn execute_one_tool_with_provenance(
 ) -> Result<CompletedToolExecution> {
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
-    observer.record_event(&ObserverEvent::ToolCallStart {
-        tool: call_name.to_string(),
-        tool_call_id: tool_call_id_owned.clone(),
-        arguments: Some(full_args.clone()),
-        channel: Some(meta.channel_name.to_string()),
-        agent_alias: meta.agent_alias.map(|s| s.to_string()),
-        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
-        turn_id: Some(meta.turn_id.to_string()),
-    });
+    record_tool_call_start(
+        call_name,
+        tool_call_id_owned.clone(),
+        &full_args,
+        meta,
+        observer,
+    );
     let start = Instant::now();
 
     let resolved = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
@@ -280,31 +375,16 @@ async fn execute_one_tool_with_provenance(
             });
         }
         DispatchResolution::Unknown => {
-            let reason = format!("Unknown tool: {call_name}");
-            let duration = start.elapsed();
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                tool_call_id: tool_call_id_owned.clone(),
-                duration,
-                success: false,
-                arguments: Some(full_args.clone()),
-                result: Some(scrub_credentials(&reason)),
-                channel: Some(meta.channel_name.to_string()),
-                agent_alias: meta.agent_alias.map(|s| s.to_string()),
-                parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
-                turn_id: Some(meta.turn_id.to_string()),
-            });
             return Ok(CompletedToolExecution {
                 executed_tool_name: None,
-                outcome: ToolExecutionOutcome {
-                    output: reason.clone(),
-                    success: false,
-                    error_reason: Some(reason),
-                    duration,
-                    receipt: None,
-                    output_data: None,
-                    attachments: Vec::new(),
-                },
+                outcome: unknown_tool_outcome(
+                    call_name,
+                    tool_call_id_owned,
+                    &full_args,
+                    meta,
+                    observer,
+                    start.elapsed(),
+                ),
             });
         }
     };
@@ -352,20 +432,142 @@ async fn execute_one_tool_with_provenance(
             .await;
     }
 
+    let capture = if zeroclaw_api::session_events::capture::current_tool_admission().is_some() {
+        let id = tool_call_id.ok_or_else(|| anyhow::Error::msg("session_tool_call_id_absent"))?;
+        let prepared = zeroclaw_api::session_events::capture::prepared_tool_for_call(id)
+            .ok_or_else(|| anyhow::Error::msg("session_tool_preparation_absent"))?;
+        // `approved` is a host-only command grant added by the existing
+        // approval owner after resolution; it is not model action input.
+        let mut semantic_arguments = call_arguments.clone();
+        crate::agent::set_runtime_approved_arg(call_name, &mut semantic_arguments, false);
+        prepared
+            .verify_action(call_name, &semantic_arguments)
+            .await?;
+        Some(prepared.start().await?)
+    } else {
+        None
+    };
     let context = ToolExecutionContext::new(cancellation_token.cloned());
-    let execute = context
+    let tool_future = context
         .run(tool.execute_with_context(call_arguments.clone(), &context))
         .instrument(tool_span.clone());
-    let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
+    use futures_util::FutureExt;
+    let execute = std::panic::AssertUnwindSafe(tool_future).catch_unwind();
+    let execute = async {
+        if let Some(port) = &capture {
+            zeroclaw_api::session_events::capture::scope_tool_observation(Arc::clone(port), execute)
+                .await
+        } else {
+            execute.await
+        }
+    };
+    let execution_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
         execute.await
     };
-    if tool_result
-        .as_ref()
-        .is_err_and(|error| error.is::<ToolExecutionCancelled>())
+    let tool_result = match execution_result {
+        Ok(result)
+            if !result
+                .as_ref()
+                .is_err_and(|error| error.is::<ToolExecutionCancelled>()) =>
+        {
+            result
+        }
+        stopped => {
+            // Dropping a host future is not evidence that its external action
+            // stopped. A panic payload is untrusted and may contain secrets.
+            let reason = if stopped.is_err() {
+                "tool_adapter_panic"
+            } else {
+                "tool_wait_cancelled"
+            };
+            if let Some(port) = &capture
+                && !port.has_outcome().await?
+            {
+                port.observe(
+                    zeroclaw_api::session_events::EventData::InvocationOutcomeUnknown {
+                        last_observed_event_id: port.started_event_id(),
+                        reason_key: reason.into(),
+                        observed_partial_ref: None,
+                        error_ref: None,
+                    },
+                    vec![],
+                )
+                .await?;
+            }
+            return match stopped {
+                Ok(_) => Err(ToolLoopCancelled.into()),
+                Err(_) => Err(anyhow::Error::msg("tool_adapter_panic")),
+            };
+        }
+    };
+    if let Some(port) = &capture
+        && !port.has_outcome().await?
     {
-        return Err(ToolLoopCancelled.into());
+        use zeroclaw_api::session_events::{EventData, PayloadRecord, StoredPayloadRef};
+        let (data, payloads) = match &tool_result {
+            Ok(result) => {
+                // Freeze the original result before receipt/presentation transformations.
+                let body = serde_json::json!({"output":result.output.as_str(),
+                    "data":result.output.data(),
+                    "attachments":result.output.attachments(),"success":result.success,
+                    "error":result.error.as_deref()});
+                let raw = PayloadRecord::json("session.tool-result/v1", &body)?;
+                if result.success {
+                    (
+                        EventData::ToolEffectCompleted {
+                            result_ref: StoredPayloadRef::from(&raw),
+                            raw_result_ref: None,
+                            transformation_ref: None,
+                            receipt_ref: None,
+                        },
+                        vec![raw],
+                    )
+                } else {
+                    let error = PayloadRecord::json(
+                        "session.error-detail/v1",
+                        &serde_json::json!({
+                        "error_key":"tool_reported_failure","detail":result.error.as_deref().map(str::to_owned)}),
+                    )?;
+                    (
+                        EventData::ToolEffectFailed {
+                            error_ref: StoredPayloadRef::from(&error),
+                            partial_result_ref: Some(StoredPayloadRef::from(&raw)),
+                            receipt_ref: None,
+                        },
+                        vec![raw, error],
+                    )
+                }
+            }
+            Err(error) => {
+                let error = PayloadRecord::json(
+                    "session.error-detail/v1",
+                    &serde_json::json!({
+                    "error_key":"tool_execution_error","detail":format!("{error:#}")}),
+                )?;
+                // An opaque adapter error does not prove that an external
+                // effect failed before taking effect.
+                (
+                    EventData::InvocationOutcomeUnknown {
+                        last_observed_event_id: port.started_event_id(),
+                        reason_key: "tool_external_outcome_unverified".into(),
+                        observed_partial_ref: None,
+                        error_ref: Some(StoredPayloadRef::from(&error)),
+                    },
+                    vec![error],
+                )
+            }
+        };
+        port.observe(data, payloads).await?;
+    }
+
+    if capture.is_some() && tool_result.is_err() {
+        return Err(zeroclaw_api::session_events::capture::capture_stopped(
+            tool_result
+                .err()
+                .ok_or_else(|| anyhow::Error::msg("tool_error_missing"))?,
+        ));
     }
 
     let outcome = {
@@ -683,17 +885,7 @@ pub(crate) async fn execute_tools_sequential(
         // and that snapshot does not know about it. Without this, the denied
         // tool executes and the step's boundary is only re-derived in time for
         // the NEXT provider request — one call too late.
-        let rescoped_exclusions: Option<Vec<String>> =
-            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
-                let mut merged = dispatch.excluded_tools.to_vec();
-                crate::agent::loop_::merge_sop_step_exclusions(
-                    &mut merged,
-                    dispatch.tools_registry,
-                    dispatch.activated_tools,
-                    Some(&scope),
-                );
-                merged
-            });
+        let rescoped_exclusions = step_scoped_exclusions(dispatch);
         let call_dispatch = ToolDispatchContext {
             tools_registry: dispatch.tools_registry,
             activated_tools: dispatch.activated_tools,
@@ -725,6 +917,9 @@ pub(crate) async fn execute_tools_sequential(
     slots.resize_with(tool_calls.len(), || None);
     Ok(slots)
 }
+
+#[cfg(test)]
+mod session_events_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1153,7 +1348,7 @@ mod tests {
         }
     }
 
-    fn test_turn_meta() -> crate::agent::turn::TurnMeta<'static> {
+    pub(super) fn test_turn_meta() -> crate::agent::turn::TurnMeta<'static> {
         crate::agent::turn::TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
@@ -1935,8 +2130,8 @@ mod tests {
     /// Fake tool whose `execute` returns `Err`, exercising the `Err(e)` arm of
     /// `execute_one_tool` (as distinct from `Ok(ToolResult { success: false })`).
     /// A tool error can embed a redirect URL with a signed query string.
-    struct FailingToolReturningErr {
-        message: &'static str,
+    pub(super) struct FailingToolReturningErr {
+        pub(super) message: &'static str,
     }
 
     #[async_trait]
@@ -2250,7 +2445,7 @@ mod tests {
 
     /// End-to-end: a failed tool whose detailed body carries a credential must
     /// reach the model's tool-result message scrubbed, in both the native
-    /// (`role=tool`) and the prompt-mode (`[Tool results]`) history shapes —
+    /// (`role=tool`) and the text-protocol provider history shape —
     /// the actual "text sent to the model / provider history".
     #[tokio::test]
     async fn failed_tool_credential_is_scrubbed_in_provider_history() {
@@ -2319,12 +2514,6 @@ mod tests {
         )
         .expect("collect_tool_results must succeed");
 
-        assert!(
-            !collected.tool_results.contains(secret)
-                && collected.tool_results.contains("[REDACTED]"),
-            "prompt-mode <tool_result> block must be scrubbed: {}",
-            collected.tool_results
-        );
         for result in &collected.individual_results {
             assert!(
                 !result.output.contains(secret) && result.output.contains("[REDACTED]"),
@@ -2337,11 +2526,9 @@ mod tests {
         let mut native_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut native_history,
-            "assistant text".to_string(),
+            ChatMessage::assistant("assistant text"),
             &native_calls,
             &collected.individual_results,
-            &collected.tool_results,
-            true,
         );
         assert!(
             native_history.iter().all(|m| !m.content.contains(secret)),
@@ -2356,27 +2543,27 @@ mod tests {
 
         let prompt_results = vec![ToolRoundResult {
             tool_call_id: None,
+            tool_name: "test_tool".into(),
+            success: true,
             output: collected.individual_results[0].output.clone(),
             attachments: Vec::new(),
         }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut prompt_history,
-            "assistant text".to_string(),
+            ChatMessage::assistant("assistant text"),
             &native_calls,
             &prompt_results,
-            &collected.tool_results,
-            false,
         );
         assert!(
             prompt_history.iter().all(|m| !m.content.contains(secret)),
-            "no prompt-mode history message may carry the raw credential"
+            "no structured tool history message may carry the raw credential"
         );
         assert!(
             prompt_history
                 .iter()
                 .any(|m| m.content.contains("[REDACTED]")),
-            "the prompt-mode [Tool results] message must carry the scrubbed body"
+            "the tool-result message must carry the scrubbed body"
         );
     }
 
