@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ripgrep \
     python3 \
     jq \
+    expect \
     pkg-config \
     libssl-dev \
     curl \
