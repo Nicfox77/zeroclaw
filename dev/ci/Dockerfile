@@ -10,12 +10,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     jq \
     expect \
+    procps \
     pkg-config \
     libssl-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+
+# Bound compiler memory and disposable artifacts on development hosts.
+ENV CARGO_BUILD_JOBS=2 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_PROFILE_TEST_DEBUG=0
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
