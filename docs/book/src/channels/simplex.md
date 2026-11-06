@@ -1,6 +1,6 @@
 # SimpleX
 
-The optional `channel-simplex` adapter supports direct text messages and incoming
+The optional `channel-simplex` adapter supports direct text, voice notes, and incoming
 encrypted audio calls from the SimpleX Android app. It uses the official
 SimpleX CLI for local identities, encrypted messaging, and call signaling. A
 separate Node.js/Chromium helper supplies virtual audio using SimpleX's
@@ -10,7 +10,7 @@ microphone, or telephony provider is required.
 ## Install
 
 Build ZeroClaw with `cargo build --release --features embedded-web,channel-simplex`.
-Install Node.js 20 or newer, then prepare the helper from the repository root:
+Install Node.js 20 or newer and ffmpeg/ffprobe with AAC support, then prepare the helper from the repository root:
 
 ```sh
 cd contrib/simplex
@@ -59,6 +59,7 @@ interrupt_on_new_message = true
 [peer_groups.simplex_owner]
 channel = "simplex.personal"
 external_peers = ["17"] # example contact ID, replace after pairing
+output_modality = "voice" # text plus a voice note for every reply
 
 # Add "simplex.personal" to the owning agent's channels list.
 # To share its existing permanent conversation across Web and other bindings:
@@ -76,6 +77,30 @@ accepted; wildcard grants do not authorize this adapter. Existing `ignore`
 rules still override grants. Authorization, agent ownership, speech activation,
 and speech-provider selection resolve from live config at use time. Restart or
 reload the daemon after changing the bridge executable or CLI endpoint.
+
+## Voice notes
+
+Incoming direct voice notes are downloaded only after checking the live peer
+grant and transcription limits. They use the owning agent’s transcription
+provider and enter the same conversation as text. `transcription.max_duration_secs`
+sets the duration limit; the transport also caps each note at 5 MiB (or the smaller
+`transcription.max_audio_bytes`). For ten-minute input, set the duration to 600.
+The helper checks the actual file duration before transcription.
+
+`peer_groups.<name>.output_modality` controls replies: `voice` sends both text and
+a native M4A voice note, `text` sends text, and `mirror` follows the incoming
+message type. This does not require `calls_enabled`. Speech is prepared from
+approved streaming text and joined with one AAC encode when the final response
+is ready. Final rewrites invalidate speculative audio. No partial voice notes
+are uploaded. Outbound hooks defer preparation until their final decision.
+
+The helper stages audio in private temporary directories (0700, files 0600).
+Incoming files are removed after transcription handoff; outgoing source files
+remain until encrypted upload completes. Transfer errors, cancellation, timeout,
+and helper shutdown clean up owned files. The temporary STT copy is plaintext;
+the SimpleX transfer remains encrypted. A failed transfer produces a text notice.
+Pending invitations from before the adapter started are not replayed; resend
+those voice notes after enabling this feature. Generic attachments are ignored.
 
 ## Calls and speech
 
@@ -104,8 +129,7 @@ outbound hooks are active, speech waits for their final decision. Already spoken
 audio cannot be withdrawn; a rewrite of spoken content stops that speech worker
 instead of replaying it. Text replies are also delivered to the SimpleX chat.
 
-This initial adapter supports direct text and incoming audio calls. Group chats,
-file attachments, voice-note messages, and agent-initiated calls are not handled.
+Group chats, generic file attachments, and agent-initiated calls are not handled.
 Android screen-off, Bluetooth routing, TURN reachability, and battery restrictions
 must be verified on the actual phone.
 
@@ -116,16 +140,20 @@ transport failure; interrupted speech must not be retried as a fresh full answer
 
 ## Verification and rollback
 
-Run `npm test` in `contrib/simplex`. With `CHROMIUM_PATH` and assets configured,
+Run `npm test` in `contrib/simplex` (ffmpeg and ffprobe are required for note tests). With `CHROMIUM_PATH` and assets configured,
 `SIMPLEX_RTC_TEST=1 npm test` additionally checks encrypted audio in both directions
-and rejects mismatched encryption keys. Rust adapter tests exercise peer denial,
+and rejects mismatched encryption keys. `SIMPLEX_CLI_TEST=1 npm test` additionally
+creates two temporary CLI profiles and verifies encrypted voice-note transfers
+in both directions through public relays; `SIMPLEX_CLI_PATH` selects the CLI binary.
+Rust adapter tests exercise peer denial,
 live policy changes, routing, and speech before finalization.
 `SIMPLEX_RELAY_TEST=1 npm test` additionally exercises the real helper through
 public TURN relays with simulated CLI signaling, including speech detection and
 interruption. It does not contact phone users or invoke model providers.
 
-For an end-to-end check, send a direct message, then start an audio call from
-Android. Confirm the encryption indicator, speak, hear the reply, interrupt it,
+For an end-to-end check, send text and a voice note from Android. Confirm
+transcription and text-plus-voice delivery with `output_modality = "voice"`.
+Then start an audio call from Android. Confirm the encryption indicator, speak, hear the reply, interrupt it,
 and repeat with headphones and the screen locked. Confirm that the same main
 conversation is visible from the Web dashboard.
 

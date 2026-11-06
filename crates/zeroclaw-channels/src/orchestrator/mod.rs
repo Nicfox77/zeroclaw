@@ -3443,7 +3443,8 @@ fn sender_prefers_voice(
 
     let channel_type = msg.channel.as_str();
     let matrix = channel_type.starts_with("matrix");
-    if !(matrix || channel_type.starts_with("telegram")) {
+    let simplex = channel_type == "simplex";
+    if !(matrix || simplex || channel_type.starts_with("telegram")) {
         return None;
     }
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
@@ -3456,8 +3457,15 @@ fn sender_prefers_voice(
         .collect();
     // The normalized peers of every group of `modality` on this channel.
     let peers_of = |modality: OutputModality| -> Vec<String> {
-        ctx.prompt_config
-            .channel_modality_peers(channel_type, channel_alias, modality)
+        let peers = if simplex {
+            ctx.live_config
+                .read()
+                .channel_modality_peers(channel_type, channel_alias, modality)
+        } else {
+            ctx.prompt_config
+                .channel_modality_peers(channel_type, channel_alias, modality)
+        };
+        peers
             .into_iter()
             .map(|p| normalize_peer_username(&p))
             .collect()
@@ -3477,7 +3485,7 @@ fn sender_prefers_voice(
     if names_sender(&voice_peers) {
         return Some(true);
     }
-    if !matrix {
+    if !(matrix || simplex) {
         return None;
     }
     if names_sender(&peers_of(OutputModality::Text)) {
@@ -10224,8 +10232,13 @@ async fn process_channel_message_body_inner(
             {
                 stop_matrix_single_message_typing_scope(scope).await;
             }
-            let draft =
+            let mut draft =
                 SendMessage::reply_to(&msg, zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER);
+            if channel.supports_voice_draft_finalization()
+                && sender_prefers_voice(&ctx, &msg) == Some(true)
+            {
+                draft = draft.force_voice();
+            }
             match session_history::observe_delivery(
                 "draft_started",
                 channel.name(),
@@ -11273,11 +11286,10 @@ async fn process_channel_message_body_inner(
                     .await
                     .map(|()| ReplyDelivery::Complete)
                 } else if let Some(ref draft_id) = draft_message_id {
-                    // Same channel with draft. For force-voice routing: cancel the
-                    // draft placeholder and deliver via send_final() so force_voice
-                    // reaches the channel's voice path (finalize_draft has no
-                    // force_voice concept).
-                    if force_voice_override {
+                    // Keep prepared audio when the adapter can finalize with
+                    // explicit modality. Other adapters retain their existing
+                    // force-voice send_final path.
+                    if force_voice_override && !channel.supports_voice_draft_finalization() {
                         let _ = session_history::cancel_draft(
                             channel.as_ref(),
                             &delivery_recipient,
@@ -11351,11 +11363,12 @@ async fn process_channel_message_body_inner(
                         } else {
                             delivered_response.clone()
                         };
-                        match session_history::deliver(native_history.as_ref(),&native_turn_id,channel.name(),&delivery_recipient,&draft_final_response,channel.finalize_draft(
+                        match session_history::deliver(native_history.as_ref(),&native_turn_id,channel.name(),&delivery_recipient,&draft_final_response,channel.finalize_draft_with_modality(
                                 &delivery_recipient,
                                 draft_id,
                                 &draft_final_response,
                                 suppress,
+                                force_voice_override,
                             )).await
                         {
                             Ok(()) => Ok(ReplyDelivery::Complete),
@@ -42647,6 +42660,40 @@ BTC is currently around $65,000 based on latest tool output."#
         ctx.prompt_config = Arc::new(prompt_config.clone());
         ctx.live_config = zeroclaw_config::live::LiveConfig::new(prompt_config).handle();
         ctx
+    }
+
+    #[test]
+    fn simplex_reply_modality_uses_live_policy_and_mirrors_voice_origin() {
+        use zeroclaw_config::{live::LiveConfig, multi_agent::OutputModality};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = HashMap::new();
+        groups.insert(
+            "owner".into(),
+            mirror_peer_group("simplex.personal", &["17"]),
+        );
+        let mut ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+        let live = LiveConfig::new((*ctx.prompt_config).clone());
+        ctx.live_config = live.handle();
+        let mut message = ChannelMessage {
+            channel: "simplex".into(),
+            channel_alias: Some("personal".into()),
+            sender: "17".into(),
+            platform_sender_id: Some("17".into()),
+            voice_origin: true,
+            ..Default::default()
+        };
+        assert_eq!(sender_prefers_voice(&ctx, &message), Some(true));
+        message.voice_origin = false;
+        assert_eq!(sender_prefers_voice(&ctx, &message), Some(false));
+        let mut config = live.snapshot();
+        config.peer_groups.get_mut("owner").unwrap().output_modality = OutputModality::Voice;
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        assert_eq!(sender_prefers_voice(&ctx, &message), Some(true));
+        let mut config = live.snapshot();
+        config.peer_groups.get_mut("owner").unwrap().output_modality = OutputModality::Text;
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        message.voice_origin = true;
+        assert_eq!(sender_prefers_voice(&ctx, &message), Some(false));
     }
 
     fn agent_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {

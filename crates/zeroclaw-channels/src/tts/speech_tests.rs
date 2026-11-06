@@ -224,3 +224,36 @@ async fn speech_concat_real_wav_parts_decode_as_one_complete_opus_file() {
         "both clips must survive decoding"
     );
 }
+
+#[cfg(feature = "channel-simplex")]
+#[tokio::test]
+#[ignore = "requires ffmpeg with AAC; run explicitly for voice deployment"]
+async fn speech_concat_real_wav_parts_decode_as_one_complete_m4a_file() {
+    let audio = concat_parts_with_format(
+        &[silence_wav(2400), silence_wav(2400)],
+        "wav",
+        SpeechContainer::M4a,
+        tokio::process::Command::new("ffmpeg"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(&audio[4..8], b"ftyp");
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(&audio).unwrap();
+    let decoded = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(file.path())
+        .args(["-f", "s16le", "-ac", "1", "-ar", "24000", "pipe:1"])
+        .output()
+        .await
+        .unwrap();
+    assert!(decoded.status.success());
+    assert!(
+        decoded.stdout.len() >= 4800 * 2,
+        "both clips must survive AAC decoding"
+    );
+    assert!(
+        decoded.stdout.len() < 7200 * 2,
+        "only normal codec padding is allowed"
+    );
+}

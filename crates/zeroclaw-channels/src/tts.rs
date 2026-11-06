@@ -1089,9 +1089,9 @@ pub struct TtsManager {
     max_text_length: usize,
 }
 
-#[cfg(feature = "channel-telegram")]
+#[cfg(any(feature = "channel-telegram", feature = "channel-simplex"))]
 pub(crate) mod speech;
-#[cfg(feature = "channel-telegram")]
+#[cfg(any(feature = "channel-telegram", feature = "channel-simplex"))]
 pub(crate) use speech::SpeechJob;
 
 impl TtsManager {
@@ -1288,6 +1288,18 @@ impl TtsManager {
     pub(crate) async fn concat_parts_to_opus(&self, parts: &[Vec<u8>]) -> Result<Vec<u8>> {
         let format = self.agent_output_format().unwrap_or("wav").to_string();
         speech::concat_parts_to_opus(parts, &format).await
+    }
+
+    /// SimpleX mobile clients use AAC in an M4A container for voice notes.
+    #[cfg(feature = "channel-simplex")]
+    pub(crate) async fn concat_parts_to_m4a(&self, parts: &[Vec<u8>]) -> Result<Vec<u8>> {
+        speech::concat_parts_with_format(
+            parts,
+            self.agent_output_format().unwrap_or("wav"),
+            speech::SpeechContainer::M4a,
+            tokio::process::Command::new("ffmpeg"),
+        )
+        .await
     }
 }
 

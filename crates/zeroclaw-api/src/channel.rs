@@ -1413,6 +1413,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Whether force-voice routing can retain this adapter's prepared draft.
+    fn supports_voice_draft_finalization(&self) -> bool {
+        false
+    }
+
+    /// Finalize with an explicit voice request, retaining speculative audio.
+    /// Adapters opting in must honor both flags; suppression takes precedence.
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        _force_voice: bool,
+    ) -> anyhow::Result<()> {
+        self.finalize_draft(recipient, message_id, text, suppress_voice)
+            .await
+    }
+
     /// Cancel and remove a previously sent draft message if the channel supports it.
     async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())

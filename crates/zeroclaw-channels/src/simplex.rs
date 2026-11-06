@@ -190,8 +190,8 @@ impl SimplexChannel {
         }
         result
     }
-    fn manager(&self, contact: &str) -> Result<crate::tts::TtsManager> {
-        ensure!(self.allowed(contact, true), "simplex_call_not_authorized");
+    fn manager(&self, contact: &str, call: bool) -> Result<crate::tts::TtsManager> {
+        ensure!(self.allowed(contact, call), "simplex_voice_not_authorized");
         let config = self.inner.config.read();
         ensure!(config.tts.enabled, "simplex_tts_disabled");
         let owner = config
@@ -199,6 +199,108 @@ impl SimplexChannel {
             .context("simplex_unowned_channel")?;
         crate::tts::TtsManager::from_config_for_agent(&config, Some(owner))
     }
+    fn wants_note(&self, contact: &str, force: bool) -> bool {
+        use zeroclaw_config::multi_agent::OutputModality;
+        let config = self.inner.config.read();
+        let matches = |modality| {
+            config
+                .channel_modality_peers("simplex", &self.inner.alias, modality)
+                .iter()
+                .any(|peer| zeroclaw_config::schema::peer_grant_identity(peer) == Some(contact))
+        };
+        !matches(OutputModality::Text) && (force || matches(OutputModality::Voice))
+    }
+    async fn voice_notice(&self, contact: &str, outgoing: bool) -> Result<()> {
+        if !self.allowed(contact, false) {
+            return Ok(());
+        }
+        let text = zeroclaw_runtime::i18n::get_required_cli_string(if outgoing {
+            "channel-simplex-voice-reply-failed"
+        } else {
+            "channel-simplex-voice-note-failed"
+        });
+        self.request(json!({"type":"send", "contact":contact, "text":text}))
+            .await
+    }
+    async fn finish_reply(
+        &self,
+        recipient: &str,
+        mut draft: Option<VoiceDraft>,
+        text: &str,
+        suppress_voice: bool,
+        force_voice: bool,
+    ) -> Result<()> {
+        ensure!(
+            self.allowed(recipient, false),
+            "simplex_contact_not_authorized"
+        );
+        if let Some(draft) = &draft {
+            ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+        }
+        let is_call = draft.as_ref().is_some_and(|d| !d.scope.is_empty());
+        let mut voice = None;
+        if !is_call && !suppress_voice && self.wants_note(recipient, force_voice) {
+            let prepared = draft.as_mut().and_then(|d| d.note.take());
+            let result = async {
+                // Recheck live permission and provider configuration at finalization.
+                let current = Arc::new(self.manager(recipient, false)?);
+                let note = prepared.unwrap_or_else(|| NoteSpeech {
+                    job: crate::tts::SpeechJob::start(current.clone()),
+                    manager: current,
+                });
+                let parts = note.job.finish(text).await?;
+                let audio = note.manager.concat_parts_to_m4a(&parts).await?;
+                ensure!(audio.len() <= 5 * 1024 * 1024, "simplex_voice_size_limit");
+                ensure!(
+                    self.allowed(recipient, false),
+                    "simplex_contact_not_authorized"
+                );
+                Ok::<_, anyhow::Error>(base64::engine::general_purpose::STANDARD.encode(audio))
+            }
+            .await;
+            match result {
+                Ok(audio) => voice = Some(audio),
+                Err(_) => {
+                    // Synthesis has no transport effect. Preserve the text response.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                        "SimpleX voice note synthesis failed; delivering text"
+                    );
+                }
+            }
+        }
+        // Audio failure after text delivery must never trigger a duplicate text
+        // fallback. Deliver audio first and let final text ACK be authoritative.
+        if !suppress_voice
+            && let Some(mut draft) = draft
+            && let Err(error) = draft.finish(text).await
+        {
+            if zeroclaw_api::session_events::capture::is_capture_stopped(&error) {
+                return Err(error);
+            }
+            // Text is the final delivery boundary. A handled speech failure
+            // must not turn an unattempted text send into uncertain capture.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(json!({"error": error.to_string()})),
+                "SimpleX speech failed; delivering final text"
+            );
+        }
+        ensure!(
+            self.allowed(recipient, false),
+            "simplex_contact_not_authorized"
+        );
+        if voice.is_some()
+            && (!self.wants_note(recipient, force_voice) || self.manager(recipient, false).is_err())
+        {
+            voice = None;
+        }
+        self.request(json!({"type": "send", "contact": recipient, "text": text, "voice":voice}))
+            .await
+    }
+
     async fn event(&self, event: Value, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let kind = event["type"].as_str().unwrap_or("");
         let contact = event["contact"].as_str().unwrap_or("");
@@ -210,8 +312,43 @@ impl SimplexChannel {
                 .retain(|scope, _| !scope.starts_with(&prefix));
             return Ok(());
         }
+        if kind == "voice_transfer_failed" {
+            return self.voice_notice(contact, event["outgoing"] == true).await;
+        }
+        if kind == "voice_invitation" {
+            if !self.allowed(contact, false) {
+                return Ok(());
+            }
+            let limits = {
+                let config = self.inner.config.read();
+                (
+                    config.transcription.enabled,
+                    config.transcription.max_duration_secs,
+                    config
+                        .transcription
+                        .max_audio_bytes
+                        .unwrap_or(5 * 1024 * 1024)
+                        .min(5 * 1024 * 1024),
+                )
+            };
+            if !limits.0
+                || !event["duration"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0 && n <= limits.1)
+                || !event["bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0 && n <= limits.2 as u64)
+            {
+                return self.voice_notice(contact, false).await;
+            }
+            return self
+                .request(json!({"type":"receive_voice", "contact":contact,
+                "message_id":event["id"], "file_id":event["file_id"], "filename":event["filename"],
+                "max_duration":limits.1}))
+                .await;
+        }
         if kind == "call_invitation" {
-            let accept = self.allowed(contact, true) && self.manager(contact).is_ok() && {
+            let accept = self.allowed(contact, true) && self.manager(contact, true).is_ok() && {
                 let config = self.inner.config.read();
                 config.transcription.enabled
                     && config
@@ -221,15 +358,22 @@ impl SimplexChannel {
             };
             return self.request(json!({"type": if accept {"accept"} else {"reject"}, "contact": contact, "call_id": event["call_id"]})).await;
         }
-        if !matches!(kind, "message" | "utterance") || !self.allowed(contact, kind == "utterance") {
+        if !matches!(kind, "message" | "utterance" | "voice_note")
+            || !self.allowed(contact, kind == "utterance")
+        {
             return Ok(());
         }
-        let voice = kind == "utterance";
+        let call = kind == "utterance";
+        let voice = call || kind == "voice_note";
         let mut text = if voice {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(event["audio"].as_str().context("simplex_audio_missing")?)?;
             ensure!(
-                bytes.len() <= 1_000_000 && bytes.starts_with(b"RIFF"),
+                if call {
+                    bytes.len() <= 1_000_000 && bytes.starts_with(b"RIFF")
+                } else {
+                    !bytes.is_empty() && bytes.len() <= 5 * 1024 * 1024
+                },
                 "simplex_invalid_utterance"
             );
             let manager = {
@@ -237,6 +381,12 @@ impl SimplexChannel {
                 ensure!(
                     config.transcription.enabled,
                     "simplex_transcription_disabled"
+                );
+                ensure!(
+                    call || event["duration"].as_f64().is_some_and(
+                        |n| n > 0.0 && n <= config.transcription.max_duration_secs as f64
+                    ),
+                    "simplex_voice_duration_limit"
                 );
                 let owner = config
                     .agent_for_channel(&format!("simplex.{}", self.inner.alias))
@@ -246,7 +396,14 @@ impl SimplexChannel {
                     Some(owner),
                 )?
             };
-            manager.transcribe(&bytes, "call.wav").await?
+            let filename = if call {
+                "call.wav"
+            } else {
+                event["filename"]
+                    .as_str()
+                    .context("simplex_voice_filename_missing")?
+            };
+            manager.transcribe(&bytes, filename).await?
         } else {
             event["text"]
                 .as_str()
@@ -254,10 +411,10 @@ impl SimplexChannel {
                 .to_string()
         };
         // Speech recognition is asynchronous. Recheck policy after it returns.
-        if (!voice && text.trim().is_empty()) || !self.allowed(contact, voice) {
+        if (!voice && text.trim().is_empty()) || !self.allowed(contact, call) {
             return Ok(());
         }
-        if voice {
+        if call {
             let scope = event["scope"]
                 .as_str()
                 .context("simplex_voice_scope_missing")?;
@@ -285,8 +442,8 @@ impl SimplexChannel {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
-            thread_ts: voice.then(|| event["scope"].as_str().unwrap_or("").to_string()),
-            interruption_scope_id: voice
+            thread_ts: call.then(|| event["scope"].as_str().unwrap_or("").to_string()),
+            interruption_scope_id: call
                 .then(|| event["call_id"].as_str().unwrap_or("").to_string()),
             voice_origin: voice,
             explicitly_addressed: true,
@@ -441,11 +598,14 @@ impl Channel for SimplexChannel {
                 .request(json!({"type": "init", "websocket_url": settings.websocket_url}))
                 .await?;
             while let Some(event) = reads.recv().await {
+                let note = matches!(event["type"].as_str(), Some("voice_note" | "voice_invitation"));
+                let contact = event["contact"].as_str().unwrap_or("").to_string();
                 if let Err(error) = channel.event(event, &tx).await {
+                    if note { channel.voice_notice(&contact, false).await?; }
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(json!({"error": error.to_string()})),
+                            .with_attrs(json!({"error": if note { "simplex_voice_note_failed".to_string() } else { error.to_string() }})),
                         "SimpleX event processing failed"
                     );
                 }
@@ -481,6 +641,17 @@ impl Channel for SimplexChannel {
             self.allowed(&message.recipient, false),
             "simplex_contact_not_authorized"
         );
+        if message.thread_ts.is_none() {
+            return self
+                .finish_reply(
+                    &message.recipient,
+                    None,
+                    &message.content,
+                    message.suppress_voice,
+                    message.force_voice,
+                )
+                .await;
+        }
         self.request(
             json!({"type": "send", "contact": message.recipient, "text": message.content}),
         )
@@ -501,13 +672,52 @@ impl Channel for SimplexChannel {
         let id = uuid::Uuid::new_v4().to_string();
         // Text-only turns do not allocate a speech worker. The stored draft is
         // only a delivery scope; no model or policy snapshot is retained.
-        let draft = VoiceDraft::new(
+        let mut draft = VoiceDraft::new(
             self.clone(),
             message.recipient.clone(),
             message.thread_ts.clone().unwrap_or_default(),
         );
+        draft.force_voice = message.force_voice;
         self.inner.drafts.lock().insert(id.clone(), draft);
         Ok(Some(id))
+    }
+    async fn prepare_voice_draft(&self, recipient: &str, id: &str, text: &str) -> Result<()> {
+        ensure!(
+            self.allowed(recipient, false),
+            "simplex_contact_not_authorized"
+        );
+        let mut drafts = self.inner.drafts.lock();
+        if let Some(draft) = drafts.get_mut(id) {
+            ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if draft.scope.is_empty() && self.wants_note(recipient, draft.force_voice) {
+                if draft.note.is_none() {
+                    let manager = Arc::new(self.manager(recipient, false)?);
+                    draft.note = Some(NoteSpeech {
+                        job: crate::tts::SpeechJob::start(manager.clone()),
+                        manager,
+                    });
+                }
+                if let Some(note) = &draft.note {
+                    note.job.update(text);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn supports_voice_draft_finalization(&self) -> bool {
+        true
+    }
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        id: &str,
+        text: &str,
+        suppress_voice: bool,
+        force_voice: bool,
+    ) -> Result<()> {
+        let draft = self.inner.drafts.lock().remove(id);
+        self.finish_reply(recipient, draft, text, suppress_voice, force_voice)
+            .await
     }
     async fn stream_voice_draft(
         &self,
@@ -537,29 +747,7 @@ impl Channel for SimplexChannel {
         suppress_voice: bool,
     ) -> Result<()> {
         let draft = self.inner.drafts.lock().remove(id);
-        ensure!(
-            self.allowed(recipient, false),
-            "simplex_contact_not_authorized"
-        );
-        // Audio failure after text delivery must never trigger a duplicate text
-        // fallback. Deliver audio first and let final text ACK be authoritative.
-        if !suppress_voice
-            && let Some(mut draft) = draft
-            && let Err(error) = draft.finish(text).await
-        {
-            if zeroclaw_api::session_events::capture::is_capture_stopped(&error) {
-                return Err(error);
-            }
-            // Text is the final delivery boundary. A handled speech failure
-            // must not turn an unattempted text send into uncertain capture.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_attrs(json!({"error": error.to_string()})),
-                "SimpleX speech failed; delivering final text"
-            );
-        }
-        self.request(json!({"type": "send", "contact": recipient, "text": text}))
+        self.finish_reply(recipient, draft, text, suppress_voice, false)
             .await
     }
     async fn cancel_draft(&self, recipient: &str, id: &str) -> Result<()> {
@@ -579,10 +767,18 @@ struct SpeechSnapshot {
     text: String,
     finished: bool,
 }
+// A draft owns its synthesis job and the same per-turn manager needed to join
+// its output format. Neither is an additional policy authority.
+struct NoteSpeech {
+    manager: Arc<crate::tts::TtsManager>,
+    job: crate::tts::SpeechJob,
+}
 struct VoiceDraft {
     contact: String,
     scope: String,
     channel: std::sync::Weak<Inner>,
+    force_voice: bool,
+    note: Option<NoteSpeech>,
     phase: usize,
     phase_start: usize,
     updates: watch::Sender<SpeechSnapshot>,
@@ -603,6 +799,8 @@ impl VoiceDraft {
             contact,
             scope,
             channel: Arc::downgrade(&channel.inner),
+            force_voice: false,
+            note: None,
             phase: 0,
             phase_start: 0,
             updates,
@@ -648,7 +846,7 @@ impl VoiceDraft {
                 let channel = SimplexChannel {
                     inner: channel.upgrade().context("simplex_channel_closed")?,
                 };
-                let manager = channel.manager(&contact)?;
+                let manager = channel.manager(&contact, true)?;
                 let cfg = crate::speech_segment::SpeechSegmentConfig::default()
                     .with_max_chars(manager.max_text_length());
                 let segments =
@@ -873,6 +1071,194 @@ mod tests {
         live.publish(live.next_revision().unwrap(), config).unwrap();
         assert!(channel.allowed("17", false));
         assert!(!channel.allowed("17", true));
+    }
+
+    #[tokio::test]
+    async fn notes_transcribe_with_owning_agent_without_call_scope_or_call_permission() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"text":"A spoken request"})),
+            )
+            .mount(&server)
+            .await;
+        let (channel, live) = fixture();
+        let mut config = live.snapshot();
+        config
+            .channels
+            .simplex
+            .get_mut("personal")
+            .unwrap()
+            .calls_enabled = false;
+        config.transcription.enabled = true;
+        config.transcription.max_duration_secs = 600;
+        config
+            .agents
+            .get_mut("assistant")
+            .unwrap()
+            .transcription_provider = "local_whisper.fixture".into();
+        config.providers.transcription.local_whisper.insert(
+            "fixture".into(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/transcribe", server.uri()),
+                ..Default::default()
+            },
+        );
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let audio = base64::engine::general_purpose::STANDARD.encode(b"audio");
+        channel.event(json!({"type":"voice_note","contact":"18","id":"42","audio":audio,"filename":"voice.m4a","duration":27}), &tx).await.unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        channel.event(json!({"type":"voice_note","contact":"17","id":"42","audio":audio,"filename":"voice.m4a","duration":27}), &tx).await.unwrap();
+        let message = rx.recv().await.unwrap();
+        assert_eq!(message.id, "42");
+        assert_eq!(message.content, "A spoken request");
+        assert!(message.voice_origin);
+        assert!(message.thread_ts.is_none());
+        assert!(message.interruption_scope_id.is_none());
+        assert_eq!(message.channel_alias.as_deref(), Some("personal"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(channel.event(json!({"type":"voice_note","contact":"17","id":"43","audio":audio,"filename":"voice.m4a","duration":601}), &tx).await.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receive_admission_retains_platform_item_id_and_checks_limits_before_download() {
+        let (channel, live) = fixture();
+        let mut config = live.snapshot();
+        config.transcription.enabled = true;
+        config.transcription.max_duration_secs = 600;
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let responder = channel.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            let value = requests.recv().await.unwrap();
+            assert_eq!(value["type"], "receive_voice");
+            assert_eq!(value["message_id"], "42");
+            assert_ne!(value["id"], "42");
+            assert_eq!(value["max_duration"], 600);
+            responder
+                .inner
+                .pending
+                .lock()
+                .remove(value["id"].as_str().unwrap())
+                .unwrap()
+                .send(json!({"ok":true}))
+                .unwrap();
+        });
+        let (tx, _rx) = mpsc::channel(4);
+        channel.event(json!({"type":"voice_invitation","contact":"18","id":"42","file_id":7,"filename":"voice.m4a","bytes":2000,"duration":27}),&tx).await.unwrap();
+        channel.event(json!({"type":"voice_invitation","contact":"17","id":"42","file_id":7,"filename":"voice.m4a","bytes":2000,"duration":27}),&tx).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with AAC; run explicitly for voice deployment"]
+    async fn note_synthesis_starts_early_and_force_finalization_keeps_prepared_audio_and_text() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_config::schema::{OpenAITtsProviderConfig, TtsProviderConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(crate::tts::speech::tests::silence_wav(2400)),
+            )
+            .mount(&server)
+            .await;
+        let (channel, live) = fixture();
+        let mut config = live.snapshot();
+        config
+            .channels
+            .simplex
+            .get_mut("personal")
+            .unwrap()
+            .calls_enabled = false;
+        config.tts.enabled = true;
+        config.agents.get_mut("assistant").unwrap().tts_provider = "openai.fixture".into();
+        config.providers.tts.openai.insert(
+            "fixture".into(),
+            OpenAITtsProviderConfig {
+                base: TtsProviderConfig {
+                    api_key: Some("fixture".into()),
+                    uri: Some(format!("{}/speech", server.uri())),
+                    response_format: Some("wav".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let responder = channel.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            let value = requests.recv().await.unwrap();
+            assert_eq!(value["type"], "send");
+            assert!(
+                value["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("The remaining answer.")
+            );
+            let audio = base64::engine::general_purpose::STANDARD
+                .decode(value["voice"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(&audio[4..8], b"ftyp");
+            responder
+                .inner
+                .pending
+                .lock()
+                .remove(value["id"].as_str().unwrap())
+                .unwrap()
+                .send(json!({"ok":true}))
+                .unwrap();
+        });
+        let draft = channel
+            .send_draft(&SendMessage::new("draft", "17").force_voice())
+            .await
+            .unwrap()
+            .unwrap();
+        let opener =
+            "The opening sentence is long enough to synthesize before the response finishes.";
+        channel
+            .prepare_voice_draft("17", &draft, &format!("{opener} Still writing"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        channel
+            .finalize_draft_with_modality(
+                "17",
+                &draft,
+                &format!("{opener} The remaining answer."),
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        task.await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the opener must not be synthesized twice"
+        );
+        assert!(channel.inner.drafts.lock().is_empty());
     }
 
     #[tokio::test]
