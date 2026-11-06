@@ -1969,7 +1969,8 @@ pub async fn handle_api_sessions_running(
         return crate::session_history::response(
             async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let mut result = crate::session_history::list(&state, subject.as_deref(), true).await?;
+                let mut result =
+                    crate::session_history::list(&state, subject.as_deref(), true).await?;
                 result["busy"] = serde_json::json!(busy);
                 Ok(result)
             }
