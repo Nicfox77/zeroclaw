@@ -91,7 +91,10 @@ The helper checks the actual file duration before transcription.
 a native M4A voice note, `text` sends text, and `mirror` follows the incoming
 message type. This does not require `calls_enabled`. Speech is prepared from
 approved streaming text and joined with one AAC encode when the final response
-is ready. Final rewrites invalidate speculative audio. No partial voice notes
+is ready. Before upload, the helper losslessly remuxes AAC into a finalized M4A
+with a populated duration and sample index for Android MediaPlayer; fragmented
+pipeline output is never uploaded directly. Final rewrites invalidate speculative
+audio. No partial voice notes
 are uploaded. Outbound hooks defer preparation until their final decision.
 
 The helper stages audio in private temporary directories (0700, files 0600).

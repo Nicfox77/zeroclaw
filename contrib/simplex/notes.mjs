@@ -20,6 +20,21 @@ async function duration(path) {
   if (!Number.isFinite(seconds) || seconds <= 0) throw Error('simplex_invalid_voice_duration');
   return seconds;
 }
+async function finalizeVoiceContainer(input, record) {
+  // The native speech pipeline emits fragmented MP4 to its pipe. Android's
+  // MediaPlayer needs a finalized local M4A: nonzero movie duration and a
+  // complete sample index. Remux AAC packets without encoding speech again.
+  const output = await open(record.path, 'wx', 0o600);
+  await output.close();
+  record.media = new AbortController();
+  try {
+    await execute('ffmpeg', ['-v', 'error', '-nostdin', '-y', '-protocol_whitelist', 'file,pipe',
+      '-i', input, '-map', '0:a:0', '-vn', '-c:a', 'copy', '-movflags', '+faststart',
+      '-f', 'ipod', record.path],
+    {timeout: 30000, maxBuffer: 16384, killSignal: 'SIGKILL', signal: record.media.signal});
+  } finally {delete record.media;}
+}
+
 export class VoiceNotes {
   constructor(rpc, emit, {ttl = 300000} = {}) {
     this.rpc = rpc; this.emit = emit; this.ttl = ttl;
@@ -42,6 +57,7 @@ export class VoiceNotes {
     finally {this.creating--;}
   }
   async remove(record) {
+    record.media?.abort();
     clearTimeout(record.timer);
     await rm(record.dir, {recursive: true, force: true});
     this.artifacts.delete(record);
@@ -168,9 +184,13 @@ export class VoiceNotes {
       if (!audio.length || audio.length > MAX_AUDIO) throw Error('simplex_voice_size_limit');
       record = await this.artifact({direction: 'send', contact});
       record.path = join(record.dir, 'reply.m4a');
-      const handle = await open(record.path, 'wx', 0o600);
+      const input = join(record.dir, 'encoded.m4a');
+      const handle = await open(input, 'wx', 0o600);
       try {await handle.writeFile(audio);} finally {await handle.close();}
+      await finalizeVoiceContainer(input, record);
+      await rm(input);
       const seconds = await duration(record.path);
+      if (this.closed) throw Error('simplex_voice_closed');
       this.expire(record);
       record.admitted = true;
       const chars = [...text], messages = [];

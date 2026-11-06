@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import WebSocket from 'ws';
 import {VoiceNotes} from './notes.mjs';
 import {spawn,spawnSync} from 'node:child_process';
-import {mkdtemp,rm,writeFile} from 'node:fs/promises';
+import {mkdtemp,rm,writeFile,readFile} from 'node:fs/promises';
 import {tmpdir,homedir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
@@ -50,6 +50,27 @@ try {
  const accepted=await b.rpc(`/freceive ${wrapper.chatItem.file.fileId} encrypt=off ${path}`);
  assert.ok(!['chatCmdError','chatError'].includes(accepted.type),'receive rejected');
  await until(()=>b.events.find(e=>e.type==='rcvFileComplete'),'download_timeout');
+ const receivedAudio=await readFile(path);
+ const headers=spawnSync('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_name,profile','-of','json',path]);
+ assert.equal(headers.status,0);
+ const metadata=JSON.parse(headers.stdout);assert.ok(Number(metadata.format.duration)>0);
+ assert.equal(metadata.streams[0].codec_name,'aac');assert.equal(metadata.streams[0].profile,'LC');
+ // Verify the receiver got a finalized movie, not merely a decodable fragment.
+ let offset=0, finalized=false;
+ while(offset+8<=receivedAudio.length) {
+  const size=receivedAudio.readUInt32BE(offset),type=receivedAudio.toString('ascii',offset+4,offset+8);
+  assert.ok(size>=8);assert.notEqual(type,'moof');
+  if(type==='moov') {
+   let child=offset+8;
+   while(child+8<=offset+size) {
+    const childSize=receivedAudio.readUInt32BE(child);
+    if(receivedAudio.toString('ascii',child+4,child+8)==='mvhd') finalized=receivedAudio.readUInt32BE(child+24)>0;
+    assert.ok(childSize>=8);child+=childSize;
+   }
+  }
+  offset+=size;
+ }
+ assert.ok(finalized,'received file must have a nonzero movie-header duration');
  await until(()=>notes.sending.size===0,'upload_cleanup_timeout');
  const voiceSource=join(root,'input.m4a');await writeFile(voiceSource,result.stdout);
  const sent=await b.rpc(`/_send @${bid} json ${JSON.stringify([{fileSource:{filePath:voiceSource},msgContent:{type:'voice',text:'',duration:1}}])}`);
