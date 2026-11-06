@@ -96,3 +96,44 @@ test('timeouts cancel admitted transfers, notify, and remove temporary files', a
     await assert.rejects(stat(path), {code: 'ENOENT'});
   } finally {await notes.close();}
 });
+
+test('a delayed relay-policy reset fails promptly and preserves normal forwarded-note admission', async () => {
+  const events = [], commands = [];
+  const notes = new VoiceNotes(async cmd => commands.push(cmd), async event => events.push(event));
+  try {
+    const forwarded = item(); forwarded.chatItem.meta.itemForwarded = {type: 'unknown'};
+    await notes.invitation(forwarded);
+    assert.equal(events[0].type, 'voice_invitation');
+    await notes.receive(receive);
+    await notes.receive(receive);
+    assert.equal(commands.length, 1, 'the same admitted transfer is idempotent');
+    const path = notes.receiving.get(7).path;
+    forwarded.chatItem.file.fileStatus = {type: 'rcvInvitation'};
+    await notes.event({type: 'chatItemUpdated', chatItem: forwarded});
+    assert.equal(notes.receiving.size, 0);
+    assert.equal(events[1].type, 'voice_transfer_failed');
+    await assert.rejects(stat(path), {code: 'ENOENT'});
+  } finally {await notes.close();}
+});
+
+test('startup recovery emits only bounded recent pending metadata, leaving download to native authorization', async () => {
+  const commands = [], events = [], now = Date.now();
+  const pending = item().chatItem;
+  pending.meta.createdAt = new Date(now - 1000).toISOString();
+  pending.file.fileStatus = {type: 'rcvInvitation'};
+  const complete = structuredClone(pending); complete.meta.itemId = 43; complete.file.fileStatus.type = 'rcvComplete';
+  const old = structuredClone(pending); old.meta.itemId = 41; old.meta.createdAt = new Date(now - 7200000).toISOString();
+  const notes = new VoiceNotes(async cmd => {
+    commands.push(cmd);
+    if (cmd === '/u') return {type: 'activeUser', user: {userId: 1}};
+    if (cmd === '/_get chats 1 count=20') return {type: 'apiChats', chats: [{chatInfo: item().chatInfo}]};
+    if (cmd === '/_get chat @17 count=20') return {type: 'apiChat', chat: {chatItems: [old, pending, complete]}};
+    throw Error('unexpected download or unbounded history query');
+  }, async event => events.push(event));
+  try {
+    await notes.recover(now);
+    assert.equal(events.length, 1); assert.equal(events[0].id, '42');
+    assert.equal(events[0].type, 'voice_invitation');
+    assert.equal(commands.length, 3);
+  } finally {await notes.close();}
+});

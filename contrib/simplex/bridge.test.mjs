@@ -26,7 +26,7 @@ test('bridge carries private text, excludes sent/group events, and rejects unenc
       socket.send(JSON.stringify({corrId: message.corrId, resp: {type: 'cmdOk'}}));});
     assert.deepEqual(await next(), {type: 'result', id: 'init', ok: true});
     send({type: 'send', id: 'send', contact: '17', text: 'A private reply'});
-    assert.equal((await next()).ok, true); assert.ok(commands[0].startsWith('/_send @17 json '));
+    assert.equal((await next()).ok, true); assert.ok(commands.some(cmd => cmd.startsWith('/_send @17 json ')));
     const item = {chatInfo: {type: 'direct', contact: {contactId: 17}}, chatItem: {meta: {itemId: 42}, chatDir: {type: 'directRcv'}, content: {type: 'rcvMsgContent', msgContent: {type: 'text', text: 'Hello'}}}};
     socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [item]}}));
     assert.deepEqual(await next(), {type: 'message', contact: '17', id: '42', text: 'Hello'});

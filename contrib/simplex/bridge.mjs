@@ -136,6 +136,7 @@ async function command(message) {
         }
       });
       socket.on('close', fatal); socket.on('error', fatal);
+      setImmediate(() => notes.recover().catch(fatal));
     } else if (type === 'ping') await rpc('/u');
     else if (type === 'receive_voice') await notes.receive(message);
     else if (type === 'send') {
