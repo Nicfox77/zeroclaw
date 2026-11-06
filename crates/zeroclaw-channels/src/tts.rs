@@ -1095,6 +1095,11 @@ pub(crate) mod speech;
 pub(crate) use speech::SpeechJob;
 
 impl TtsManager {
+    /// Provider text limit used by channel speech segmentation.
+    #[cfg(feature = "channel-simplex")]
+    pub(crate) fn max_text_length(&self) -> usize {
+        self.max_text_length
+    }
     pub fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_for_agent(config, None)
     }

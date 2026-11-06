@@ -1294,6 +1294,22 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Deliver live call speech from a sanitized, leak-checked assistant text
+    /// phase. Unlike speculative preparation, audio may become audible before
+    /// the turn finishes. The caller must defer this when outbound hooks need
+    /// to approve the completed response. `phase` identifies a text boundary;
+    /// `finished` closes that phase and never represents progress or reasoning.
+    async fn stream_voice_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _phase: usize,
+        _text: &str,
+        _finished: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Show a progress/status update (e.g. tool execution status).
     async fn update_draft_progress(
         &self,

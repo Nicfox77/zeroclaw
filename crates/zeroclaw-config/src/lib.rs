@@ -36,6 +36,7 @@ pub mod schema_markdown;
 pub mod secrets;
 pub mod sections;
 pub mod setup;
+pub mod simplex;
 pub mod skill_bundles;
 pub mod summary_deck;
 pub mod traits;

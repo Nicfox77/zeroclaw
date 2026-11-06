@@ -418,6 +418,7 @@ channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured 
 channel-whatsapp-web-feature-missing-build =     Build/run with: cargo build --features whatsapp-web
 channel-whatsapp-web-feature-missing-install =     If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web
 channel-whatsapp-web-feature-missing-error = WhatsApp Web channel requires the 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)
+channel-simplex-not-configured-error = The SimpleX channel is not configured.
 
 channel-wecom-ws-stream-bootstrap = Working on it, please wait.
 channel-wecom-ws-stop-ack = Stopped the current message.

@@ -8,6 +8,8 @@ pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
 mod session_history;
+#[cfg(feature = "channel-simplex")]
+pub(crate) use session_history::DeliveryScope;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -619,6 +621,12 @@ fn interrupt_on_new_message_enabled(
     };
 
     match msg.channel.as_str() {
+        "simplex" => ctx
+            .prompt_config
+            .channels
+            .simplex
+            .get(alias)
+            .is_some_and(|c| c.interrupt_on_new_message),
         "telegram" => ctx
             .prompt_config
             .channels
@@ -6277,6 +6285,17 @@ async fn run_draft_updater_with_leak_detection(
                     )
                     .await;
                 }
+                if outbound_hooks.is_none() {
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        "",
+                        true,
+                    )
+                    .await;
+                }
                 speech_phase_start = accumulated.len();
                 let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                 if let Err(e) = session_history::observe_delivery(
@@ -6301,6 +6320,17 @@ async fn run_draft_updater_with_leak_detection(
             // Matrix has its own disclosure policy in
             // `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
+                if outbound_hooks.is_none() {
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        "",
+                        true,
+                    )
+                    .await;
+                }
                 speech_phase_start = accumulated.len();
                 if let Some(text) = event.legacy_status() {
                     let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
@@ -6349,6 +6379,15 @@ async fn run_draft_updater_with_leak_detection(
                         speech.truncate(speech.trim_end().len());
                         speech.push_str(&phase[phase.trim_end().len()..]);
                     }
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        &speech,
+                        false,
+                    )
+                    .await;
                     if let Err(error) = channel
                         .prepare_voice_draft(&reply_target, &draft_id, &speech)
                         .await
@@ -6413,10 +6452,42 @@ async fn run_draft_updater_with_leak_detection(
                     )
                     .await;
                 }
+                if outbound_hooks.is_none() {
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        "",
+                        true,
+                    )
+                    .await;
+                }
                 speech_phase_start = accumulated.len();
                 StreamDelta::ack_flush_barrier(&ack);
             }
         }
+    }
+}
+
+async fn deliver_live_voice_phase(
+    channel: &Arc<dyn Channel>,
+    recipient: &str,
+    draft: &str,
+    phase: usize,
+    text: &str,
+    finished: bool,
+) {
+    if let Err(error) = channel
+        .stream_voice_draft(recipient, draft, phase, text, finished)
+        .await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"error": error.to_string()})),
+            "Live call speech update failed"
+        );
     }
 }
 
@@ -13597,6 +13668,16 @@ fn build_channel_by_id(
         "mattermost" => {
             anyhow::bail!("Mattermost channel requires the `channel-mattermost` feature");
         }
+        #[cfg(feature = "channel-simplex")]
+        "simplex" => {
+            config.channels.simplex.get("default").with_context(|| {
+                channel_runtime_cli_string("channel-simplex-not-configured-error")
+            })?;
+            Ok(Arc::new(crate::simplex::SimplexChannel::new(
+                "default".into(),
+                config_arc.clone(),
+            )))
+        }
         #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
@@ -15340,6 +15421,20 @@ fn collect_configured_channels_with_authority(
                 matrix_skip_context
             )
         );
+    }
+
+    #[cfg(feature = "channel-simplex")]
+    for (alias, sx) in &config.channels.simplex {
+        if sx.enabled && active_channel_aliases.contains(&format!("simplex.{alias}")) {
+            channels.push(ConfiguredChannel {
+                display_name: "SimpleX",
+                alias: Some(alias.clone()),
+                channel: Arc::new(crate::simplex::SimplexChannel::new(
+                    alias.clone(),
+                    config_arc.clone(),
+                )),
+            });
+        }
     }
 
     #[cfg(feature = "channel-signal")]
@@ -17997,6 +18092,17 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-slack"))]
         "slack" => {
             anyhow::bail!("Slack channel requires the `channel-slack` feature");
+        }
+        #[cfg(feature = "channel-simplex")]
+        "simplex" => {
+            config
+                .channels
+                .simplex
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let storage = zeroclaw_config::live::LiveConfig::new(config.clone());
+            let ch = crate::simplex::SimplexChannel::new(alias.into(), storage.handle());
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(feature = "channel-signal")]
         "signal" => {
@@ -23741,6 +23847,7 @@ api_key = "anthropic-key"
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
         voice_preparations: tokio::sync::Mutex<Vec<String>>,
+        voice_streams: tokio::sync::Mutex<Vec<(usize, String, bool)>>,
         draft_updates: tokio::sync::Mutex<Vec<String>>,
         /// When set, `update_draft`/`finalize_draft` faithfully model the real
         /// Discord/Matrix MultiMessage confirmed-prefix bookkeeping: each
@@ -23795,6 +23902,7 @@ api_key = "anthropic-key"
                 stall_start_typing: false,
                 stall_stop_typing: false,
                 voice_preparations: tokio::sync::Mutex::new(Vec::new()),
+                voice_streams: tokio::sync::Mutex::new(Vec::new()),
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
                 cumulative_offset: false,
                 multi_confirmed_prefix: std::sync::Mutex::new(String::new()),
@@ -24287,6 +24395,21 @@ api_key = "anthropic-key"
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .len()
+        }
+
+        async fn stream_voice_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            phase: usize,
+            text: &str,
+            finished: bool,
+        ) -> anyhow::Result<()> {
+            self.voice_streams
+                .lock()
+                .await
+                .push((phase, text.into(), finished));
+            Ok(())
         }
 
         async fn prepare_voice_draft(
@@ -36538,6 +36661,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     enabled: true,
                     web: true,
                     telegram: HashMap::from([("personal".into(), "10001".into())]),
+                    simplex: HashMap::new(),
                 },
                 ..Default::default()
             };
@@ -54950,6 +55074,17 @@ Done."#;
             )
             .await;
             let prepared = recording.voice_preparations.lock().await;
+            let live = recording.voice_streams.lock().await;
+            if hooks_enabled {
+                assert!(live.is_empty());
+            } else {
+                assert_eq!(live.len(), 3);
+                assert_eq!(live[0], (0, "First narration.".into(), false));
+                assert_eq!(live[1], (0, String::new(), true));
+                assert!(live[2].1.contains("Safe final response."));
+                assert!(!live[2].1.contains("private"));
+            }
+
             if hooks_enabled {
                 assert!(
                     prepared.is_empty(),

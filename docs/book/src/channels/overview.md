@@ -36,6 +36,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
 | Signal | `channel-signal` | [Signal](./signal.md) |
+| SimpleX | `channel-simplex` | [SimpleX](./simplex.md) |
 | Twitch | `channel-twitch` | [Twitch](./social.md#twitch) |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |

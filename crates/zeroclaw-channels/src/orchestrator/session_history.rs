@@ -453,7 +453,7 @@ pub(super) async fn deliver<F: std::future::Future<Output = anyhow::Result<()>> 
 /// Capture host presentation effects at the adapter call boundary. Spawned
 /// draft workers explicitly transfer this immutable execution coordinate.
 #[derive(Clone)]
-pub(super) struct DeliveryScope {
+pub(crate) struct DeliveryScope {
     port: Arc<dyn SessionExecutionPort>,
     turn: Option<String>,
 }
@@ -461,7 +461,7 @@ tokio::task_local! {
     static DELIVERY_SCOPE: DeliveryScope;
 }
 impl DeliveryScope {
-    pub(super) fn current() -> Option<Self> {
+    pub(crate) fn current() -> Option<Self> {
         if let Ok(scope) = DELIVERY_SCOPE.try_with(Clone::clone) {
             return Some(scope);
         }
@@ -476,7 +476,7 @@ impl DeliveryScope {
             None => future.await,
         }
     }
-    pub(super) async fn observe<T: serde::Serialize + Send>(
+    pub(crate) async fn observe<T: serde::Serialize + Send>(
         scope: Option<&Self>,
         operation: &str,
         channel: &str,
