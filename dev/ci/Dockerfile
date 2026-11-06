@@ -5,6 +5,8 @@ FROM rust:1.98-slim@sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
+    g++ \
+    ripgrep \
     pkg-config \
     libssl-dev \
     curl \
