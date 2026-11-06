@@ -6,6 +6,7 @@ services:
             context: ..
             dockerfile: dev/ci/Dockerfile
         container_name: zeroclaw-local-ci
+        init: true
         working_dir: /workspace
         # Permission-denial fixtures must exercise DAC checks, even as root.
         cap_drop:
