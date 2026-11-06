@@ -243,7 +243,8 @@ impl PacedChannel {
             ..
         }) = dropped
         {
-            self.inner.cancel_draft(&recipient, &message_id).await?;
+            crate::util::cancel_draft_best_effort(self.inner.as_ref(), &recipient, &message_id)
+                .await;
         }
         let (immediate, awaited, spawn_worker) = decision;
         if let Some(op) = immediate {
@@ -713,6 +714,7 @@ mod tests {
         final_sends: AtomicUsize,
         finalize_drafts: AtomicUsize,
         cancellations: AtomicUsize,
+        cleanup_fails: std::sync::atomic::AtomicBool,
     }
 
     impl Attributable for CountingChannel {
@@ -736,6 +738,10 @@ mod tests {
         }
         async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> Result<()> {
             self.cancellations.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                !self.cleanup_fails.load(Ordering::SeqCst),
+                "fixture cleanup failure"
+            );
             Ok(())
         }
         async fn send_final(&self, _message: &SendMessage) -> Result<()> {
@@ -874,6 +880,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let cfg = PacingFixture {
             interval_secs: 0,
@@ -893,6 +900,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // Use 1h to make the wait long enough that we can assert the
@@ -922,6 +930,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h interval again — we only ever send once per recipient, so
@@ -953,6 +962,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -984,6 +994,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1041,6 +1052,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h floor: the first op fires immediately, so no real time elapses.
@@ -1075,6 +1087,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let paced = Arc::new(PacedChannel {
             inner: counting.clone(),
@@ -1112,11 +1125,16 @@ mod tests {
             .finalize_draft_with_modality("alice", "voice-draft", "final", false, true)
             .await
             .unwrap();
+        counting.cleanup_fails.store(true, Ordering::SeqCst);
+        paced
+            .finalize_draft_with_modality("alice", "voice-draft", "final", false, true)
+            .await
+            .expect("failed preview cleanup must not trigger a text fallback");
         paced
             .finalize_draft("alice", "text-draft", "final", false)
             .await
             .unwrap();
-        assert_eq!(counting.cancellations.load(Ordering::SeqCst), 2);
+        assert_eq!(counting.cancellations.load(Ordering::SeqCst), 3);
         assert_eq!(counting.finalize_drafts.load(Ordering::SeqCst), 0);
         queued.abort();
     }
@@ -1128,6 +1146,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1216,6 +1235,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {

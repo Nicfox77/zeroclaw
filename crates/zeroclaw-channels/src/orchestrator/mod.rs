@@ -55320,7 +55320,7 @@ Done."#;
             .await;
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/deleteMessage$"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
             .expect(if fail_cleanup { 1 } else { 0 })
             .mount(&server)
             .await;
@@ -55366,7 +55366,7 @@ Done."#;
                 },
                 0,
             )
-            .with_fixture_timeout(Duration::from_secs(1))
+            .with_fixture_timeout(Duration::from_secs(10))
             .with_voice_peer_resolver(Arc::new(|| vec!["-1001234567890".into()]))
             .with_send_text_with_voice_resolver(Arc::new(|| true))
             .with_tts(&config),
