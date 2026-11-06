@@ -9,6 +9,45 @@ const makeAudio = () => {
     '-t', '0.3', '-c:a', 'aac', '-movflags', 'frag_keyframe+empty_moov', '-f', 'mp4', 'pipe:1']);
   assert.equal(result.status, 0); return result.stdout;
 };
+// Inspect the on-disk playback contract independently of ffprobe's ability to
+// reconstruct missing metadata from fragments.
+function boxes(audio, start = 0, end = audio.length) {
+  const result = [];
+  while (start + 8 <= end) {
+    let size = audio.readUInt32BE(start), header = 8;
+    const type = audio.toString('ascii', start + 4, start + 8);
+    if (size === 1) {size = Number(audio.readBigUInt64BE(start + 8)); header = 16;}
+    if (size === 0) size = end - start;
+    assert.ok(size >= header && start + size <= end);
+    result.push({type, start: start + header, end: start + size}); start += size;
+  }
+  return result;
+}
+function packetHashes(audio) {
+  const probe = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'a:0', '-show_packets',
+    '-show_data_hash', 'sha256', '-of', 'json', 'pipe:0'], {input: audio});
+  assert.equal(probe.status, 0);
+  return JSON.parse(probe.stdout).packets.map(packet => packet.data_hash);
+}
+function assertFinalizedM4a(audio) {
+  const top = boxes(audio), moov = top.find(box => box.type === 'moov');
+  assert.ok(moov);
+  assert.ok(top.findIndex(box => box.type === 'moov') < top.findIndex(box => box.type === 'mdat'));
+  assert.ok(!top.some(box => box.type === 'moof'));
+  const movie = boxes(audio, moov.start, moov.end);
+  assert.ok(!movie.some(box => box.type === 'mvex'));
+  const header = movie.find(box => box.type === 'mvhd');
+  assert.equal(audio[header.start], 0);
+  assert.ok(audio.readUInt32BE(header.start + 12) > 0);
+  assert.ok(audio.readUInt32BE(header.start + 16) > 0, 'Android must see a nonzero movie duration');
+  const track = movie.find(box => box.type === 'trak');
+  const media = boxes(audio, track.start, track.end).find(box => box.type === 'mdia');
+  const info = boxes(audio, media.start, media.end).find(box => box.type === 'minf');
+  const table = boxes(audio, info.start, info.end).find(box => box.type === 'stbl');
+  const samples = boxes(audio, table.start, table.end).find(box => box.type === 'stsz');
+  assert.ok(audio.readUInt32BE(samples.start + 8) > 0, 'Android must see a populated sample index');
+}
+
 const item = (fileId = 7) => ({chatInfo: {type: 'direct', contact: {contactId: 17}},
   chatItem: {meta: {itemId: 42}, chatDir: {type: 'directRcv'}, content: {type: 'rcvMsgContent',
     msgContent: {type: 'voice', text: '', duration: 1}}, file: {fileId, fileName: 'voice.m4a', fileSize: 2000}}});
@@ -64,7 +103,9 @@ test('one batch creates text plus a native voice note; source survives ACK until
     assert.equal(batch[0].msgContent.text, 'The final reply.');
     assert.equal(batch[1].msgContent.type, 'voice'); assert.equal(batch[1].msgContent.duration, 1);
     const path = batch[1].fileSource.filePath;
-    assert.deepEqual(await readFile(path), audio);
+    const uploaded = await readFile(path);
+    assertFinalizedM4a(uploaded);
+    assert.deepEqual(packetHashes(uploaded), packetHashes(audio), 'remuxing must preserve every AAC packet');
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     const complete = item(); complete.chatItem.file.fileSource = {filePath: path};
     await notes.event({type: 'sndFileCompleteXFTP', chatItem: complete});
