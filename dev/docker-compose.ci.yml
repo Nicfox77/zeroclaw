@@ -7,10 +7,20 @@ services:
             dockerfile: dev/ci/Dockerfile
         container_name: zeroclaw-local-ci
         working_dir: /workspace
+        # Permission-denial fixtures must exercise DAC checks, even as root.
+        cap_drop:
+            - DAC_OVERRIDE
+            - DAC_READ_SEARCH
         environment:
             - CARGO_TERM_COLOR=always
             - PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - CARGO_TARGET_DIR=/ci-target
+            # The dedicated parallel regression gate explicitly selects 16.
+            - RUST_TEST_THREADS=${RUST_TEST_THREADS:-4}
+            # Explicitly trust this test checkout, not arbitrary repositories.
+            - GIT_CONFIG_COUNT=1
+            - GIT_CONFIG_KEY_0=safe.directory
+            - GIT_CONFIG_VALUE_0=/workspace
         volumes:
             - ..:/workspace
             - cargo-registry:/usr/local/cargo/registry
