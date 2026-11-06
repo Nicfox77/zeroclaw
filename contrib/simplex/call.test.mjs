@@ -13,7 +13,7 @@ import {join} from 'node:path';
 import {openRtc} from './rtc.mjs';
 import {wav} from './audio.mjs';
 
-test('real bridge accepts an encrypted call, exchanges speech, and blocks stale audio after barge-in', {skip: !process.env.SIMPLEX_RELAY_TEST, timeout: 45000}, async () => {
+for (const streaming of [false, true]) test(`real bridge ${streaming ? 'streams PCM and returns an ordered playback receipt' : 'batches speech'} through an encrypted call and blocks stale audio`, {skip: !process.env.SIMPLEX_RELAY_TEST, timeout: 45000}, async () => {
   const server = new WebSocketServer({host: '127.0.0.1', port: 0}); await once(server, 'listening');
   const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
   const lines = createInterface({input: child.stdout}); const queue = [];
@@ -62,7 +62,7 @@ test('real bridge accepts an encrypted call, exchanges speech, and blocks stale 
     });
     emit({type: 'callInvitation', callInvitation: {contact: {contactId: 17}, sharedKey: key, callType: {media: 'audio', capabilities: {encryption: true}}}});
     const invitation = await next('call_invitation'); assert.ok(!JSON.stringify(invitation).includes(key));
-    send({type: 'accept', id: 'accept', contact: '17', call_id: invitation.call_id});
+    send({type: 'accept', id: 'accept', contact: '17', call_id: invitation.call_id, streaming});
     assert.equal((await next('result', 'accept')).ok, true);
     await next('call_connected'); await signaling;
     assert.ok(statuses.includes('/_call status @17 connected'));
@@ -70,15 +70,41 @@ test('real bridge accepts an encrypted call, exchanges speech, and blocks stale 
     for (let i = 0; i < tone.length / 2; i++) tone.writeInt16LE(Math.round(6000 * Math.sin(i * Math.PI * 880 / 16000)), i * 2);
     const audio = wav(tone).toString('base64');
     await phone.play(audio);
-    const utterance = await next('utterance');
-    assert.equal(utterance.finished, true);
-    assert.equal(Buffer.from(utterance.audio, 'base64').toString('ascii', 0, 4), 'RIFF');
-    send({type: 'audio', id: 'audio', contact: '17', scope: utterance.scope, audio});
+    let utterance;
+    if (streaming) {
+      const frame = await next('call_audio');
+      assert.equal(frame.call_id, invitation.call_id);
+      assert.equal(Buffer.from(frame.audio, 'base64').length, 2048);
+      assert.notEqual(Buffer.from(frame.audio, 'base64').toString('ascii',0,4), 'RIFF');
+      send({type:'speech_start',id:'onset1',contact:'17',call_id:invitation.call_id,utterance_id:'u1'});
+      const result = await next('result','onset1');
+      assert.equal(result.ok,true);
+      utterance = result.observation;
+      assert.equal(utterance.scope, `${invitation.call_id}/u1`);
+      assert.equal(utterance.playback.interrupted, false);
+    } else {
+      utterance = await next('utterance');
+      assert.equal(utterance.finished, true);
+      assert.equal(Buffer.from(utterance.audio, 'base64').toString('ascii', 0, 4), 'RIFF');
+    }
+    const longTone = wav(Buffer.concat(Array(10).fill(tone))).toString('base64');
+    send({type: 'audio', id: 'audio', contact: '17', scope: utterance.scope, audio:longTone, text:'A longer answer that has already finished generating.'});
     assert.equal((await next('result', 'audio')).ok, true);
     const deadline = Date.now() + 5000;
     while (audible < 4000 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
     assert.ok(audible > 4000);
-    queue.splice(0, queue.length); await phone.play(audio); await next('interrupted');
+    queue.splice(0, queue.length); await phone.play(audio);
+    if (streaming) {
+      await next('call_audio');
+      send({type:'speech_start',id:'onset2',contact:'17',call_id:invitation.call_id,utterance_id:'u2'});
+      const result = await next('result','onset2');
+      assert.equal(result.ok,true);
+      assert.equal(result.observation.playback.interrupted,true);
+      assert.equal(result.observation.playback.partial.text,'A longer answer that has already finished generating.');
+      assert.ok(result.observation.playback.partial.played_ms > 0);
+      assert.ok(result.observation.playback.partial.played_ms < 10000);
+      assert.ok(!queue.some(event => ['utterance','interrupted'].includes(event.type)), 'streaming onset returns its observation in the same RPC');
+    } else await next('interrupted');
     send({type: 'audio', id: 'stale', contact: '17', scope: utterance.scope, audio});
     const rejected = await next('result', 'stale');
     assert.equal(rejected.ok, false); assert.equal(rejected.not_delivered, true);

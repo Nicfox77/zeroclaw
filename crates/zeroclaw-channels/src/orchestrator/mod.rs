@@ -622,7 +622,8 @@ fn interrupt_on_new_message_enabled(
 
     match msg.channel.as_str() {
         "simplex" => ctx
-            .prompt_config
+            .live_config
+            .read()
             .channels
             .simplex
             .get(alias)
@@ -12662,6 +12663,14 @@ async fn run_message_dispatch_loop_until_cancelled(
                 None => break false,
             },
         };
+        if msg.control.is_some() && !msg.passive_context {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject),
+                "invalid_channel_transport_control"
+            );
+            continue;
+        }
         // Acquire picker-delivery ownership at the first definitive queue
         // consumption boundary. Every `continue`, semaphore shutdown, debounce
         // cancellation, worker abort, and normal completion below then settles
@@ -12733,9 +12742,13 @@ async fn run_message_dispatch_loop_until_cancelled(
         // spawning a worker or registering a new task. Handled here in the
         // dispatch loop so the target registrations are still in the store;
         // each cancelled turn removes its own entry when it releases.
-        // A passive observation carries no turn of its own and must not cancel
-        // the sender's live turns or answer in the room.
-        if msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content) {
+        // Only an explicit trusted transport control may interrupt while passive;
+        // ordinary observations never cancel a live turn or answer in the room.
+        let transport_interrupt =
+            msg.control == Some(zeroclaw_api::channel::ChannelControl::Interrupt);
+        if (transport_interrupt && interrupt_on_new_message_enabled(&ctx, &msg))
+            || (msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content))
+        {
             let scope_key = interruption_scope_key(&msg);
             let states = {
                 let active = in_flight_by_sender
@@ -12820,52 +12833,63 @@ async fn run_message_dispatch_loop_until_cancelled(
                         })
                     });
 
-            let reply = if had_registered_turn || cancelled_bucket {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
-            } else if folded_into_another_scope {
-                zeroclaw_runtime::i18n::get_required_cli_string(
-                    "channel-runtime-stop-folded-followup",
-                )
-            } else {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
-            };
-            let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-            if let Some(channel) = channel {
-                // `/stop` bypasses every admission budget so cancellation
-                // stays reachable, but its acknowledgement must not: a
-                // sender flooding `/stop` against a slow channel would
-                // otherwise accumulate detached reply tasks without bound.
-                // The cancellation above already ran; only the reply is
-                // skipped when the budget is exhausted.
-                match Arc::clone(&stop_reply_budget).try_acquire_owned() {
-                    Ok(reply_permit) => {
-                        let send_msg = stop_reply_message(&msg, reply);
-                        notice_tasks.spawn(async move {
-                            let _reply_permit = reply_permit;
-                            send_notice_with_timeout(channel, send_msg, "stop_ack").await;
-                        });
-                    }
-                    Err(_) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                            "stop executed without acknowledgement: reply budget exhausted"
-                        );
-                    }
+            if transport_interrupt {
+                if msg.content.is_empty() {
+                    continue;
                 }
+                // A nonempty passive body is the append-only playback report.
             } else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "stop command: no registered channel found for reply"
-                );
+                let reply = if had_registered_turn || cancelled_bucket {
+                    zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
+                } else if folded_into_another_scope {
+                    zeroclaw_runtime::i18n::get_required_cli_string(
+                        "channel-runtime-stop-folded-followup",
+                    )
+                } else {
+                    zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
+                };
+                let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+                if let Some(channel) = channel {
+                    // `/stop` bypasses every admission budget so cancellation
+                    // stays reachable, but its acknowledgement must not: a
+                    // sender flooding `/stop` against a slow channel would
+                    // otherwise accumulate detached reply tasks without bound.
+                    // The cancellation above already ran; only the reply is
+                    // skipped when the budget is exhausted.
+                    match Arc::clone(&stop_reply_budget).try_acquire_owned() {
+                        Ok(reply_permit) => {
+                            let send_msg = stop_reply_message(&msg, reply);
+                            notice_tasks.spawn(async move {
+                                let _reply_permit = reply_permit;
+                                send_notice_with_timeout(channel, send_msg, "stop_ack").await;
+                            });
+                        }
+                        Err(_) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                                "stop executed without acknowledgement: reply budget exhausted"
+                            );
+                        }
+                    }
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "stop command: no registered channel found for reply"
+                    );
+                }
+                continue;
             }
+        }
+
+        if transport_interrupt && msg.content.is_empty() {
             continue;
         }
 
@@ -39523,6 +39547,76 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[tokio::test]
+    async fn transport_speech_start_cancels_without_reply_and_precedes_next_prompt() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let provider = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "default".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let first = shared_topic_message("alice", "first", "Please explain slowly.");
+        let mut cutoff = shared_topic_message(
+            "alice",
+            "cutoff",
+            "Playback stopped halfway through the second point.",
+        );
+        cutoff.passive_context = true;
+        cutoff.control = Some(zeroclaw_api::channel::ChannelControl::Interrupt);
+        let next = shared_topic_message("alice", "next", "What was the second point?");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let capture = provider.clone();
+        let before_final = channel_impl.clone();
+        let send = zeroclaw_spawn::spawn!(async move {
+            tx.send(first).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while capture.calls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tx.send(cutoff).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                before_final.sent_messages.lock().await.is_empty(),
+                "speech-start alone must cancel before any final transcript"
+            );
+            tx.send(next).await.unwrap();
+        });
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send.await.unwrap();
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "no stop acknowledgement or interrupted response"
+        );
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "the passive report must not call the model");
+        assert!(
+            calls[1]
+                .iter()
+                .any(|(role, text)| role == "user" && text.contains("Playback stopped halfway"))
+        );
+        assert!(!calls[1].iter().any(|(role, _)| role == "assistant"));
+    }
+
     /// A conversation with a backlog must not hold the global in-flight budget
     /// while it merely waits. A queued turn owns no execution permit, so an
     /// unrelated conversation keeps dispatching alongside the busy topic's
@@ -47407,6 +47501,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
+                control: None,
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
                 platform_sender_id: None,
@@ -51096,6 +51191,7 @@ This is an example JSON object for profile settings."#;
         process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
+                control: None,
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
                 platform_sender_id: None,

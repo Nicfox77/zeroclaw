@@ -1947,6 +1947,7 @@ impl WhatsAppWebChannel {
     ) {
         if let Err(e) = tx
             .send(ChannelMessage {
+                control: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 channel: "whatsapp".to_string(),
                 channel_alias: Some(alias.to_string()),

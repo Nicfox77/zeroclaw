@@ -131,6 +131,7 @@ mod tests {
 
     fn message() -> ChannelMessage {
         ChannelMessage {
+            control: None,
             id: "fixture".into(),
             sender: "mutable-name".into(),
             platform_sender_id: Some("10001".into()),

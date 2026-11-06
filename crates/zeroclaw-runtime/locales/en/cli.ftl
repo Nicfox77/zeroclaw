@@ -1754,3 +1754,6 @@ turn-repeated-failure-retry-skipped = Skipped an additional identical call in th
 
 channel-simplex-voice-note-failed = I couldn’t process that voice note. Please try again, or send your message as text.
 channel-simplex-voice-reply-failed = I couldn’t send the voice reply. The text response is available above.
+
+channel-simplex-playback-interrupted = [Live audio delivery report] The user interrupted spoken output. Completed segments at the sender: { $completed }. Interrupted segment (full text, only partly played): { $partial }. Playback stopped approximately { $played } ms into its { $duration } ms audio. Queued audio was discarded. Do not assume the user heard the remaining response. This is sender playback timing; phone/network buffering can shift the audible cutoff. The original generated response remains in history.
+channel-simplex-live-recognition-failed = Live speech recognition stopped. Please call again or send your message as text.

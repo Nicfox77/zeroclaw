@@ -32,9 +32,10 @@ const notes = new VoiceNotes(rpc, emit);
 async function endCall(notify = true) {
   const previous = call; call = undefined;
   if (!previous) return;
+  const playback = await previous.rtc?.stop();
   await previous.rtc?.close();
   if (notify) await rpc(`/_call end @${previous.contact}`).catch(() => {});
-  await emit({type: 'call_ended', contact: previous.contact, call_id: previous.id});
+  await emit({type: 'call_ended', contact: previous.contact, call_id: previous.id, scope: `${previous.id}/${previous.generation}`, playback});
 }
 function contactId(value) {
   if (!Number.isSafeInteger(value) || value <= 0) throw Error('simplex_invalid_contact');
@@ -76,15 +77,22 @@ async function event(resp) {
       break;
   }
 }
-async function accept(contact, callId) {
+async function interrupt(current, generation = randomUUID(), publish = true) {
+  if (call !== current) return;
+  current.generation = generation;
+  const playback = await current.rtc.stop();
+  const observation = {type: 'interrupted', contact: current.contact, call_id: current.id,
+    scope: `${current.id}/${generation}`, playback};
+  if (publish) await emit(observation);
+  return observation;
+}
+async function accept(contact, callId, streaming) {
   if (!invitation || invitation.id !== callId || invitation.contact !== contact || call) throw Error('simplex_stale_invitation');
   const incoming = invitation; invitation = undefined;
   const current = {id: incoming.id, contact, generation: randomUUID(), rtc: undefined};
   call = current;
   const vad = new Utterances(() => {
-    current.generation = randomUUID();
-    current.rtc.stop().catch(() => endCall());
-    emit({type: 'interrupted', contact, call_id: current.id}).catch(fatal);
+    interrupt(current).catch(() => endCall());
   }, (audio, finished) => {
     if (call !== current) return;
     emit({type: 'utterance', contact, call_id: current.id, scope: `${current.id}/${current.generation}`, finished,
@@ -93,10 +101,15 @@ async function accept(contact, callId) {
   current.rtc = await openRtc({
     assets: process.env.SIMPLEX_CALL_ASSETS ?? join(homedir(), '.local/share/zeroclaw-simplex'),
     executablePath: process.env.CHROMIUM_PATH,
-    onPcm: encoded => {if (call === current) vad.push(Buffer.from(encoded, 'base64'));},
+    onPcm: encoded => {
+      if (call !== current) return;
+      if (streaming) return emit({type: 'call_audio', contact, call_id: current.id, audio: encoded});
+      vad.push(Buffer.from(encoded, 'base64'));
+    },
     onSignal: async ({resp, command}) => {
       if (call !== current || command) return; // command replies handled below
       try {
+        if (resp.type === 'audio_error') {await endCall(); return;}
         if (resp.type === 'ice') await rpc(`/_call extra @${contact} ${JSON.stringify({rtcIceCandidates: resp.iceCandidates})}`);
         if (resp.type === 'connection') {
           const state = resp.state?.connectionState;
@@ -114,6 +127,7 @@ async function accept(contact, callId) {
 }
 async function command(message) {
   const {type, id} = message;
+  let observation;
   try {
     if (type === 'init') {
       const url = new URL(message.websocket_url);
@@ -146,17 +160,24 @@ async function command(message) {
       const chars = [...message.text];
       for (let i = 0; i < chars.length; i += 12000) await rpc(`/_send @${contact} json ${JSON.stringify([{msgContent: {type: 'text', text: chars.slice(i, i + 12000).join('')}}])}`);
       }
-    } else if (type === 'accept') await accept(contactId(Number(message.contact)), message.call_id);
+    } else if (type === 'accept') await accept(contactId(Number(message.contact)), message.call_id, message.streaming === true);
+    else if (type === 'speech_start') {
+      if (!call || call.id !== message.call_id || call.contact !== message.contact || typeof message.utterance_id !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(message.utterance_id)) throw Error('simplex_invalid_speech_start');
+      observation = await interrupt(call, message.utterance_id, false);
+    }
     else if (type === 'reject') {
       if (invitation?.id === message.call_id) {await rpc(`/_call reject @${invitation.contact}`); invitation = undefined;}
     } else if (type === 'audio') {
       if (!call || message.scope !== `${call.id}/${call.generation}` || message.contact !== call.contact) throw Object.assign(Error('simplex_stale_call_audio'), {notDelivered: true});
-      await call.rtc.play(message.audio);
+      if (message.text !== undefined && (typeof message.text !== 'string' || message.text.length > 16000)) throw Error('simplex_invalid_speech_text');
+      await call.rtc.play(message.audio, {scope: message.scope, segment: message.id, text: message.text ?? ''});
     } else if (type === 'stop_audio') {
       if (call?.contact === message.contact && message.scope === `${call.id}/${call.generation}`) await call.rtc.stop();
-    } else if (type === 'hangup') await endCall();
+    } else if (type === 'hangup') {
+      if (!message.call_id || (call?.id === message.call_id && call?.contact === message.contact)) await endCall();
+    }
     else throw Error('simplex_unknown_bridge_command');
-    await emit({type: 'result', id, ok: true});
+    await emit({type: 'result', id, ok: true, observation});
   } catch (error) {
     if (type === 'accept') await endCall().catch(() => {});
     await emit({type: 'result', id, ok: false, not_delivered: error.notDelivered === true});

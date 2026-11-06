@@ -6561,6 +6561,11 @@ impl TranscriptionEndpoint for LocalWhisperTranscriptionEndpoint {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.transcription.local_whisper"]
 pub struct LocalWhisperTranscriptionProviderConfig {
+    /// Optional loopback PCM WebSocket endpoint for live calls. Binary input
+    /// is PCM16 mono 16 kHz; JSON events are ready/speech_start/partial/final.
+    /// HTTP voice-note transcription continues to use `uri`.
+    #[serde(default)]
+    pub stream_uri: Option<String>,
     /// Endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
     pub uri: String,
     /// Bearer token for endpoint authentication. Omit for unauthenticated
@@ -6601,6 +6606,7 @@ pub struct LocalWhisperTranscriptionProviderConfig {
 impl Default for LocalWhisperTranscriptionProviderConfig {
     fn default() -> Self {
         Self {
+            stream_uri: None,
             uri: String::new(),
             bearer_token: None,
             language: None,

@@ -481,9 +481,19 @@ pub enum ChannelConversationScope {
     ReplyTarget,
 }
 
+/// Out-of-band transport control, created only by an authenticated adapter.
+/// It is never inferred from text or replayed from stored conversation input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelControl {
+    /// Cancel this sender/call scope without a visible acknowledgement. A
+    /// passive message body, when present, records a delivery observation.
+    Interrupt,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
+    pub control: Option<ChannelControl>,
     pub id: String,
     pub sender: String,
     /// Immutable sender identifier assigned by the channel platform, when
