@@ -1,3 +1,4 @@
+pub use crate::simplex::SimplexConfig;
 // Historical schema typed lenses for migration. Each module is frozen after
 // its corresponding version ships; only their `migrate(self) -> ...` methods
 // are referenced at runtime by `crate::migration`.
@@ -16168,6 +16169,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub signal: HashMap<String, SignalConfig>,
+    /// SimpleX CLI instances (`[channels.simplex.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub simplex: HashMap<String, SimplexConfig>,
     /// WhatsApp channel instances (`[channels.whatsapp.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -16381,6 +16386,13 @@ impl ChannelsConfig {
                 name: "Matrix",
                 desc: "self-hosted chat",
                 configured: !self.matrix.is_empty(),
+            },
+            ChannelInfo {
+                kind: "simplex",
+                config_key: "simplex",
+                name: "SimpleX",
+                desc: "Private messaging and encrypted audio calls",
+                configured: !self.simplex.is_empty(),
             },
             ChannelInfo {
                 kind: "signal",
@@ -16609,6 +16621,7 @@ impl ChannelsConfig {
             || self.imessage.values().any(|c| c.enabled)
             || self.matrix.values().any(|c| c.enabled)
             || self.signal.values().any(|c| c.enabled)
+            || self.simplex.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
@@ -16646,7 +16659,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -16656,6 +16669,7 @@ impl ChannelsConfig {
             ("imessage", !self.imessage.is_empty(), true),
             ("matrix", !self.matrix.is_empty(), true),
             ("signal", !self.signal.is_empty(), true),
+            ("simplex", !self.simplex.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
@@ -16742,6 +16756,7 @@ impl Default for ChannelsConfig {
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
+            simplex: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             nextcloud_talk: HashMap::new(),
@@ -24476,6 +24491,9 @@ impl Config {
         // enabled channel built with an empty credential never connects and
         // its per-channel supervisor restarts it forever (crashloop), so
         // reject at config-load time instead.
+        for channel in self.channels.simplex.values() {
+            channel.validate()?;
+        }
         for (alias, sig) in &self.channels.signal {
             sig.validate_required(alias)?;
         }
@@ -34085,6 +34103,7 @@ auto_save = true
                 imessage: HashMap::new(),
                 matrix: HashMap::new(),
                 signal: HashMap::new(),
+                simplex: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
@@ -36511,6 +36530,7 @@ allowed_users = ["@u:matrix.org"]
                 },
             )]),
             signal: HashMap::new(),
+            simplex: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             nextcloud_talk: HashMap::new(),
@@ -37100,6 +37120,7 @@ allowed_numbers = ["+1", "+2"]
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
+            simplex: HashMap::new(),
             whatsapp: HashMap::from([(
                 "default".to_string(),
                 WhatsAppConfig {

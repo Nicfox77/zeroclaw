@@ -18,6 +18,9 @@ pub struct MainSessionConfig {
     pub web: bool,
     /// Telegram bot alias to stable numeric owner user ID. Only that user's direct chat joins.
     pub telegram: HashMap<String, String>,
+    /// SimpleX adapter alias to the owner's local numeric contact ID. The
+    /// identity belongs to that adapter's persistent SimpleX database.
+    pub simplex: HashMap<String, String>,
 }
 
 /// The agent identity creates the canonical personal-conversation identity.
@@ -40,14 +43,15 @@ pub fn web_session(config: &Config, agent: &str) -> Option<String> {
 
 pub fn channel_session(config: &Config, agent: &str, message: &ChannelMessage) -> Option<String> {
     let policy = &config.agent(agent)?.main_session;
-    if !policy.enabled
-        || message.channel != "telegram"
-        || message.passive_context
-        || message.thread_ts.is_some()
-    {
+    if !policy.enabled || message.passive_context {
         return None;
     }
-    let owner = policy.telegram.get(message.channel_alias.as_deref()?)?;
+    let bindings = match message.channel.as_str() {
+        "telegram" if message.thread_ts.is_none() => &policy.telegram,
+        "simplex" if message.thread_ts.is_none() || message.voice_origin => &policy.simplex,
+        _ => return None,
+    };
+    let owner = bindings.get(message.channel_alias.as_deref()?)?;
     // Use the adapter-stamped platform ID, never a mutable display username.
     (message.platform_sender_id.as_deref() == Some(owner.as_str())
         && message.reply_target == *owner)
@@ -60,7 +64,7 @@ impl MainSessionConfig {
             return Ok(());
         }
         anyhow::ensure!(
-            self.web || !self.telegram.is_empty(),
+            self.web || !self.telegram.is_empty() || !self.simplex.is_empty(),
             "main_session_requires_explicit_connection_bindings"
         );
         anyhow::ensure!(
@@ -72,7 +76,8 @@ impl MainSessionConfig {
             "main_session_web_requires_authenticated_gateway"
         );
         anyhow::ensure!(
-            self.telegram.is_empty() || config.channels.session_persistence,
+            (self.telegram.is_empty() && self.simplex.is_empty())
+                || config.channels.session_persistence,
             "main_session_requires_channel_persistence"
         );
         for (alias, owner) in &self.telegram {
@@ -84,6 +89,17 @@ impl MainSessionConfig {
             anyhow::ensure!(
                 config.agent_for_channel(&format!("telegram.{alias}")) == Some(agent),
                 "main_session_telegram_binding_must_belong_to_the_agent"
+            );
+        }
+        for (alias, owner) in &self.simplex {
+            anyhow::ensure!(
+                owner.parse::<u64>().is_ok_and(|id| id > 0)
+                    && owner.bytes().all(|byte| byte.is_ascii_digit()),
+                "main_session_simplex_requires_numeric_contact_id"
+            );
+            anyhow::ensure!(
+                config.agent_for_channel(&format!("simplex.{alias}")) == Some(agent),
+                "main_session_simplex_binding_must_belong_to_the_agent"
             );
         }
         Ok(())
@@ -105,6 +121,7 @@ mod tests {
                     enabled: true,
                     web: true,
                     telegram: HashMap::from([("personal".into(), "10001".into())]),
+                    simplex: HashMap::new(),
                 },
                 ..Default::default()
             },
@@ -190,5 +207,42 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn simplex_text_and_call_transcripts_share_only_the_bound_contact() {
+        let mut config = config();
+        let agent = config.agents.get_mut("assistant").unwrap();
+        agent.channels.push("simplex.personal".into());
+        agent
+            .main_session
+            .simplex
+            .insert("personal".into(), "17".into());
+        assert!(
+            agent
+                .main_session
+                .clone()
+                .validate(&config, "assistant")
+                .is_ok()
+        );
+        let mut msg = message();
+        msg.channel = "simplex".into();
+        msg.platform_sender_id = Some("17".into());
+        msg.reply_target = "17".into();
+        assert_eq!(
+            channel_session(&config, "assistant", &msg),
+            web_session(&config, "assistant")
+        );
+        msg.thread_ts = Some("call/generation".into());
+        msg.voice_origin = true;
+        assert_eq!(
+            channel_session(&config, "assistant", &msg),
+            web_session(&config, "assistant")
+        );
+        msg.voice_origin = false;
+        assert!(channel_session(&config, "assistant", &msg).is_none());
+        msg.voice_origin = true;
+        msg.platform_sender_id = Some("18".into());
+        assert!(channel_session(&config, "assistant", &msg).is_none());
     }
 }
