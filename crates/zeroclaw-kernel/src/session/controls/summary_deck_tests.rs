@@ -664,41 +664,188 @@ async fn deck_rotates_without_deleting_originals_and_survives_reopen() {
 
 #[tokio::test]
 async fn background_summary_keeps_chat_running_and_rebases_newer_turns() {
-    let directory = tempfile::tempdir().unwrap();
-    let (port, _) = session(directory.path(), "sqlite");
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut runtime = Runtime::new();
-    runtime.gate = Some(gate.clone());
-    let runtime = Arc::new(runtime);
-    let port = port.with_summary_deck(runtime.clone());
-    for n in 0..5 {
-        add_turn(&port, n).await.unwrap();
-    }
-    let snapshot = add_turn(&port, 5).await.unwrap();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        port.prepare_context(snapshot),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let stale = add_turn(&port, 6).await.unwrap();
-    gate.add_permits(1);
-    wait_job(&port).await.unwrap();
-    // An engine finishing with its pre-publication view cannot restore the
-    // summarized prefix or overwrite the newer deck.
-    port.replace_context(stale, "fixture_inflight_context")
-        .await
-        .unwrap();
-    let current = port
-        .read_context_snapshot(port.latest_context().await.unwrap())
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (port, _) = session(directory.path(), backend);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut runtime = Runtime::new();
+        runtime.gate = Some(gate.clone());
+        let runtime = Arc::new(runtime);
+        let port = port.with_summary_deck(runtime.clone());
+        for n in 0..5 {
+            add_turn(&port, n).await.unwrap();
+        }
+        let snapshot = add_turn(&port, 5).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            port.prepare_context(snapshot),
+        )
         .await
         .unwrap()
         .unwrap();
-    let text = serde_json::to_string(&current.messages).unwrap();
-    assert!(text.contains("Summary 1:"));
-    assert!(text.contains("Architecture question 6:"));
-    assert!(!text.contains("Architecture question 0:"));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while runtime.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("summary must freeze its input before the foreground edit");
+        let mut stale = add_turn(&port, 6).await.unwrap();
+        stale
+            .messages
+            .push(ConversationMessage::Chat(ChatMessage::assistant(
+                "Newer derived context must survive background publication.",
+            )));
+        port.replace_context(stale.clone(), "fixture_newer_context")
+            .await
+            .unwrap();
+        let before = port.latest_context().await.unwrap();
+        let derived =
+            crate::session::context_messages::context_refs(port.owner.store.as_ref(), &before)
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+        gate.add_permits(1);
+        wait_job(&port).await.unwrap();
+        // An engine finishing with its pre-publication view cannot restore the
+        // summarized prefix or overwrite the newer deck.
+        port.replace_context(stale, "fixture_inflight_context")
+            .await
+            .unwrap();
+        let current = port
+            .read_context_snapshot(port.latest_context().await.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let text = serde_json::to_string(&current.messages).unwrap();
+        assert!(text.contains("Summary 1:"));
+        assert!(text.contains("Architecture question 6:"));
+        assert!(!text.contains("Architecture question 0:"));
+        assert!(text.contains("Newer derived context must survive background publication."));
+        let latest = port.latest_context().await.unwrap();
+        assert!(
+            crate::session::context_messages::context_refs(port.owner.store.as_ref(), &latest,)
+                .unwrap()
+                .contains(&derived),
+            "{backend}: the canonical identity must survive rebasing"
+        );
+        assert_eq!(
+            port.history_reader()
+                .unwrap()
+                .history(port.stream.as_str(), 100)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            14,
+            "{backend}: derived context must not duplicate the original transcript"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transformed_conversation_identity_cannot_select_another_payload() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (port, _) = session(directory.path(), backend);
+        let mut snapshot = add_turn(&port, 0).await.unwrap();
+        for text in ["First derived annotation", "Second derived annotation"] {
+            snapshot
+                .messages
+                .push(ConversationMessage::Chat(ChatMessage::assistant(text)));
+        }
+        port.replace_context(snapshot, "fixture_derived_annotations")
+            .await
+            .unwrap();
+        let input = port.latest_context().await.unwrap();
+        let mut refs =
+            crate::session::context_messages::context_refs(port.owner.store.as_ref(), &input)
+                .unwrap();
+        let first = refs.len() - 2;
+        assert!(matches!(
+            refs[first].source,
+            ContextMessageSource::Conversation { .. }
+        ));
+        // Both payloads are valid and in scope. A known message identity must
+        // still bind to its own canonical payload, rather than another item.
+        refs[first].source = refs[first + 1].source.clone();
+        let transform = port
+            .owner
+            .begin_context_transform(
+                crate::session::context::ContextTransformCommand {
+                    stream: port.stream.clone(),
+                    branch: port.branch.clone(),
+                    turn: None,
+                    expected_projection: Some(input.event_id.clone()),
+                    intent: ContextTransformIntent {
+                        reason_key: "fixture_forgery".into(),
+                        algorithm_version: "fixture/v1".into(),
+                        budget: 0,
+                    },
+                    execution_binding: Some(port.authority.maintenance_binding().unwrap()),
+                },
+                port.authority.clone(),
+            )
+            .await
+            .unwrap();
+        let started = transform.started_event_id().unwrap();
+        let payload = PayloadRecord::json(
+            "session.context/v1",
+            &serde_json::json!({
+                "message_refs": refs, "history_has_trim_breadcrumb": false,
+            }),
+        )
+        .unwrap();
+        let mut projection = SessionEvent::typed(
+            port.stream.clone(),
+            EventData::ContextProjectionCreated {
+                source_ranges: vec![SourceRange {
+                    session_id: port.stream.clone(),
+                    from_seq: input.sequence,
+                    to_seq: input.sequence,
+                    disposition: RangeDisposition::Included,
+                }],
+                summary_ref: None,
+                budget: 0,
+                reason_key: "fixture_forgery".into(),
+                algorithm_version: "fixture/v1".into(),
+                result_ref: StoredPayloadRef::from(&payload),
+                summary_source_refs: vec![],
+                transform_started_event_id: Some(started.clone()),
+            },
+            EventActor::System {
+                component: "context_transform".into(),
+            },
+        )
+        .unwrap();
+        projection.branch_id = Some(port.branch.clone());
+        projection.causation_id = Some(started.clone());
+        let head = port.owner.store.head(&port.stream).unwrap();
+        let error = port
+            .owner
+            .append(AppendRequest {
+                session_id: port.stream.clone(),
+                expected_head: head.clone(),
+                idempotency_key: format!("fixture_forgery:{started}"),
+                events: vec![projection],
+                payloads: vec![payload],
+                erasure_reference_commitment: None,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("context conversation source has no canonical origin"),
+            "{backend}: {error}"
+        );
+        assert_eq!(port.owner.store.head(&port.stream).unwrap(), head);
+        transform
+            .failed("fixture_forgery_rejected".into())
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

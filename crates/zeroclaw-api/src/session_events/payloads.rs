@@ -724,7 +724,7 @@ pub fn validate_payload_batch(
     Ok(index.plan(&facts, request)?.deleting)
 }
 fn validate_semantic_payloads(
-    index: &super::rules::HistoryIndex,
+    facts: &super::rules::HistoryIndex,
     history: &super::index::OverlayMap<'_, EventId, SessionEvent>,
     payloads: &super::index::OverlayMap<'_, PayloadId, StoredPayload>,
     message_ids: &super::index::OverlaySet<'_, MessageId>,
@@ -975,6 +975,24 @@ fn validate_semantic_payloads(
                                 && let (Ok(origin), Ok(position)) =
                                     (EventId::parse(origin), position.parse::<usize>())
                                 && let Some(source) = history.get(&origin)
+                                && source.event_id != event.event_id
+                                && source.sequence > 0
+                                && source.session_id == event.session_id
+                                && lineage.as_ref().is_some_and(|lineage| {
+                                    super::lineage::includes(lineage, source)
+                                })
+                                // Ordinary transforms create context identities
+                                // from their start event; imported contexts use
+                                // the projection itself. Both must resolve to
+                                // an already committed canonical projection.
+                                && let Some(source) = match &source.body.data {
+                                    EventData::ContextProjectionCreated { .. } => Some(source),
+                                    EventData::ContextTransformStarted { .. } => facts
+                                        .transform_terminal(&origin)
+                                        .and_then(|id| history.get(id))
+                                        .filter(|terminal| terminal.branch_id == source.branch_id),
+                                    _ => None,
+                                }
                                 && source.event_id != event.event_id
                                 && source.sequence > 0
                                 && source.session_id == event.session_id
@@ -1295,7 +1313,7 @@ fn validate_semantic_payloads(
                 .invocation_id
                 .as_ref()
                 .and_then(|invocation| {
-                    index.invocation_origin(invocation).or_else(|| {
+                    facts.invocation_origin(invocation).or_else(|| {
                         request.events.iter().find(|item| {
                             item.invocation_id.as_ref() == Some(invocation)
                                 && item.body.kind() == EventKind::ChildInvocationRequested
@@ -1309,7 +1327,7 @@ fn validate_semantic_payloads(
                 let terminal = history
                     .get(&evidence.terminal_event_id)
                     .ok_or_else(|| invalid("child terminal evidence target absent"))?;
-                let derived = index
+                let derived = facts
                     .child_derivation(&origin.event_id)
                     .ok_or_else(|| invalid("child derivation missing"))?;
                 super::rules::validate_child_terminal(origin, derived, terminal)?;

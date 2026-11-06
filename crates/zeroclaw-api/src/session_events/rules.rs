@@ -57,7 +57,7 @@ pub struct HistoryIndex {
     child_derivations: HashMap<EventId, EventId>,
     start_events: HashMap<InvocationId, EventId>,
     files: HashSet<(SessionId, String)>,
-    transforms: HashMap<EventId, bool>,
+    transforms: HashMap<EventId, Option<EventId>>,
     elicitations: HashMap<(SessionId, String), (Option<BranchId>, bool)>,
     consumed: HashSet<String>,
     reconciled: HashSet<EventId>,
@@ -77,7 +77,7 @@ pub struct HistoryDelta {
     child_derivations: HashMap<EventId, EventId>,
     start_events: HashMap<InvocationId, EventId>,
     files: HashSet<(SessionId, String)>,
-    transforms: HashMap<EventId, bool>,
+    transforms: HashMap<EventId, Option<EventId>>,
     elicitations: HashMap<(SessionId, String), (Option<BranchId>, bool)>,
     consumed: HashSet<String>,
     reconciled: HashSet<EventId>,
@@ -116,7 +116,7 @@ impl HistoryIndex {
                         .is_none_or(|(_, terminal)| !*terminal)
             })
             || self.transforms.iter().any(|(id, terminal)| {
-                !terminal
+                terminal.is_none()
                     && self
                         .prior
                         .get(id)
@@ -203,6 +203,10 @@ impl HistoryIndex {
         self.child_derivations
             .get(id)
             .and_then(|id| self.prior.get(id))
+    }
+    /// Resolve the canonical terminal event without scanning session history.
+    pub(super) fn transform_terminal(&self, id: &EventId) -> Option<&EventId> {
+        self.transforms.get(id).and_then(Option::as_ref)
     }
     pub fn extend_committed(&mut self, events: &[SessionEvent]) -> Result<(), AppendError> {
         let delta = self.stage(events.iter(), &[])?;
@@ -828,7 +832,7 @@ impl HistoryIndex {
                     }
                 }
                 EventKind::ContextTransformStarted => {
-                    transforms.insert(event.event_id.clone(), false);
+                    transforms.insert(event.event_id.clone(), None);
                 }
                 EventKind::ContextTransformFailed
                 | EventKind::ContextTransformCancelled
@@ -847,10 +851,10 @@ impl HistoryIndex {
                         _ => None,
                     };
                     if let Some(id) = id {
-                        if incoming && transforms.get(id).is_none_or(|terminal| *terminal) {
+                        if incoming && transforms.get(id).is_none_or(Option::is_some) {
                             return Err(invalid("context transform absent or already terminal"));
                         }
-                        transforms.insert(id.clone(), true);
+                        transforms.insert(id.clone(), Some(event.event_id.clone()));
                     }
                 }
                 EventKind::SessionClosed if !matches!(&event.body.data, EventData::SessionClosed { reason_key } if reason_key == "session_ttl_expired") =>
