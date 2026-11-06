@@ -36923,7 +36923,7 @@ for await (const line of createInterface({input:process.stdin})) {
                 let directory = tempfile::TempDir::new().expect("directory");
                 let channel = Arc::new(SendMessageRecordingChannel::matrix());
                 let provider = Arc::new(PrecheckProbeModelProvider {
-                    precheck_delay: times_out.then_some(Duration::from_secs(5)),
+                    precheck_delay: times_out.then_some(Duration::from_secs(30)),
                     ..Default::default()
                 });
                 let mut config = Config {
@@ -36936,7 +36936,9 @@ for await (const line of createInterface({input:process.stdin})) {
                     ..Default::default()
                 };
                 agent.precheck.enabled = true;
-                agent.precheck.timeout_secs = 1;
+                // Allow the durable attempt marker to flush on slower test
+                // filesystems before the deliberately stalled provider runs.
+                agent.precheck.timeout_secs = 5;
                 config.agents.insert("test-agent".into(), agent.clone());
                 config.peer_groups.insert(
                     "fixture".into(),
