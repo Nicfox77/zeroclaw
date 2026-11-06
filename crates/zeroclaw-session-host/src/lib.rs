@@ -20,11 +20,9 @@ use zeroclaw_kernel::session::{
     SessionCoordinator,
     engine::{EngineSession, EngineSessionAuthority, EngineSessionSource},
 };
-mod execution_context;
 mod seed;
 mod summary_cost;
 mod summary_deck;
-pub use execution_context::execution_context_evidence;
 
 type SessionOwner = Arc<tokio::sync::Mutex<Option<Arc<SessionCoordinator>>>>;
 type SessionOwners = HashMap<(std::path::PathBuf, String), SessionOwner>;
@@ -301,6 +299,52 @@ pub fn open_repository(
 }
 #[async_trait::async_trait]
 impl EngineSessionSource for NativeSessionHub {
+    async fn list(
+        &self,
+        actor: EventActor,
+        policy: Arc<dyn zeroclaw_kernel::session::query::SessionAccessPolicy>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<zeroclaw_api::session_events::views::SessionSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (directory, _) = self.prepare().await?;
+        let stores = self.stores.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            use zeroclaw_kernel::session::{SessionError, query::SessionAccess};
+            let catalog = SessionCatalog::open(&directory, &stores)?
+                .ok_or_else(|| anyhow::Error::msg("native session storage is unavailable"))?;
+            let mut visible = Vec::new();
+            for (_, summary) in catalog.query().indexed_summaries()? {
+                if summary.closed
+                    || policy
+                        .session_agent_scope()
+                        .is_some_and(|alias| summary.owning_agent.as_deref() != Some(alias))
+                {
+                    continue;
+                }
+                match policy.authorize_actor(&actor, &summary.head.session_id, SessionAccess::Read)
+                {
+                    Ok(()) => visible.push(summary),
+                    Err(SessionError::PermissionDenied(_)) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            visible.sort_by(|left, right| {
+                right
+                    .last_activity
+                    .cmp(&left.last_activity)
+                    .then_with(|| left.head.session_id.cmp(&right.head.session_id))
+            });
+            visible.truncate(limit);
+            // Revalidate immediately before disclosing the selected records.
+            for summary in &visible {
+                policy.authorize_actor(&actor, &summary.head.session_id, SessionAccess::Read)?;
+            }
+            Ok(visible)
+        })
+        .await?
+    }
     async fn sessions(&self) -> anyhow::Result<Vec<String>> {
         let (directory, _) = self.prepare().await?;
         let stores = self.stores.clone();
@@ -455,7 +499,13 @@ impl EngineSessionSource for NativeSessionHub {
         let Some(owner) = self.read_owner(directory, session_id).await? else {
             return Ok(None);
         };
-        let query = owner.query(principal, policy);
+        let query = owner.query(principal, policy.clone());
+        if let Some(alias) = policy.session_agent_scope() {
+            let summary = query.summary(stream.clone()).await?;
+            if summary.owning_agent.as_deref() != Some(alias) {
+                return Ok(None);
+            }
+        }
         Ok(Some(zeroclaw_kernel::session::engine::SessionReadHandle {
             stream,
             query,

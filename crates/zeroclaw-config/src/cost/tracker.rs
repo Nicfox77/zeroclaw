@@ -208,9 +208,9 @@ struct AgentTotals {
 impl CostTracker {
     /// Create a new cost tracker.
     pub fn new(config: CostConfig, workspace_dir: &Path, session_backend: &str) -> Result<Self> {
-        let storage_path =
-            zeroclaw_infra::cost_ledger::resolve_path(workspace_dir, session_backend)?;
-        let storage = CostStorage::new(&storage_path).with_context(|| {
+        let (storage_path, generation) =
+            zeroclaw_infra::cost_ledger::resolve_storage(workspace_dir, session_backend)?;
+        let storage = CostStorage::new(&storage_path, generation).with_context(|| {
             format!(
                 "Failed to open cost storage at {}",
                 storage_path.display().to_string()
@@ -933,8 +933,8 @@ impl CostTracker {
         workspace_dir: &Path,
         session_backend: &str,
     ) -> Option<Arc<Self>> {
-        let storage_path =
-            match zeroclaw_infra::cost_ledger::resolve_path(workspace_dir, session_backend) {
+        let (storage_path, generation) =
+            match zeroclaw_infra::cost_ledger::resolve_storage(workspace_dir, session_backend) {
                 Ok(path) => path,
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -949,6 +949,7 @@ impl CostTracker {
             };
 
         if let Some(ct) = trackers.read().get(&storage_path).cloned() {
+            ct.lock_storage().refresh_generation(generation);
             ct.update_config(config);
             return Some(ct);
         }
@@ -959,6 +960,7 @@ impl CostTracker {
 
         let mut guard = trackers.write();
         if let Some(ct) = guard.get(&storage_path).cloned() {
+            ct.lock_storage().refresh_generation(generation);
             ct.update_config(config);
             return Some(ct);
         }
@@ -1129,6 +1131,9 @@ impl CostSummaryAccumulator {
 
 struct CostStorage {
     ledger: zeroclaw_infra::cost_ledger::CostLedger,
+    /// Installation generation for which the cached aggregates are valid.
+    /// Resolved from session-format.json when the global tracker is selected.
+    ledger_generation: u64,
     /// Cached total for the current UTC day.
     daily_cost_usd: f64,
     /// Cached total for the current UTC month.
@@ -1191,11 +1196,12 @@ impl ReportingPeriod {
 
 impl CostStorage {
     /// Create or open cost storage.
-    fn new(path: &Path) -> Result<Self> {
+    fn new(path: &Path, generation: u64) -> Result<Self> {
         let ledger = zeroclaw_infra::cost_ledger::CostLedger::open(path)?;
         let now = Utc::now();
         Ok(Self {
             ledger,
+            ledger_generation: generation,
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
             daily_cost_by_agent: HashMap::new(),
@@ -1204,6 +1210,13 @@ impl CostStorage {
             cached_month: now.month(),
             aggregates_current: false,
         })
+    }
+
+    fn refresh_generation(&mut self, generation: u64) {
+        if self.ledger_generation != generation {
+            self.ledger_generation = generation;
+            self.aggregates_current = false;
+        }
     }
 
     fn recover_concatenated_records<F>(
@@ -1596,7 +1609,7 @@ mod tests {
         );
 
         // A fresh storage over the corrupted ledger still recovers both records.
-        let storage = CostStorage::new(&path).unwrap();
+        let storage = CostStorage::new(&path, 0).unwrap();
         let mut count = 0usize;
         storage.for_each_record(|_| count += 1).unwrap();
         assert_eq!(count, 2, "both concatenated records should be recovered");
@@ -2421,6 +2434,84 @@ mod tests {
                 NativeBackend::Jsonl => tmp.path().join("sessions/session-events.db"),
             };
             assert!(!unexpected.exists(), "must not open a second backend");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_round_trip_refreshes_reused_trackers_budget_aggregates() {
+        use zeroclaw_infra::session_events::{installation::NativeBackend, upgrade};
+
+        for (initial, other) in [
+            (NativeBackend::Sqlite, NativeBackend::Jsonl),
+            (NativeBackend::Jsonl, NativeBackend::Sqlite),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let trackers = RwLock::new(HashMap::new());
+            let config = CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 200.0,
+                ..Default::default()
+            };
+            upgrade::upgrade_installation(tmp.path(), initial, |_| "test-agent".into()).unwrap();
+            let first =
+                CostTracker::resolve_global(&trackers, config.clone(), tmp.path(), initial.name())
+                    .unwrap();
+            let agent = first.derived_for_agent("test-agent", 8.0);
+            first
+                .record_usage_with_agent(
+                    TokenUsage::new("test/model", 1_000_000, 0, 0, 3.0, 0.0, 0.0),
+                    Some("test-agent"),
+                )
+                .unwrap();
+            assert!(matches!(
+                first.check_budget(0.0).unwrap(),
+                BudgetCheck::Allowed
+            ));
+            assert!(matches!(
+                agent.check_budget(0.0).unwrap(),
+                BudgetCheck::Allowed
+            ));
+            // Ordinary delegate lookups resolve the same manifest generation;
+            // they must retain the shared cache instead of rescanning history.
+            let reused =
+                CostTracker::resolve_global(&trackers, config.clone(), tmp.path(), initial.name())
+                    .unwrap();
+            assert!(Arc::ptr_eq(&first, &reused));
+            assert!(reused.lock_storage().aggregates_current);
+
+            upgrade::upgrade_installation(tmp.path(), other, |_| "test-agent".into()).unwrap();
+            let second =
+                CostTracker::resolve_global(&trackers, config.clone(), tmp.path(), other.name())
+                    .unwrap();
+            second
+                .record_usage_with_agent(
+                    TokenUsage::new("test/model", 1_000_000, 0, 0, 9.0, 0.0, 0.0),
+                    Some("test-agent"),
+                )
+                .unwrap();
+
+            upgrade::upgrade_installation(tmp.path(), initial, |_| "test-agent".into()).unwrap();
+            let after =
+                CostTracker::resolve_global(&trackers, config, tmp.path(), initial.name()).unwrap();
+            assert!(Arc::ptr_eq(&first, &after));
+            assert!(
+                matches!(after.check_budget(89.0).unwrap(), BudgetCheck::Exceeded { current_usd, .. } if current_usd == 12.0)
+            );
+            // Derived trackers must see the refreshed per-agent cache as well.
+            assert!(
+                matches!(agent.check_budget(0.0).unwrap(), BudgetCheck::Exceeded { current_usd, agent_alias: Some(alias), .. } if current_usd == 12.0 && alias == "test-agent")
+            );
+            let summary = after.get_summary().unwrap();
+            // Reusing the tracker preserves its process-local counters; the
+            // migrated ledger and budget aggregates include both backends.
+            assert_eq!(summary.request_count, 1);
+            assert_eq!(summary.session_cost_usd, 3.0);
+            assert_eq!(after.lock_storage().ledger.read_records().unwrap().len(), 2);
+            assert_eq!(summary.daily_cost_usd, 12.0);
+            assert_eq!(summary.monthly_cost_usd, 12.0);
         }
     }
 

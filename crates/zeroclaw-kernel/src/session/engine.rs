@@ -32,6 +32,16 @@ pub trait EngineSessionSource: Send + Sync {
     /// must authorize before disclosing this descriptor to a caller.
     async fn describe(&self, session_id: String) -> anyhow::Result<Option<SessionDescriptor>>;
     async fn sessions(&self) -> anyhow::Result<Vec<String>>;
+    /// Discovery uses the rebuildable metadata index, never one history replay
+    /// per session. Filter with current authority before applying the limit.
+    async fn list(
+        &self,
+        _actor: EventActor,
+        _policy: Arc<dyn SessionAccessPolicy>,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<views::SessionSummary>> {
+        anyhow::bail!("session_index_query_unsupported")
+    }
     /// Trusted host retention command. Closing retains the append-only audit
     /// trail; it never erases payloads or expires a running execution.
     async fn archive_stale(
@@ -95,68 +105,34 @@ impl views::SessionHistoryReadPort for EngineSession {
     }
 
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<views::SessionSummary>> {
+        // A bound reader represents one admitted session.  Preserve the
+        // reader's own authorization semantics even when the host can answer
+        // the global listing from its derived index.
+        SessionAccessPolicy::authorize_actor(
+            self.authority.as_ref(),
+            &self.actor,
+            &self.stream,
+            SessionAccess::Read,
+        )?;
+        if let Some(source) = &self.source {
+            return source
+                .list(self.actor.clone(), self.authority.clone(), limit)
+                .await;
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let current = self.query().summary(self.stream.clone()).await?;
-        let current_id = self.stream.as_str().to_owned();
-        let visible = if let Some(source) = &self.source {
-            Some(source.sessions().await?)
-        } else {
-            None
-        };
-        let current_visible = visible.as_ref().map_or_else(
-            || {
-                current
-                    .fields
-                    .get("session_kind")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("temporary")
-            },
-            |sessions| sessions.contains(&current_id),
-        );
-        let mut summaries = Vec::new();
-        if current_visible {
-            summaries.push(current);
-        }
-        if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
+        if current.closed
+            || current
+                .fields
+                .get("session_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("temporary")
         {
-            for session_id in visible.into_iter().flatten() {
-                if session_id == current_id {
-                    continue;
-                }
-                let stream = zeroclaw_api::session_events::SessionId::parse(session_id.to_owned())?;
-                match SessionAccessPolicy::authorize_actor(
-                    self.authority.as_ref(),
-                    &self.actor,
-                    &stream,
-                    SessionAccess::Read,
-                ) {
-                    Ok(()) => {}
-                    Err(SessionError::PermissionDenied(_)) => continue,
-                    Err(error) => return Err(error.into()),
-                }
-                if let Some(native) = source
-                    .query(
-                        session_id,
-                        PrincipalId(principal_id.clone()),
-                        self.authority.clone(),
-                    )
-                    .await?
-                {
-                    summaries.push(native.query.summary(native.stream).await?);
-                }
-            }
+            return Ok(Vec::new());
         }
-        summaries.retain(|summary| !summary.closed);
-        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-        summaries.truncate(limit);
-        for summary in &summaries {
-            SessionAccessPolicy::authorize_actor(
-                self.authority.as_ref(),
-                &self.actor,
-                &summary.head.session_id,
-                SessionAccess::Read,
-            )?;
-        }
-        Ok(summaries)
+        Ok(vec![current])
     }
 
     async fn history(
@@ -397,83 +373,7 @@ impl TurnExecutorPort for EngineExecutor<'_> {
     }
 }
 #[async_trait::async_trait]
-impl SessionExecutionPort for EngineSession {
-    fn history_reader(&self) -> Option<Arc<dyn views::SessionHistoryReadPort>> {
-        Some(Arc::new(self.clone()))
-    }
-    async fn pending_inputs(
-        &self,
-        provider_ref: String,
-        model: String,
-    ) -> anyhow::Result<Vec<EngineTurnInput>> {
-        self.recoverable_inputs(provider_ref, model).await
-    }
-    async fn reject_pending_input(&self, turn_id: &str, reason_key: &str) -> anyhow::Result<()> {
-        self.cancel_requeued_input(turn_id, reason_key, None).await
-    }
-    async fn fork_branch(
-        &self,
-        branch: BranchId,
-        cursor: EventCursor,
-    ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
-        Ok(Arc::new(self.fork(branch, cursor).await?))
-    }
-    async fn branches(&self) -> anyhow::Result<Vec<BranchId>> {
-        self.existing_branches().await
-    }
-    async fn resume_branch(
-        &self,
-        branch: BranchId,
-    ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
-        let branches = self.existing_branches().await?;
-        anyhow::ensure!(branches.contains(&branch), "session_branch_not_found");
-        SessionAccessPolicy::authorize_actor(
-            self.authority.as_ref(),
-            &self.actor,
-            &self.stream,
-            SessionAccess::Write,
-        )?;
-        self.authority.authorize_context(&self.stream, &branch)?;
-        let mut session = self.clone();
-        session.branch = branch;
-        Ok(Arc::new(session))
-    }
-    async fn hide_content(&self, target: EventId, reason: &str) -> anyhow::Result<()> {
-        EngineSession::hide_content(self, target, reason).await
-    }
-    async fn replace_content(&self, target: EventId, replacement: EventId) -> anyhow::Result<()> {
-        EngineSession::replace_content(self, target, replacement).await
-    }
-    async fn record_file(&self, file: EngineFileInput, operation: &str) -> anyhow::Result<()> {
-        self.control_file(file, operation).await
-    }
-    async fn request_elicitation(
-        &self,
-        request_id: &str,
-        prompt: &str,
-        schema: &serde_json::Value,
-        expires_at: Timestamp,
-    ) -> anyhow::Result<()> {
-        self.control_elicitation_requested(request_id, prompt, schema, expires_at)
-            .await
-    }
-    async fn resolve_elicitation(
-        &self,
-        request_id: &str,
-        resolution: &serde_json::Value,
-    ) -> anyhow::Result<()> {
-        self.control_elicitation_resolved(request_id, resolution)
-            .await
-    }
-    async fn deliver(
-        &self,
-        intent: zeroclaw_api::session_events::capture::DeliveryIntent,
-        send: zeroclaw_api::session_events::capture::DeliveryFuture<'_>,
-    ) -> anyhow::Result<serde_json::Value> {
-        self.deliver_observed(intent, send)
-            .await
-            .map_err(zeroclaw_api::session_events::capture::capture_stopped)
-    }
+impl zeroclaw_api::session_events::capture::SessionContextPort for EngineSession {
     async fn record_context_input(
         &self,
         input: EngineTurnInput,
@@ -483,60 +383,6 @@ impl SessionExecutionPort for EngineSession {
         self.control_context_input(input, context_text, reason_key)
             .await
     }
-    async fn record_control(&self, value: serde_json::Value) -> anyhow::Result<()> {
-        self.control_evidence(value).await
-    }
-    async fn record_approval_reply_rejected(
-        &self,
-        request_id: Option<String>,
-        classification: String,
-        evidence: serde_json::Value,
-    ) -> anyhow::Result<()> {
-        self.control_approval_reply_rejected(request_id, classification, evidence)
-            .await
-    }
-    async fn close(&self, reason_key: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.summary_deck
-                .as_ref()
-                .map(|runtime| runtime.main_session())
-                .transpose()?
-                .flatten()
-                .as_ref()
-                != Some(&self.stream),
-            "main_session_reset_requires_disabling_policy"
-        );
-        self.control_close(reason_key).await
-    }
-    async fn rename(&self, title: &str) -> anyhow::Result<()> {
-        self.control_rename(title).await
-    }
-    async fn observe_metadata(
-        &self,
-        value: zeroclaw_api::session_events::capture::SessionMetadataObservation,
-    ) -> anyhow::Result<()> {
-        self.control_metadata(value).await
-    }
-    async fn append_assistant(&self, text: &str) -> anyhow::Result<MessageId> {
-        self.control_append(text).await
-    }
-    async fn observe_model_change(
-        &self,
-        selection: ModelOverrideSelection,
-        outcome: ModelChangeDisposition,
-    ) -> anyhow::Result<()> {
-        self.control_model_change(selection, outcome).await
-    }
-    async fn request_cancellation(
-        &self,
-        turn: Option<&str>,
-        incarnation: &str,
-        reason_key: &str,
-    ) -> anyhow::Result<()> {
-        self.control_cancellation(turn, incarnation, reason_key)
-            .await
-    }
-
     async fn restore_model_override(&self) -> anyhow::Result<Option<ModelOverrideSelection>> {
         Ok(self.query().model_selection(self.stream.clone()).await?)
     }
@@ -672,6 +518,143 @@ impl SessionExecutionPort for EngineSession {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_api::session_events::capture::SessionControlPort for EngineSession {
+    async fn fork_branch(
+        &self,
+        branch: BranchId,
+        cursor: EventCursor,
+    ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
+        Ok(Arc::new(self.fork(branch, cursor).await?))
+    }
+    async fn branches(&self) -> anyhow::Result<Vec<BranchId>> {
+        self.existing_branches().await
+    }
+    async fn resume_branch(
+        &self,
+        branch: BranchId,
+    ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
+        let branches = self.existing_branches().await?;
+        anyhow::ensure!(branches.contains(&branch), "session_branch_not_found");
+        SessionAccessPolicy::authorize_actor(
+            self.authority.as_ref(),
+            &self.actor,
+            &self.stream,
+            SessionAccess::Write,
+        )?;
+        self.authority.authorize_context(&self.stream, &branch)?;
+        let mut session = self.clone();
+        session.branch = branch;
+        Ok(Arc::new(session))
+    }
+    async fn hide_content(&self, target: EventId, reason: &str) -> anyhow::Result<()> {
+        EngineSession::hide_content(self, target, reason).await
+    }
+    async fn replace_content(&self, target: EventId, replacement: EventId) -> anyhow::Result<()> {
+        EngineSession::replace_content(self, target, replacement).await
+    }
+    async fn record_control(&self, value: serde_json::Value) -> anyhow::Result<()> {
+        self.control_evidence(value).await
+    }
+    async fn close(&self, reason_key: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.summary_deck
+                .as_ref()
+                .map(|runtime| runtime.main_session())
+                .transpose()?
+                .flatten()
+                .as_ref()
+                != Some(&self.stream),
+            "main_session_reset_requires_disabling_policy"
+        );
+        self.control_close(reason_key).await
+    }
+    async fn rename(&self, title: &str) -> anyhow::Result<()> {
+        self.control_rename(title).await
+    }
+    async fn observe_metadata(
+        &self,
+        value: zeroclaw_api::session_events::capture::SessionMetadataObservation,
+    ) -> anyhow::Result<()> {
+        self.control_metadata(value).await
+    }
+    async fn append_assistant(&self, text: &str) -> anyhow::Result<MessageId> {
+        self.control_append(text).await
+    }
+    async fn observe_model_change(
+        &self,
+        selection: ModelOverrideSelection,
+        outcome: ModelChangeDisposition,
+    ) -> anyhow::Result<()> {
+        self.control_model_change(selection, outcome).await
+    }
+    async fn request_cancellation(
+        &self,
+        turn: Option<&str>,
+        incarnation: &str,
+        reason_key: &str,
+    ) -> anyhow::Result<()> {
+        self.control_cancellation(turn, incarnation, reason_key)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_api::session_events::capture::SessionExecutionPort for EngineSession {
+    fn history_reader(&self) -> Option<Arc<dyn views::SessionHistoryReadPort>> {
+        Some(Arc::new(self.clone()))
+    }
+    async fn pending_inputs(
+        &self,
+        provider_ref: String,
+        model: String,
+    ) -> anyhow::Result<Vec<EngineTurnInput>> {
+        self.recoverable_inputs(provider_ref, model).await
+    }
+    async fn reject_pending_input(&self, turn_id: &str, reason_key: &str) -> anyhow::Result<()> {
+        self.cancel_requeued_input(turn_id, reason_key, None).await
+    }
+    async fn record_file(&self, file: EngineFileInput, operation: &str) -> anyhow::Result<()> {
+        self.control_file(file, operation).await
+    }
+    async fn request_elicitation(
+        &self,
+        request_id: &str,
+        prompt: &str,
+        schema: &serde_json::Value,
+        expires_at: Timestamp,
+    ) -> anyhow::Result<()> {
+        self.control_elicitation_requested(request_id, prompt, schema, expires_at)
+            .await
+    }
+    async fn resolve_elicitation(
+        &self,
+        request_id: &str,
+        resolution: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.control_elicitation_resolved(request_id, resolution)
+            .await
+    }
+    async fn deliver(
+        &self,
+        intent: zeroclaw_api::session_events::capture::DeliveryIntent,
+        send: zeroclaw_api::session_events::capture::DeliveryFuture<'_>,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.deliver_observed(intent, send)
+            .await
+            .map_err(zeroclaw_api::session_events::capture::capture_stopped)
+    }
+    async fn record_approval_reply_rejected(
+        &self,
+        request_id: Option<String>,
+        classification: String,
+        evidence: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.control_approval_reply_rejected(request_id, classification, evidence)
+            .await
     }
     async fn execute(
         &self,

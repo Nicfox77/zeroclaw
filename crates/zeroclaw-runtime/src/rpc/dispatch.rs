@@ -629,6 +629,24 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
     Some(grants.allowed_tools.clone())
 }
 
+/// Project freshly resolved grants into the complete posture used by both
+/// prompts and steering. A wildcard tool or agent selector does not grant
+/// ownership of other sessions, or authority for work that runs later, on
+/// another agent or as SOP steps without the caller's principal.
+fn principal_tool_posture(
+    grants: &zeroclaw_api::grants::ResolvedGrants,
+) -> crate::agent::SteeringPosture {
+    crate::agent::SteeringPosture {
+        tool_ceiling: principal_tool_ceiling(grants),
+        disable_principal_unaware_nested_tools: !grants.admin
+            && !grants
+                .allowed_agents
+                .iter()
+                .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD),
+        withhold_unrestricted_tools: !grants.admin,
+    }
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -1788,7 +1806,7 @@ impl RpcHistoryAuthority {
         } else {
             None
         };
-        let context = zeroclaw_session_host::execution_context_evidence(
+        let context = zeroclaw_kernel::session::execution_context::execution_context_evidence(
             &config,
             self.target_agent
                 .as_deref()
@@ -1890,6 +1908,14 @@ impl RpcHistoryAuthority {
     }
 }
 impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthority {
+    fn session_agent_scope(&self) -> Option<&str> {
+        Some(
+            self.target_agent
+                .as_deref()
+                .unwrap_or(&self.admission.agent_alias),
+        )
+    }
+
     fn authorize_reasoning(
         &self,
         actor: &zeroclaw_api::session_events::EventActor,
@@ -1935,6 +1961,22 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthorit
             return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
                 "RPC history identity or access mismatch".into(),
             ));
+        }
+        // History inspection may cross sessions for a current operator. Keep
+        // writes, child execution and narrowed principals bound to their own
+        // session; never turn this read permission into execution authority.
+        if stream != &self.stream
+            && self.target_agent.is_none()
+            && matches!(access, zeroclaw_kernel::session::query::SessionAccess::Read)
+        {
+            let lease = self.admission.dispatcher.ctx.auth.hold_authority();
+            let grants = self.current_under(&lease)?;
+            if grants.as_ref().is_some_and(|grants| grants.admin)
+                || (grants.is_none()
+                    && self.admission.dispatcher.access_policy == RpcAccessPolicy::TrustedLocal)
+            {
+                return Ok(());
+            }
         }
         self.check_scope(stream)
     }
@@ -2944,7 +2986,8 @@ impl RpcDispatcher {
 
     /// Apply a principal's posture to an agent: narrow its tool surface to the
     /// selector, and, for a principal without operator reach, disable nested
-    /// tools that cannot carry the principal through. A handler that
+    /// tools that cannot carry the principal through and withhold the
+    /// session-data tools that have no principal-aware view. A handler that
     /// re-resolved its principal after waiting for admission passes the fresh
     /// grants here: the stamped copy is only as current as the last gate, and
     /// a prompt that queued before its principal was narrowed must execute
@@ -2954,26 +2997,15 @@ impl RpcDispatcher {
         grants: &zeroclaw_api::grants::ResolvedGrants,
         agent: &mut crate::agent::agent::Agent,
     ) {
-        // Derive the ceiling from the SAME rule creation uses
-        // (`principal_tool_ceiling`): admin -> coarse `tools:execute` ->
-        // selector, in that order. Computing it from `admin || wildcard`
-        // alone omitted the coarse-grant check, so a non-admin who revoked
-        // only `tools:execute` while keeping a wildcard (or any named
-        // selector) yielded `None` here — and `narrow_to_principal_tools(None)`
-        // prunes nothing, leaving previously available static/activated tools
-        // executable under a session that has lost the right to run tools at
-        // all. Sharing one function closes that gap across creation,
-        // rehydration, and subsequent prompts.
-        let narrowing = principal_tool_ceiling(grants);
-        agent.narrow_to_principal_tools(narrowing.as_deref());
-        if !grants.admin
-            && !grants
-                .allowed_agents
-                .iter()
-                .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
-        {
-            agent.disable_principal_unaware_nested_tools();
+        if let Some(auth) = self.auth.clone() {
+            let inbound = Arc::clone(&self.ctx.auth);
+            agent.bind_principal_admission(Arc::new(move || {
+                inbound
+                    .current_grants(&auth)
+                    .is_ok_and(|grants| grants.admin)
+            }));
         }
+        agent.apply_principal_tool_posture(principal_tool_posture(grants));
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
@@ -3425,9 +3457,40 @@ impl RpcDispatcher {
         Some((self.tui_id.as_deref()?, self.tui_epoch?))
     }
 
+    /// The registry entry `initialize` records for this connection.
+    fn tui_entry(
+        &self,
+        tui_id: String,
+        env: std::collections::HashMap<String, String>,
+    ) -> super::tui_identity::TuiEntry {
+        super::tui_identity::TuiEntry {
+            tui_id,
+            connected_at: chrono::Utc::now(),
+            transport: self
+                .peer_label
+                .split_once(':')
+                .map_or("unknown", |(proto, _)| proto)
+                .to_string(),
+            remote: self.transport_kind != crate::rpc::transport::TransportKind::Local,
+            peer_label: self.peer_label.clone(),
+            env,
+        }
+    }
+
     #[cfg(test)]
     pub fn set_tui_id_for_test(&mut self, tui_id: Option<String>) {
         self.tui_id = tui_id;
+    }
+
+    /// Register `tui_id` for this connection as `initialize` does.
+    #[cfg(test)]
+    pub fn register_tui_for_test(&mut self, tui_id: &str) {
+        let epoch = self
+            .ctx
+            .tui_registry
+            .register(self.tui_entry(tui_id.to_string(), Default::default()));
+        self.tui_id = Some(tui_id.to_string());
+        self.tui_epoch = Some(epoch);
     }
 
     #[cfg(test)]
@@ -3929,10 +3992,18 @@ impl RpcDispatcher {
         {
             return Ok(true);
         }
-        let session_config = config.clone();
+        let repository = self.ctx.session_repository.clone().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Session repository was not supplied"
+            );
+            anyhow::Error::msg("session repository was not supplied")
+        })?;
         let session_owner = from.to_owned();
         if tokio::task::spawn_blocking(move || {
-            zeroclaw_session_host::open_repository(&session_config)?
+            repository
                 .list_sessions_by_agent(&session_owner)
                 .map(|sessions| !sessions.is_empty())
         })
@@ -4449,20 +4520,20 @@ impl RpcDispatcher {
 
         let env = self.retained_tui_env(&connection_auth, req.env);
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
+        // A connection holds one registration. Initializing again (to
+        // revalidate, say) replaces this connection's earlier registration
+        // instead of leaving it live beside the new one, so the identity is
+        // still seen to leave when the connection ends.
+        if let Some((previous_id, previous_epoch)) = self.tui_registration() {
+            let previous_id = previous_id.to_string();
+            self.ctx
+                .tui_registry
+                .unregister(&previous_id, previous_epoch);
+        }
         let tui_epoch = self
             .ctx
             .tui_registry
-            .register(super::tui_identity::TuiEntry {
-                tui_id: tui_id.clone(),
-                connected_at: chrono::Utc::now(),
-                transport: self
-                    .peer_label
-                    .split_once(':')
-                    .map_or("unknown", |(proto, _)| proto)
-                    .to_string(),
-                peer_label: self.peer_label.clone(),
-                env,
-            });
+            .register(self.tui_entry(tui_id.clone(), env));
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
 
@@ -5890,6 +5961,19 @@ impl RpcDispatcher {
             None
         };
 
+        // Persist the authorized cwd before the first turn. An idle session
+        // can be reaped or restarted without ever producing TurnAccepted.
+        if let Some(native) = &native_restore {
+            native
+                .observe_metadata(
+                    zeroclaw_api::session_events::capture::SessionMetadataObservation::Workspace {
+                        directory: cwd.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        }
+
         let restored_overrides = match &native_restore {
             Some(native) => match native
                 .restore_model_override()
@@ -5997,23 +6081,25 @@ impl RpcDispatcher {
                         let owner = effective_owner.clone();
                         tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
                             match store_cloned.load_session_for_restore(&sid)? {
-                            zeroclaw_infra::session_repository::SessionRestore::Restorable(
-                                data,
-                            ) => Ok(AcpSessionNewLoad::Restored(data)),
-                            zeroclaw_infra::session_repository::SessionRestore::Missing => {
-                                store_cloned.create_session_with_interaction_surface(
-                                    &sid, "rpc",
-                                    &alias,
-                                    &cwd_owned,
-                                    resolved_interaction_surface.map(|surface| surface.as_str()),
-                                    owner.as_deref(),
-                                )?;
-                                Ok(AcpSessionNewLoad::Created)
+                                zeroclaw_infra::session_repository::SessionRestore::Restorable(
+                                    data,
+                                ) => Ok(AcpSessionNewLoad::Restored(data)),
+                                zeroclaw_infra::session_repository::SessionRestore::Missing => {
+                                    store_cloned.create_session_with_interaction_surface(
+                                        &sid,
+                                        "rpc",
+                                        &alias,
+                                        &cwd_owned,
+                                        resolved_interaction_surface
+                                            .map(|surface| surface.as_str()),
+                                        owner.as_deref(),
+                                    )?;
+                                    Ok(AcpSessionNewLoad::Created)
+                                }
+                                zeroclaw_infra::session_repository::SessionRestore::Killed => {
+                                    Ok(AcpSessionNewLoad::Killed)
+                                }
                             }
-                            zeroclaw_infra::session_repository::SessionRestore::Killed => {
-                                Ok(AcpSessionNewLoad::Killed)
-                            }
-                        }
                         })
                         .await
                     };
@@ -6050,7 +6136,8 @@ impl RpcDispatcher {
                                         &data.messages,
                                     )
                                 });
-                            seed_event = agent.seed_conversation_history_with_event(provider_history);
+                            seed_event =
+                                agent.seed_conversation_history_with_event(provider_history);
                             // Restore the durable TodoWrite plan into the fresh
                             // in-memory session and re-emit it so the resuming /
                             // reconnecting client's tracker repopulates without a
@@ -6111,113 +6198,30 @@ impl RpcDispatcher {
                     }
                 }
                 crate::rpc::types::ChatMode::Chat => {
-                    if let Some(native) = &native_restore {
-                        if let Some(context) = native.restore_context().await.map_err(|error|rpc_err(INTERNAL_ERROR,error.to_string()))? {
-                            agent.set_history_has_trim_breadcrumb(context.history_has_trim_breadcrumb.unwrap_or(false));
-                            message_count = context.messages.len();
-                            seed_event = agent.seed_conversation_history_with_event(context.messages);
-                            if seed_event.is_some() {
-                                native.replace_context(zeroclaw_api::session_events::capture::ContextSnapshot {
-                                    messages:(agent.history()).to_vec(),
-                                    history_has_trim_breadcrumb:Some(agent.history_has_trim_breadcrumb()),
-                                }, "session_restore_trim").await.map_err(|error|rpc_err(INTERNAL_ERROR,error.to_string()))?;
-                            }
-                        }
-                    } else {
-                        #[cfg(test)]
-                        if let Some(ref backend) = self.ctx.session_backend {
-                        let session_key = format!("rpc_{session_id}");
-                        let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                        // Fail closed: an unreadable transcript must not become
-                        // an empty history that a later turn authoritatively
-                        // persists over the existing durable session.
-                        let stored = match backend.try_load(&session_key) {
-                            Ok(stored) => stored,
-                            Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({
-                                        "session_key": session_key,
-                                        "error": format!("{}", e),
-                                    })),
-                                    "Failed to load RPC session transcript; refusing to open with unverified history"
-                                );
-                                return Err(rpc_err(
-                                    INTERNAL_ERROR,
-                                    "session restore unavailable; retry the connection",
-                                ));
-                            }
-                        };
-                        if !stored.is_empty() {
-                            // Breadcrumb provenance is the backend's own
-                            // canonical record alongside the transcript, never
-                            // inferred from message text. Set it BEFORE
-                            // seeding: seeding trims immediately if the
-                            // restored transcript is over the structured cap,
-                            // and that seed-time trim reads the agent's
-                            // current breadcrumb flag to decide whether a
-                            // leading synthetic marker counts as a real turn.
-                            match backend.get_session_trim_breadcrumb(&session_key) {
-                                Ok(opt) => {
-                                    agent.set_history_has_trim_breadcrumb(opt.unwrap_or(false));
-                                    seed_event = agent.seed_history_with_event(&stored);
-                                    message_count = stored.len();
-                                    // Seed-time trim only fires when the
-                                    // restored history exceeded the structured
-                                    // cap, so it dropped rows, not just
-                                    // relabeled them. Mirror the ACP restore
-                                    // contract: persist the retained
-                                    // projection and corrected breadcrumb
-                                    // before the session goes live, or a
-                                    // reconnect before the next prompt
-                                    // reloads the untrimmed durable prefix
-                                    // and repeats the trim, leaving the live
-                                    // agent and the durable session
-                                    // disagreeing.
-                                    if seed_event.is_some() {
-                                        let durable = zeroclaw_providers::durable_chat_messages(
-                                            agent.history(),
-                                        );
-                                        if !replace_rpc_chat_conversation_state(
-                                            backend.as_ref(),
-                                            &session_id,
-                                            &session_key,
-                                            &durable,
+                    if let Some(native) = &native_restore
+                        && let Some(context) = native
+                            .restore_context()
+                            .await
+                            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                    {
+                        agent.set_history_has_trim_breadcrumb(
+                            context.history_has_trim_breadcrumb.unwrap_or(false),
+                        );
+                        message_count = context.messages.len();
+                        seed_event = agent.seed_conversation_history_with_event(context.messages);
+                        if seed_event.is_some() {
+                            native
+                                .replace_context(
+                                    zeroclaw_api::session_events::capture::ContextSnapshot {
+                                        messages: (agent.history()).to_vec(),
+                                        history_has_trim_breadcrumb: Some(
                                             agent.history_has_trim_breadcrumb(),
-                                        ) {
-                                            return Err(rpc_err(
-                                                INTERNAL_ERROR,
-                                                "session restore unavailable; retry the connection",
-                                            ));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                        .with_attrs(::serde_json::json!({
-                                            "session_key": session_key,
-                                            "error": format!("{}", e),
-                                        })),
-                                        "Failed to read trim breadcrumb provenance for RPC restore; refusing to open with unverified history"
-                                    );
-                                    return Err(rpc_err(
-                                        INTERNAL_ERROR,
-                                        "session restore unavailable; retry the connection",
-                                    ));
-                                }
-                            }
-                        }
+                                        ),
+                                    },
+                                    "session_restore_trim",
+                                )
+                                .await
+                                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
                         }
                     }
                 }
@@ -6226,21 +6230,33 @@ impl RpcDispatcher {
             if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
                 && let Some(port) = &native_restore
             {
-                if let Some(context) = port.restore_context().await.map_err(|error|rpc_err(INTERNAL_ERROR,error.to_string()))? {
-                    agent.set_history_has_trim_breadcrumb(context.history_has_trim_breadcrumb.unwrap_or(false));
+                if let Some(context) = port
+                    .restore_context()
+                    .await
+                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                {
+                    agent.set_history_has_trim_breadcrumb(
+                        context.history_has_trim_breadcrumb.unwrap_or(false),
+                    );
                     message_count = context.messages.len();
                     seed_event = agent.seed_conversation_history_with_event(context.messages);
                     if seed_event.is_some() {
-                        port.replace_context(zeroclaw_api::session_events::capture::ContextSnapshot {
-                            messages: agent.history().to_vec(),
-                            history_has_trim_breadcrumb: Some(agent.history_has_trim_breadcrumb()),
-                        }, "session_restore_trim").await.map_err(|error|rpc_err(INTERNAL_ERROR,error.to_string()))?;
+                        port.replace_context(
+                            zeroclaw_api::session_events::capture::ContextSnapshot {
+                                messages: agent.history().to_vec(),
+                                history_has_trim_breadcrumb: Some(
+                                    agent.history_has_trim_breadcrumb(),
+                                ),
+                            },
+                            "session_restore_trim",
+                        )
+                        .await
+                        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
                     }
                 }
             } else if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
                 self.persist_seed_trim_before_notice(&session_id, seed_event.as_ref())
-                    .await
-                    ?;
+                    .await?;
             }
             Ok::<_, JsonRpcError>((message_count, seed_event, plan))
         }
@@ -8574,40 +8590,8 @@ impl RpcDispatcher {
             });
         }
 
-        match chat_mode {
-            crate::rpc::types::ChatMode::Acp => {
-                // Native ACP turns always own a checkpoint. Their terminal
-                // projection is committed above; falling back to a wholesale
-                // transcript replacement here would erase the append-only
-                // journal frontier and resurrect trimmed data.
-            }
-            crate::rpc::types::ChatMode::Chat => {
-                // A refused turn never touched the Agent, so there is nothing
-                // of it to persist.
-                #[cfg(test)]
-                if native_session.is_none()
-                    && !matches!(outcome, Err(crate::rpc::turn::TurnError::Refused(_)))
-                    && let Some(ref backend) = self.ctx.session_backend
-                    && let Some(agent) = self.ctx.sessions.get_agent(sid).await
-                {
-                    let key = format!("rpc_{sid}");
-                    // Replace the durable transcript and breadcrumb flag with
-                    // the agent's own authoritative post-turn history, as one
-                    // state, rather than appending this turn's prompt/response
-                    // delta on top of a transcript the agent's loop may have
-                    // already trimmed underneath it.
-                    let agent = agent.lock().await;
-                    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
-                    replace_rpc_chat_conversation_state(
-                        backend.as_ref(),
-                        sid,
-                        &key,
-                        &durable,
-                        agent.history_has_trim_breadcrumb(),
-                    );
-                }
-            }
-        }
+        // The turn end is the latest activity for orphan retirement.
+        self.ctx.sessions.touch(sid).await;
 
         // Report the same durable transcript count as the session picker and
         // pager. The live model context can omit or compact historical rows.
@@ -8637,6 +8621,7 @@ impl RpcDispatcher {
                 .iter()
                 .filter(|message| {
                     matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
+
                 })
                 .count();
             Some(zeroclaw_api::model_provider::projected_entry_count(history) - system_rows)
@@ -9566,14 +9551,7 @@ impl RpcDispatcher {
             ) {
                 return refuse(denied.message);
             }
-            SteeringAdmission::Admitted(SteeringPosture {
-                tool_ceiling: principal_tool_ceiling(&grants),
-                disable_principal_unaware_nested_tools: !grants.admin
-                    && !grants
-                        .allowed_agents
-                        .iter()
-                        .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD),
-            })
+            SteeringAdmission::Admitted(principal_tool_posture(&grants))
         })))
     }
 
@@ -11891,6 +11869,29 @@ impl RpcDispatcher {
 
     // ── Cron handlers ────────────────────────────────────────────
 
+    /// Agent jobs rebuild tools without the caller's principal. An agent
+    /// selector (even a wildcard) cannot confer that missing authority.
+    fn authorize_cron_agent_execution(
+        &self,
+        method: Method,
+        job: &crate::cron::CronJob,
+    ) -> Result<(), JsonRpcError> {
+        if job.job_type != crate::cron::JobType::Agent {
+            return Ok(());
+        }
+        if self
+            .recheck_authority_after_admission(method)?
+            .is_some_and(|grants| grants.admin)
+        {
+            return Ok(());
+        }
+        let denied = crate::rpc::auth::AuthDenied::forbidden(crate::i18n::get_required_cli_string(
+            "rpc-cron-agent-principal-required",
+        ));
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
     async fn handle_cron_list(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
         let mut jobs = crate::cron::list_jobs(&config)
@@ -11955,27 +11956,68 @@ impl RpcDispatcher {
             name: req.name,
             ..Default::default()
         };
-        // The ownership test rides in the `UPDATE` itself for a scoped
-        // principal, so an agent rename landing between the check and the
-        // write cannot open a window. An operator-level principal patches
-        // any row, including the ownerless legacy ones.
-        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
-        // Validate a replacement command under the owning agent's policy before
-        // it is persisted. `cron/add` validates on the way in; without the same
-        // check here an invalid command can replace a working job through the
-        // patch path, and the job only fails later, at execution.
-        if let Some(command) = patch.command.as_deref()
-            && !command.trim().is_empty()
-        {
-            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, true)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
+        // Keep the opaque initial ownership refusal, but repeat all authority
+        // and row checks under the actual writer transaction below.
+        self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        let command = patch.command.clone();
+        let denied = parking_lot::Mutex::new(None);
+        let job = crate::cron::update_job_authorized(&config, &req.id, None, patch, |job| {
+            let authorize = || -> Result<_, JsonRpcError> {
+                // Storage first, then config -> accepted authority -> pairing,
+                // with no further storage acquisition or await after resolution.
+                let live = self.ctx.config.read();
+                let lease = self.ctx.auth.hold_authority();
+                let auth = self
+                    .auth
+                    .as_ref()
+                    .ok_or_else(|| rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"))?;
+                let grants = current_authority_under(&lease, auth, Method::CronPatch)
+                    .map_err(|error| rpc_err(error.code, error.message))?;
+                if !grants.may_use_agent(&req.agent)
+                    || (!grants.admin && !live.agents.contains_key(&req.agent))
+                {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        crate::i18n::get_required_cli_string("cron-rpc-requested-agent-forbidden"),
+                    ));
+                }
+                if !grants.may_use_agent(&job.agent_alias) {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "Cron job not found: {}",
+                            crate::cron::job_not_found(&req.id)
+                        ),
+                    ));
+                }
+                if job.job_type == crate::cron::JobType::Agent && !grants.admin {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        crate::i18n::get_required_cli_string("rpc-cron-agent-principal-required"),
+                    ));
+                }
+                if let Some(command) = command
+                    .as_deref()
+                    .filter(|command| !command.trim().is_empty())
+                {
+                    crate::cron::validate_shell_command(&live, &job.agent_alias, command, true)
+                        .map_err(|error| {
+                            rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {error}"))
+                        })?;
+                }
+                Ok((live, lease))
+            };
+            authorize().map_err(|error| {
+                let message = error.message.clone();
+                *denied.lock() = Some(error);
+                anyhow::Error::msg(message)
+            })
+        });
+        if let Some(error) = denied.into_inner() {
+            return Err(error);
         }
-        let job = if self.has_admin_grants() {
-            crate::cron::update_job(&config, &req.id, patch)
-        } else {
-            crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
-        }
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
+        let job =
+            job.map_err(|error| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {error}")))?;
         to_result(job)
     }
 
@@ -12024,6 +12066,7 @@ impl RpcDispatcher {
         .capture_selection();
         let config = self.ctx.config.read().clone();
         let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
+        self.authorize_cron_agent_execution(Method::CronTrigger, &job)?;
         let event_tx = self.ctx.event_tx.clone();
         let execution = crate::cron::scheduler::run_manual_job_with_selection(
             &config,
@@ -13344,6 +13387,14 @@ impl RpcDispatcher {
                 let from = req.from.clone();
                 let to = req.to.clone();
                 let memory = self.ctx.memory.clone();
+                let managed_sessions = self
+                    .ctx
+                    .session_repository
+                    .clone()
+                    .map(|store| {
+                        store as Arc<dyn zeroclaw_api::session_events::management::AgentSessionPort>
+                    })
+                    .ok_or_else(|| "session repository was not supplied".to_owned());
                 // Same ownership-boundary boxing as the delete transaction:
                 // the rename future carries the same capture shape (prepared
                 // config, channel maps, commit, both leases) and is
@@ -13402,6 +13453,7 @@ impl RpcDispatcher {
                             memory.as_ref(),
                             &from,
                             &to,
+                            managed_sessions,
                         )
                         .await;
                         warnings.extend(owned.warnings);
@@ -13549,9 +13601,7 @@ impl RpcDispatcher {
                 Some(store) => store
                     .count_live_sessions_by_agent(&alias)
                     .map_err(|error| error.to_string()),
-                None => zeroclaw_session_host::open_repository(&config)
-                    .and_then(|store| store.count_live_sessions_by_agent(&alias))
-                    .map_err(|error| error.to_string()),
+                None => Err("session repository was not supplied".into()),
             };
             crate::agent_lifecycle::plan_agent_delete_with_acp_count(&config, &alias, live_acp)
         })
@@ -13583,16 +13633,13 @@ impl RpcDispatcher {
             .agent_lifecycle
             .begin_delete(alias.clone())
             .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let session_config = self.ctx.config.read().clone();
         let store = self.ctx.session_repository.clone();
         let preflight_alias = alias.clone();
         let live_acp = tokio::task::spawn_blocking(move || match store {
             Some(store) => store
                 .count_live_sessions_by_agent(&preflight_alias)
                 .map_err(|error| error.to_string()),
-            None => zeroclaw_session_host::open_repository(&session_config)
-                .and_then(|store| store.count_live_sessions_by_agent(&preflight_alias))
-                .map_err(|error| error.to_string()),
+            None => Err("session repository was not supplied".into()),
         })
         .await
         .map_err(|error| {
@@ -13645,6 +13692,14 @@ impl RpcDispatcher {
             .unwrap_or_else(|| Arc::new(zeroclaw_memory::NoneMemory::new("none")));
         let memory_unavailable = self.ctx.memory.is_none();
         let cleanup_alias = alias.clone();
+        let managed_sessions = self
+            .ctx
+            .session_repository
+            .clone()
+            .map(|store| {
+                store as Arc<dyn zeroclaw_api::session_events::management::AgentSessionPort>
+            })
+            .ok_or_else(|| "session repository was not supplied".to_owned());
         let cleanup_sessions = Arc::clone(&self.ctx.sessions);
         let cleanup_reload_tx = self.ctx.reload_tx.clone();
         let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
@@ -13708,6 +13763,7 @@ impl RpcDispatcher {
                     &memory,
                     &cleanup_alias,
                     &archive.archive_dir,
+                    managed_sessions,
                 )
                 .await;
                 warnings.extend(owned.warnings);
@@ -14923,7 +14979,7 @@ impl RpcDispatcher {
             return Ok(());
         };
         if executes {
-            self.refuse_constrained_tool_selector_for_sop(method)?;
+            self.refuse_constrained_principal_for_sop(method, grants)?;
         }
         let agents = {
             let config = self.ctx.config.read();
@@ -14939,37 +14995,21 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Refuse a procedure run by a principal whose tool selector names a
-    /// subset of the tools rather than the wildcard.
-    ///
-    /// A session composes [`Self::principal_tool_narrowing`] into the agent it
-    /// assembles, so a principal with a named tool list gets a narrowed
-    /// session rather than a refusal. A procedure is dispatched through the
-    /// SOP engine, which builds its own agents from the procedure's own policy
-    /// and never sees that narrowing, so the same principal would run with the
-    /// agent's full tool set. Until the narrowing is plumbed through the
-    /// engine, this path keeps the fail-closed posture the session selector
-    /// used to carry.
-    ///
-    /// A wildcard selector passes: the principal may already name any tool, so
-    /// the engine assembling the agent's own set is not an escalation past it.
-    fn refuse_constrained_tool_selector_for_sop(&self, method: Method) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
-            return Ok(());
-        };
-        if auth.grants.admin
-            || auth
-                .grants
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
-        {
+    /// Headless steps do not carry the caller's principal or session-data
+    /// restrictions. Until they do, only administrators may start or resume
+    /// them, including when a non-admin has wildcard tool and agent selectors.
+    /// Authoring retains its separate agent checks.
+    fn refuse_constrained_principal_for_sop(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin {
             return Ok(());
         }
         let denied = rpc_err(
             FORBIDDEN,
-            "Principal has a constrained tool selector; procedures run outside per-session tool \
-             narrowing and are refused to it",
+            crate::i18n::get_required_cli_string("sop-rpc-principal-ceiling-required"),
         );
         self.audit_auth_denial(
             method,
@@ -14979,6 +15019,45 @@ impl RpcDispatcher {
             },
         );
         Err(denied)
+    }
+
+    /// Resolve live authority at RPC admission and again at the effect boundary.
+    /// When a procedure is supplied, the caller holds the engine lock so its
+    /// definition cannot change before start/resume.
+    fn authorize_sop_execution(
+        &self,
+        method: Method,
+        sop: Option<&crate::sop::Sop>,
+    ) -> Result<(), JsonRpcError> {
+        // Resolve aliases before authority so a wait on live config cannot
+        // leave us using grants resolved before that wait.
+        let agents = sop.map(|sop| Self::sop_executing_agents(sop, &self.ctx.config.read()));
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Ok(());
+        };
+        self.refuse_constrained_principal_for_sop(method, &grants)?;
+        if let Some(agents) = agents {
+            for alias in agents {
+                self.selector_session_agent_with_grants(method, &grants, &alias)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sop_execution_lease<'a>(
+        &'a self,
+        method: Method,
+    ) -> Result<Box<dyn crate::sop::dispatch::SopEffectGuard + 'a>, JsonRpcError> {
+        // Match publication's config -> accepted authority -> pairing order.
+        // Callers use a nonblocking store and drop this before any await.
+        let config = self.ctx.config.read();
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method)
+                .map_err(|denied| rpc_err(denied.code, denied.message))?;
+            self.refuse_constrained_principal_for_sop(method, &grants)?;
+        }
+        Ok(Box::new((lease, config)))
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
@@ -15089,6 +15168,7 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        self.authorize_sop_execution(Method::SopsRun, None)?;
         // The run executes as the procedure's agents, so the principal must be
         // entitled to every one of them before anything is dispatched.
         if self.stamped_grants().is_some() {
@@ -15136,14 +15216,23 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results = if let Some(dedup_key) = dedup_key {
-            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
-                engine, audit, event, &req.name, dedup_key,
-            )
-            .await
-        } else {
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        let denied = parking_lot::Mutex::new(None);
+        let authorize = |sop: &crate::sop::Sop| {
+            self.authorize_sop_execution(Method::SopsRun, Some(sop))
+                .and_then(|()| self.sop_execution_lease(Method::SopsRun))
+                .map_err(|error| {
+                    let reason = error.message.clone();
+                    *denied.lock() = Some(error);
+                    reason
+                })
         };
+        let results = crate::sop::dispatch::dispatch_sop_event_to_authorized(
+            engine, audit, event, &req.name, dedup_key, &authorize,
+        )
+        .await;
+        if let Some(error) = denied.into_inner() {
+            return Err(error);
+        }
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
@@ -15325,30 +15414,21 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        // Approving resumes the run headlessly as its procedure's agents, so
-        // the principal must be entitled to every one of them before its
-        // decision reaches the broker. The loaded run's procedure is what
-        // executes, whatever is on disk.
-        if self.stamped_grants().is_some() {
-            let run_sop = {
-                let guard = engine
-                    .lock()
-                    .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-                guard
-                    .get_run(&req.run_id)
-                    .and_then(|run| guard.get_sop(&run.sop_name))
-                    .cloned()
-            };
-            if let Some(run_sop) = run_sop {
-                self.authorize_sop_agents(Method::SopsDecide, &run_sop, true)?;
-            }
+        if let Some(grants) = self.stamped_grants() {
+            self.refuse_constrained_principal_for_sop(Method::SopsDecide, grants)?;
         }
 
         let mut resolved_outcome = None;
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("sop-decision-admission")
+            .await;
         {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            self.authorize_sop_execution(Method::SopsDecide, guard.get_sop(&req.name))?;
+            let _authority = self.sop_execution_lease(Method::SopsDecide)?;
             let run_sop_name = guard
                 .get_run(&req.run_id)
                 .map(|run| run.sop_name.clone())
@@ -15366,10 +15446,10 @@ impl RpcDispatcher {
             }
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
-            match guard
-                .resolve_via_broker_deferred(&req.run_id, decision, principal)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
-            {
+            let outcome = guard.with_nonblocking_store(|engine| {
+                engine.resolve_via_broker_deferred(&req.run_id, decision, principal)
+            });
+            match outcome.map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))? {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
                     resolved_outcome = Some(outcome);
                 }
@@ -15436,7 +15516,15 @@ impl RpcDispatcher {
             );
         }
 
-        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("sop-decision-result")
+            .await;
+        let result = crate::sop::run_overlay_for(&sop, &engine, &req.run_id);
+        // The effect lease ended before driving the resumed work. The final
+        // read can wait again; authorize its success and error projections.
+        let _authority = self.sop_execution_lease(Method::SopsDecide)?;
+        let overlay = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -16700,48 +16788,6 @@ pub(super) async fn forward_turn_event(
     }
 }
 
-/// Replace the RPC chat session's durable transcript and breadcrumb flag
-/// with the agent's own authoritative post-turn history. A durable write
-/// failure here must not be silently swallowed: the turn is still reported
-/// to the RPC client as completed, but the durable store then disagrees
-/// with what the caller claims was persisted, so failures are logged with
-/// session context for operators to notice.
-///
-/// Returns `true` when the row was committed or there was nothing left to
-/// persist (session already deleted), and `false` when the durable write
-/// itself failed, so a restore-time caller can fail closed instead of
-/// letting the session go live against a store that still has the
-/// untrimmed prefix.
-#[cfg(test)]
-fn replace_rpc_chat_conversation_state(
-    backend: &dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend,
-    session_id: &str,
-    session_key: &str,
-    durable: &[zeroclaw_providers::ChatMessage],
-    breadcrumb_present: bool,
-) -> bool {
-    // Guarded replacement, not check-then-act: a delete committing between a
-    // separate existence probe and the write would be silently undone by the
-    // replace recreating the session row/files. When deletion already won
-    // (`Ok(false)`) there is nothing left to persist, so skip quietly.
-    match backend.replace_conversation_state_if_exists(session_key, durable, breadcrumb_present) {
-        Ok(_) => true,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "session_id": session_id,
-                        "error": format!("{}", e),
-                    })),
-                "Failed to persist authoritative post-turn conversation state"
-            );
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod connection_test_support {
     use super::RpcContext;
@@ -16933,6 +16979,10 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    mod principal_headless;
+    mod sop_principal;
+    mod steering_posture;
+
     use zeroclaw_api::model_provider::ChatMessage;
 
     // These waits detect a stuck boundary, not a latency contract. Real durable
@@ -17432,6 +17482,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             initiating_agent: None,
+            memory_owner: None,
             decided_mode: None,
             decisions: std::collections::BTreeMap::new(),
         };
@@ -18626,7 +18677,16 @@ mod tests {
     async fn cron_patch_rejects_a_command_the_owner_policy_refuses() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = cron_roster_config_in(&tmp, 4242);
-        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "alpha",
+            Some("alpha-job".into()),
+            Schedule::Every { every_ms: 3600000 },
+            "echo original",
+            None,
+            true,
+        )
+        .unwrap();
         let ctx = enforcement_ctx(config.clone());
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
@@ -18654,6 +18714,135 @@ mod tests {
             "a rejected patch must leave the stored command unchanged"
         );
         assert_eq!(reread.name.as_deref(), job.name.as_deref());
+    }
+
+    #[test]
+    fn cron_patch_rechecks_authority_and_row_after_sqlite_writer_wait() {
+        run_on_a_large_stack(|| async {
+            for scenario in [
+                "agent-demotion",
+                "shell-revocation",
+                "owner-change",
+                "type-change",
+                "agent-control",
+                "shell-control",
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = cron_roster_config_in(&tmp, 4242);
+                let agent = scenario.starts_with("agent-");
+                config
+                    .permission_profiles
+                    .get_mut("cron-alpha")
+                    .unwrap()
+                    .admin = agent;
+                let job = if agent {
+                    seed_cron_job(&config, "alpha", "original")
+                } else {
+                    crate::cron::add_shell_job_with_approval(
+                        &config,
+                        "alpha",
+                        Some("original".into()),
+                        Schedule::Every { every_ms: 3600000 },
+                        "echo original",
+                        None,
+                        true,
+                    )
+                    .unwrap()
+                };
+                let ctx = enforcement_ctx(config.clone());
+                let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+                let (operator, _) = local_operator(&ctx).await;
+                let writer =
+                    rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let (arrived, waiting) = std::sync::mpsc::channel();
+                let id = job.id.clone();
+                let worker = std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        crate::cron::notify_patch_writer_wait_for_test(arrived);
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(rpc(
+                                &mut alice,
+                                &mut rx,
+                                1,
+                                "cron/patch",
+                                json!({"id":id,"agent":"alpha","name":"patched"}),
+                            ))
+                    })
+                    .unwrap();
+                let arrival = waiting.recv_timeout(std::time::Duration::from_secs(3));
+                if arrival.is_ok() {
+                    match scenario {
+                        "agent-demotion" | "shell-revocation" => {
+                            let commit = ctx.begin_config_commit().await.unwrap();
+                            let mut changed = ctx.config.read().clone();
+                            let profile =
+                                changed.permission_profiles.get_mut("cron-alpha").unwrap();
+                            profile.admin = false;
+                            if scenario == "shell-revocation" {
+                                profile
+                                    .grants
+                                    .get_mut(&zeroclaw_api::grants::Resource::Cron)
+                                    .unwrap()
+                                    .retain(|verb| *verb != zeroclaw_api::grants::Verb::Update);
+                            }
+                            changed.mark_dirty("permission_profiles.cron-alpha");
+                            operator
+                                .save_and_publish_config(
+                                    commit,
+                                    changed,
+                                    RpcConfigCommitEffects::default(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        "owner-change" => {
+                            writer
+                                .execute(
+                                    "UPDATE cron_jobs SET agent_alias='beta' WHERE id=?1",
+                                    [&job.id],
+                                )
+                                .unwrap();
+                        }
+                        "type-change" => {
+                            writer.execute("UPDATE cron_jobs SET job_type='agent', prompt='private' WHERE id=?1", [&job.id]).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                writer.execute_batch("COMMIT").unwrap();
+                let response = worker.join().unwrap();
+                arrival.expect("patch must enter the real SQLite writer wait");
+                let stored = crate::cron::get_job(&config, &job.id).unwrap();
+                if scenario.ends_with("control") {
+                    assert!(response.get("error").is_none(), "{scenario}: {response}");
+                    assert_eq!(stored.name.as_deref(), Some("patched"));
+                } else {
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(if scenario == "owner-change" {
+                            INVALID_PARAMS
+                        } else {
+                            FORBIDDEN
+                        }),
+                        "{scenario}: {response}"
+                    );
+                    assert_eq!(stored.name.as_deref(), Some("original"), "{scenario}");
+                    assert_eq!(stored.command, job.command);
+                    assert_eq!(stored.next_run, job.next_run);
+                }
+                assert!(stored.last_run.is_none());
+                assert!(
+                    crate::cron::list_runs(&config, &job.id, 10)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        });
     }
 
     #[tokio::test]
@@ -19802,6 +19991,7 @@ mod tests {
             .get_mut("cron-alpha")
             .expect("the fixture profile exists");
         profile.allowed_tools = vec![zeroclaw_api::grants::WILDCARD.into()];
+        profile.grants.insert(Resource::Tools, vec![Verb::Execute]);
         profile.grants.insert(
             Resource::Sops,
             vec![
@@ -19824,6 +20014,28 @@ mod tests {
         (ctx, engine, sops_dir)
     }
 
+    fn allow_all_sop_agents(ctx: &RpcContext) {
+        let mut config = ctx.config_authority.snapshot_config();
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .allowed_agents = vec!["*".into()];
+        ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
+    }
+
+    fn grant_sop_admin(ctx: &RpcContext) {
+        let mut config = ctx.config_authority.snapshot_config();
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = true;
+        ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
+    }
+
     fn park_sop_run(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>, name: &str) -> String {
         let action = engine
             .lock()
@@ -19844,11 +20056,26 @@ mod tests {
         run_id
     }
 
+    /// `sops/run` got past authorization. This context has no SOP audit log,
+    /// and that check follows authorization, so an admitted run stops there.
+    fn assert_sop_run_admitted(response: &Value) {
+        assert_eq!(
+            response["error"]["code"],
+            json!(INTERNAL_ERROR),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            json!("SOP subsystem not enabled"),
+            "{response}"
+        );
+    }
+
     #[tokio::test]
-    async fn sop_run_and_decide_refuse_a_procedure_run_as_an_agent_outside_the_selector() {
+    async fn sop_run_and_decide_refuse_agent_scoped_execution() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
-        let beta_run = park_sop_run(&engine, "beta-sop");
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
         let run = rpc(
@@ -19856,7 +20083,7 @@ mod tests {
             &mut rx,
             1,
             "sops/run",
-            json!({"name": "beta-sop"}),
+            json!({"name": "alpha-sop"}),
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
@@ -19866,7 +20093,7 @@ mod tests {
             &mut rx,
             2,
             "sops/decide",
-            json!({"name": "beta-sop", "run_id": beta_run, "decision": "approve"}),
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": "approve"}),
         )
         .await;
         assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
@@ -19874,14 +20101,13 @@ mod tests {
             engine
                 .lock()
                 .expect("engine lock")
-                .get_run(&beta_run)
+                .get_run(&alpha_run)
                 .map(|run| run.status),
             Some(crate::sop::SopRunStatus::WaitingApproval),
             "a refused approval must leave the run parked"
         );
 
-        // alpha's procedure passes the selector. This context has no SOP audit
-        // log, so the run then fails as unavailable rather than as refused.
+        allow_all_sop_agents(&ctx);
         let admitted = rpc(
             &mut alice,
             &mut rx,
@@ -19890,13 +20116,31 @@ mod tests {
             json!({"name": "alpha-sop"}),
         )
         .await;
-        assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
+        assert_eq!(
+            admitted["error"]["code"],
+            json!(FORBIDDEN),
+            "wildcards do not grant session-data authority: {admitted}"
+        );
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            4,
+            "sops/decide",
+            json!({"name":"alpha-sop", "run_id":alpha_run, "decision":"approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine.lock().unwrap().get_run(&alpha_run).unwrap().status,
+            crate::sop::SopRunStatus::WaitingApproval
+        );
     }
 
     #[tokio::test]
     async fn sop_run_refuses_a_constrained_tool_selector_like_a_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, _engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let mut narrowed = ctx.config.read().clone();
         narrowed
@@ -19917,6 +20161,587 @@ mod tests {
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+    }
+
+    #[tokio::test]
+    async fn sop_run_and_decide_refuse_a_wildcard_selector_without_tools_execute() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let mut without_tools = ctx.config.read().clone();
+        without_tools
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth
+            .refresh_from_config(&without_tools)
+            .expect("the policy without tools:execute compiles");
+
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": "approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&alpha_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::WaitingApproval),
+            "a refused approval must leave the run parked"
+        );
+
+        // The trusted local operator holds admin grants and is never narrowed,
+        // so the same procedure is admitted for it.
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let admitted = rpc(
+            &mut operator,
+            &mut op_rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_sop_run_admitted(&admitted);
+    }
+
+    #[tokio::test]
+    async fn sop_missing_definition_cannot_bypass_the_tool_ceiling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth.refresh_from_config(&revoked).unwrap();
+        engine.lock().unwrap().set_sops_for_test(vec![]);
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": "absent", "decision": "approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+    }
+
+    /// The actual RPC must finish its refusal while the external writer is still
+    /// holding SQLite, rather than waiting with an already accepted authority.
+    #[tokio::test]
+    async fn sop_rpc_refuses_sqlite_contention_before_start_or_resume_effects() {
+        use crate::sop::{SopRunStatus, SopRunStore};
+        for resume in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (base, engine, _) = sop_scoped_ctx(&tmp, 4242);
+            grant_sop_admin(&base);
+            let path = tmp.path().join("sop-contention.db");
+            let store = Arc::new(crate::sop::SqliteRunStore::open(&path).unwrap());
+            let mut replacement = crate::sop::SopEngine::new(base.config.read().sop.clone())
+                .with_store(store.clone());
+            replacement.set_sops_for_test(vec![gated_sop("alpha-sop", "alpha")]);
+            *engine.lock().unwrap() = replacement;
+            let run_id = resume.then(|| park_sop_run(&engine, "alpha-sop"));
+            let before = run_id.as_ref().map(|id| {
+                serde_json::to_value(engine.lock().unwrap().get_run(id).unwrap()).unwrap()
+            });
+            let shared: Arc<dyn zeroclaw_memory::traits::Memory> =
+                Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+            let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+                base.config.read().clone(),
+                Arc::clone(&base.sessions),
+                engine.clone(),
+                Arc::new(crate::sop::SopAuditLogger::new(shared)),
+                None,
+            );
+            let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+            let method = if resume { "sops/decide" } else { "sops/run" };
+            let params = if let Some(id) = &run_id {
+                json!({"name":"alpha-sop","run_id":id,"decision":"approve"})
+            } else {
+                json!({"name":"alpha-sop"})
+            };
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (done, completed) = std::sync::mpsc::channel();
+            let call = std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let response = runtime.block_on(rpc(&mut peer, &mut rx, 1, method, params));
+                    done.send(response).unwrap();
+                    (peer, rx)
+                })
+                .unwrap();
+            let result = completed.recv_timeout(std::time::Duration::from_secs(2));
+            // Always release/join, even on the old implementation, so a failed
+            // regression does not leave a worker running behind the fixture.
+            writer.execute_batch("ROLLBACK").unwrap();
+            let (mut peer, mut rx) = call.join().unwrap();
+            let response = result.expect("RPC must refuse without waiting for SQLite's writer");
+            assert!(response.get("error").is_some(), "{response}");
+            // Start admission reports storage failures as INVALID_PARAMS, whereas
+            // resume uses INTERNAL_ERROR. Pin the actual SQLite cause below so
+            // a parser/permission refusal cannot satisfy this regression.
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("locked"),
+                "the external SQLite writer must cause the refusal: {response}"
+            );
+            assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
+            if let Some(id) = &run_id {
+                assert_eq!(
+                    serde_json::to_value(engine.lock().unwrap().get_run(id).unwrap()).unwrap(),
+                    before.unwrap()
+                );
+                assert_eq!(
+                    store.load_run(id).unwrap().unwrap().run.status,
+                    SopRunStatus::WaitingApproval
+                );
+                let denied = rpc(
+                    &mut peer,
+                    &mut rx,
+                    2,
+                    "sops/decide",
+                    json!({"name":"alpha-sop","run_id":id,"decision":{"deny":{}}}),
+                )
+                .await;
+                assert!(
+                    denied.get("error").is_none(),
+                    "uncontended operator decision: {denied}"
+                );
+            } else {
+                assert!(engine.lock().unwrap().active_runs().is_empty());
+                assert!(store.load_active_runs().unwrap().is_empty());
+                let admitted = rpc(
+                    &mut peer,
+                    &mut rx,
+                    2,
+                    "sops/run",
+                    json!({"name":"alpha-sop"}),
+                )
+                .await;
+                assert!(
+                    admitted.get("error").is_none(),
+                    "uncontended administrator start: {admitted}"
+                );
+                assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+            }
+        }
+    }
+
+    struct PausedSopDecision {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sop::DecisionModel for PausedSopDecision {
+        fn id(&self) -> &str {
+            "paused"
+        }
+
+        async fn ask(
+            &self,
+            _state: Value,
+            _questions: std::collections::BTreeMap<String, crate::sop::decision::Question>,
+        ) -> anyhow::Result<crate::sop::decision::Answers> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            // RunStrict admits this synthetic outage, so only authorization
+            // can stop admission after the suspended decision returns.
+            anyhow::bail!("synthetic decision outage")
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_run_rechecks_live_authority_and_loaded_agents_after_decision_wait() {
+        for deduplicated in [false, true] {
+            for change in [
+                "tools",
+                "agents",
+                "definition",
+                "removed",
+                "identity",
+                "expiry",
+                "control",
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                allow_all_sop_agents(&ctx);
+                grant_sop_admin(&ctx);
+                let model = Arc::new(PausedSopDecision {
+                    entered: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                });
+                let mut sop = gated_sop("alpha-sop", "alpha");
+                sop.decision = Some(
+                    serde_json::from_value(json!({
+                        "model": "paused", "gate": "Start?"
+                    }))
+                    .unwrap(),
+                );
+                let store: Arc<dyn crate::sop::SopRunStore> =
+                    Arc::new(crate::sop::store::InMemoryRunStore::new());
+                let mut replacement = crate::sop::SopEngine::new(ctx.config.read().sop.clone())
+                    .with_store(Arc::clone(&store))
+                    .with_decision_models(std::collections::HashMap::from([(
+                        "paused".into(),
+                        model.clone() as Arc<dyn crate::sop::DecisionModel>,
+                    )]));
+                replacement.set_sops_for_test(vec![sop.clone()]);
+                *engine.lock().unwrap() = replacement;
+                let memory = zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "sqlite".into(),
+                        ..Default::default()
+                    },
+                    tmp.path(),
+                    None,
+                )
+                .unwrap();
+                let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+                    ctx.config.read().clone(),
+                    Arc::clone(&ctx.sessions),
+                    Arc::clone(&engine),
+                    Arc::new(crate::sop::SopAuditLogger::new(Arc::from(memory))),
+                    None,
+                );
+                let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+                if change == "expiry" {
+                    alice.auth.as_mut().unwrap().principal.expires_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            + 2,
+                    );
+                }
+                let params = if deduplicated {
+                    json!({"name": "alpha-sop", "dedup_key": "synthetic-work"})
+                } else {
+                    json!({"name": "alpha-sop"})
+                };
+                let request = async { rpc(&mut alice, &mut rx, 1, "sops/run", params).await };
+                let mutate = async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        model.entered.notified(),
+                    )
+                    .await
+                    .expect("the authorized request reaches its decision wait");
+                    match change {
+                        "tools" | "agents" => {
+                            let mut revoked = ctx.config.read().clone();
+                            revoked
+                                .permission_profiles
+                                .get_mut("cron-alpha")
+                                .unwrap()
+                                .admin = false;
+                            let profile =
+                                revoked.permission_profiles.get_mut("cron-alpha").unwrap();
+                            if change == "tools" {
+                                profile
+                                    .grants
+                                    .remove(&zeroclaw_api::grants::Resource::Tools);
+                            } else {
+                                profile.allowed_agents = vec!["alpha".into()];
+                            }
+                            ctx.auth.refresh_from_config(&revoked).unwrap();
+                        }
+                        "definition" => {
+                            sop.agent = Some("beta".into());
+                            engine.lock().unwrap().set_sops_for_test(vec![sop]);
+                        }
+                        "removed" => engine.lock().unwrap().set_sops_for_test(vec![]),
+                        // Removing the roster identity revokes the credential's
+                        // live resolution, independently of the tool selector.
+                        "identity" => {
+                            let mut revoked = ctx.config.read().clone();
+                            revoked
+                                .permission_profiles
+                                .get_mut("cron-alpha")
+                                .unwrap()
+                                .admin = false;
+                            revoked.users.clear();
+                            ctx.auth.refresh_from_config(&revoked).unwrap();
+                        }
+                        "expiry" => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                        "control" => {}
+                        _ => unreachable!(),
+                    }
+                    model.release.notify_one();
+                };
+                let (response, ()) = tokio::join!(request, mutate);
+                if change == "removed" {
+                    // A procedure unloaded during the decision wait is refused
+                    // in the caller's language, and nothing starts.
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(INVALID_PARAMS),
+                        "dedup={deduplicated}: {response}"
+                    );
+                    assert_eq!(
+                        response["error"]["message"],
+                        json!(crate::i18n::get_required_cli_string(
+                            "sop-rpc-definition-unavailable"
+                        )),
+                        "dedup={deduplicated}: {response}"
+                    );
+                    assert!(engine.lock().unwrap().active_runs().is_empty());
+                    assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
+                } else if matches!(change, "control" | "definition") {
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+                } else {
+                    assert!(
+                        matches!(response["error"]["code"].as_i64(),
+                        Some(code) if code == i64::from(FORBIDDEN) || code == i64::from(AUTH_REQUIRED)),
+                        "{change}, dedup={deduplicated}: {response}"
+                    );
+                    assert!(engine.lock().unwrap().active_runs().is_empty());
+                    assert!(store.load_active_runs().unwrap().is_empty());
+                    assert!(store.load_terminal_runs(0).unwrap().is_empty());
+                    assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_decide_rechecks_live_authority_after_engine_lock_with_a_stale_stamp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        grant_sop_admin(&ctx);
+        let run_id = park_sop_run(&engine, "alpha-sop");
+        let (alice, _) = roster_peer(&ctx, 4242).await;
+        let engine_guard = engine.lock().unwrap();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let requested_run = run_id.clone();
+        let task = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                entered.send(()).unwrap();
+                // The admitted stamp stays permissive throughout this call, so
+                // only resolution after acquiring the held engine lock can deny.
+                runtime
+                    .block_on(alice.handle_sops_decide(&json!({
+                        "name": "alpha-sop", "run_id": requested_run, "decision": "approve"
+                    })))
+                    .unwrap_err()
+            })
+            .unwrap();
+        waiting.recv().unwrap();
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = false;
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth.refresh_from_config(&revoked).unwrap();
+        drop(engine_guard);
+        let denied = task.join().unwrap();
+        assert_eq!(denied.code, FORBIDDEN);
+        assert_eq!(
+            engine.lock().unwrap().get_run(&run_id).unwrap().status,
+            crate::sop::SopRunStatus::WaitingApproval
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_decide_rechecks_before_lookup_and_final_projection() {
+        for (boundary, target) in [
+            ("sop-decision-admission", "valid"),
+            ("sop-decision-admission", "missing"),
+            ("sop-decision-admission", "mismatched"),
+            ("sop-decision-result", "valid"),
+        ] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                allow_all_sop_agents(&ctx);
+                grant_sop_admin(&ctx);
+                let run_id = park_sop_run(&engine, "alpha-sop");
+                let requested = match target {
+                    "missing" => "missing".to_string(),
+                    "mismatched" => park_sop_run(&engine, "beta-sop"),
+                    _ => run_id.clone(),
+                };
+                let (alice, _) = roster_peer(&ctx, 4242).await;
+                let (operator, _) = local_operator(&ctx).await;
+                let (entered, release) = ctx.sessions.set_test_effect_pause(boundary);
+                let params = json!({
+                    "name":"alpha-sop", "run_id":requested, "decision":{"deny":{}}
+                });
+                let request = alice.handle_sops_decide(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        let commit = ctx.config_authority.begin_config_commit().await.unwrap();
+                        let mut changed = ctx.config.read().clone();
+                        changed
+                            .permission_profiles
+                            .get_mut("cron-alpha")
+                            .unwrap()
+                            .admin = false;
+                        changed.mark_dirty("permission_profiles.cron-alpha");
+                        operator
+                            .save_and_publish_config(
+                                commit,
+                                changed,
+                                RpcConfigCommitEffects::default(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("decision reaches and leaves the effect boundary");
+                if revoke {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code, FORBIDDEN, "{boundary}, {target}");
+                    assert_eq!(
+                        error.message,
+                        crate::i18n::get_required_cli_string("sop-rpc-principal-ceiling-required")
+                    );
+                } else if target == "valid" {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    assert_eq!(result.unwrap_err().code, INVALID_PARAMS);
+                }
+                let status = engine.lock().unwrap().get_run(&run_id).unwrap().status;
+                let changed = target == "valid" && (!revoke || boundary == "sop-decision-result");
+                assert_eq!(
+                    status,
+                    if changed {
+                        crate::sop::SopRunStatus::Cancelled
+                    } else {
+                        crate::sop::SopRunStatus::WaitingApproval
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_run_and_decide_are_refused_after_admin_demotion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        grant_sop_admin(&ctx);
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Admitted on both methods while tools:execute is held. The decision
+        // is a denial so that it does not resume the run into a headless driver.
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_sop_run_admitted(&admitted);
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": {"deny": {}}}),
+        )
+        .await;
+        assert!(decided.get("error").is_none(), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&alpha_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::Cancelled),
+            "an admitted denial must reach the run"
+        );
+
+        // Revoke only tools:execute; the wildcard selector and the SOP grants
+        // stay, and the same connection is refused on its next run.
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = false;
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth
+            .refresh_from_config(&revoked)
+            .expect("the revoked policy compiles");
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
     }
 
     #[tokio::test]
@@ -20315,6 +21140,7 @@ mod tests {
                 connected_at: chrono::Utc::now(),
                 peer_label: tui_id.to_string(),
                 transport: "unix".to_string(),
+                remote: false,
                 env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
             });
         dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
@@ -20522,6 +21348,7 @@ mod tests {
                 connected_at: chrono::Utc::now(),
                 peer_label: "tui_reuse0001".to_string(),
                 transport: "unix".to_string(),
+                remote: false,
                 env: std::collections::HashMap::new(),
             });
         client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
@@ -20595,6 +21422,7 @@ mod tests {
                 connected_at: chrono::Utc::now(),
                 peer_label: "tui_empty0001".to_string(),
                 transport: "unix".to_string(),
+                remote: false,
                 env: std::collections::HashMap::new(),
             });
         client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
@@ -21412,6 +22240,164 @@ mod tests {
         profile.allowed_agents = agents.iter().map(|s| (*s).into()).collect();
         dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
         dispatcher.ctx.config_authority.publish_for_test(config);
+    }
+
+    /// Model that asks for `cron_list` once, then answers in text.
+    #[derive(Default)]
+    struct UnheldToolResponder(std::sync::atomic::AtomicUsize);
+
+    impl wiremock::Respond for UnheldToolResponder {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let first = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let (message, finish_reason) = if first {
+                (
+                    json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "unheld-call",
+                            "type": "function",
+                            "function": {"name": "cron_list", "arguments": "{}"},
+                        }],
+                    }),
+                    "tool_calls",
+                )
+            } else {
+                (
+                    json!({"role": "assistant", "content": "done", "tool_calls": []}),
+                    "stop",
+                )
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-unheld-tool",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "test-model",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }))
+        }
+    }
+
+    /// A non-administrator's supervised session whose model names a tool
+    /// the session doesn't hold is answered `Unknown tool` with no
+    /// `approval_request`: approving it could run nothing. `cron_list` is
+    /// outside this principal's tools, and it is one of the tools a
+    /// non-administrator's session never holds.
+    #[tokio::test]
+    async fn a_supervised_principal_session_is_not_asked_to_approve_a_tool_it_does_not_hold() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+        use zeroclaw_config::schema::WireApi;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(UnheldToolResponder::default())
+            .mount(&server)
+            .await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["calculator"], &["*"]);
+        // Approval prompts reach the client through the ask-user channel
+        // handles, which exist only when `ask_user` is selected.
+        config.tools.optional.push("ask_user".into());
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap();
+        provider.uri = Some(server.uri());
+        provider.wire_api = Some(WireApi::ChatCompletions);
+        assert_eq!(
+            config.risk_profiles["test-profile"].level,
+            zeroclaw_config::autonomy::AutonomyLevel::Supervised
+        );
+        let (operator, sessions) = make_native_test_dispatcher(config);
+        let (mut caller, mut rx) = roster_peer(&operator.ctx, 4242).await;
+        let sid = "unheld-tool";
+        let response = rpc(
+            &mut caller,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp"}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            assert!(
+                !agent.tool_names().contains(&"cron_list"),
+                "the session must not hold cron_list: {:?}",
+                agent.tool_names()
+            );
+            assert!(
+                agent
+                    .channel_handles()
+                    .ask_user
+                    .as_ref()
+                    .is_some_and(|handle| handle.read().contains_key("rpc")),
+                "an approval prompt must be able to reach this client"
+            );
+        }
+
+        let line = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+            "params": {"session_id": sid, "prompt": "list my cron jobs"},
+        })
+        .to_string();
+        // The turn may outlive `process_line`, so read until its reply: an
+        // approval request on the way fails at once instead of waiting for
+        // the prompt's timeout.
+        let mut frames = Vec::new();
+        {
+            let prompt = caller.process_line(&line);
+            tokio::pin!(prompt);
+            let mut handed_off = false;
+            let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    () = &mut prompt, if !handed_off => handed_off = true,
+                    Some(frame) = rx.recv() => {
+                        let value: Value = serde_json::from_str(&frame).unwrap();
+                        assert_ne!(
+                            value["params"]["type"], "approval_request",
+                            "asked to approve a tool the session does not hold: {value}"
+                        );
+                        let reply = value.get("id") == Some(&json!(2));
+                        frames.push(value);
+                        if reply {
+                            break;
+                        }
+                    }
+                    () = &mut deadline => panic!("the prompt did not answer: {frames:?}"),
+                }
+            }
+        }
+        let reply = frames.last().expect("the loop ends on the reply");
+        assert!(reply.get("error").is_none(), "{reply}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the model is asked again after the answer"
+        );
+        let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let tool_message = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap_or_else(|| panic!("the tool answer is sent back: {second}"));
+        assert!(
+            tool_message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Unknown tool: cron_list")),
+            "{tool_message}"
+        );
     }
 
     /// A prompt that queued while its principal was still unrestricted must
@@ -28573,6 +29559,69 @@ mod tests {
         assert!(agent.get("runtime_profile").is_none());
     }
 
+    fn make_native_test_dispatcher(
+        config: zeroclaw_config::schema::Config,
+    ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
+        let data_dir = config.data_dir.clone();
+        zeroclaw_infra::session_events::upgrade::upgrade_installation(
+            &data_dir,
+            zeroclaw_infra::session_events::installation::NativeBackend::parse(
+                &config.channels.session_backend,
+            )
+            .unwrap(),
+            |_| "test-agent".into(),
+        )
+        .unwrap();
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let ctx = Arc::get_mut(&mut dispatcher.ctx).expect("unshared fixture context");
+        ctx.session_repository = Some(Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::new(&data_dir).unwrap(),
+        ));
+        ctx.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+            ctx.config.clone(),
+        )));
+        (dispatcher, sessions)
+    }
+
+    /// [`two_user_config`] with alice also holding an `administrator`
+    /// profile, which [`set_alice_administrator`] grants and revokes. Her
+    /// `member` grants stay in force either way, so the edit changes only the
+    /// administrator bypass, never her method or agent permissions.
+    fn two_user_config_with_administrator_alice(
+        tmp: &tempfile::TempDir,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = two_user_config(tmp);
+        config.permission_profiles.insert(
+            "administrator".into(),
+            zeroclaw_config::schema::PermissionProfileConfig {
+                admin: true,
+                ..zeroclaw_config::schema::PermissionProfileConfig::default()
+            },
+        );
+        config
+            .users
+            .get_mut("alice")
+            .expect("the fixture defines alice")
+            .permission_profiles
+            .push("administrator".into());
+        config
+    }
+
+    /// Grant or revoke alice's administrator profile and publish the policy,
+    /// as an accepted permission-profile edit does.
+    fn set_alice_administrator(ctx: &Arc<RpcContext>, admin: bool) {
+        let mut config = ctx.config_authority.snapshot_config();
+        config
+            .permission_profiles
+            .get_mut("administrator")
+            .expect("the fixture defines the administrator profile")
+            .admin = admin;
+        ctx.auth
+            .refresh_from_config(&config)
+            .expect("the edited policy compiles");
+        ctx.config_authority.publish_for_test(config);
+    }
+
     fn make_acp_test_dispatcher(
         config: zeroclaw_config::schema::Config,
     ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
@@ -30105,7 +31154,7 @@ mod tests {
             execute_session_tool_as(&dispatcher, current, "sessions_list", json!({})).await;
         assert!(listed.success);
         assert!(listed.output.contains(current));
-        assert!(!listed.output.contains(previous));
+        assert!(listed.output.contains(previous));
         assert!(!listed.output.contains(foreign));
 
         let history = execute_session_tool_as(
@@ -30117,6 +31166,16 @@ mod tests {
         .await;
         assert!(history.success, "{:?}", history.error);
         assert!(history.output.contains("current RPC answer"));
+
+        let previous_history = execute_session_tool_as(
+            &dispatcher,
+            current,
+            "sessions_history",
+            json!({"session_id": previous}),
+        )
+        .await;
+        assert!(previous_history.success);
+        assert!(previous_history.output.contains("durable prior RPC answer"));
 
         let foreign_history = execute_session_tool_as(
             &dispatcher,
@@ -30162,7 +31221,7 @@ mod tests {
             execute_session_tool_as(&dispatcher, current, "sessions_list", json!({})).await;
         assert!(rehydrated_list.success);
         assert!(rehydrated_list.output.contains(current));
-        assert!(!rehydrated_list.output.contains(previous));
+        assert!(rehydrated_list.output.contains(previous));
         assert!(!rehydrated_list.output.contains(foreign));
         let rehydrated_history = execute_session_tool_as(
             &dispatcher,
@@ -30190,9 +31249,532 @@ mod tests {
         let chat_list =
             execute_session_tool_as(&dispatcher, chat_id, "sessions_list", json!({})).await;
         assert!(chat_list.success);
-        assert!(!chat_list.output.contains(current));
-        assert!(!chat_list.output.contains(previous));
+        assert!(chat_list.output.contains(current));
+        assert!(chat_list.output.contains(previous));
         assert!(!chat_list.output.contains(foreign));
+    }
+
+    async fn seed_native_assistant(dispatcher: &RpcDispatcher, sid: &str, text: &str) {
+        let record = dispatcher
+            .authorize_session_owner(sid, Method::SessionPrompt)
+            .await
+            .unwrap();
+        let port = dispatcher
+            .native_session_command(sid, sid, record.as_ref(), Method::SessionPrompt)
+            .await
+            .unwrap()
+            .unwrap();
+        port.append_assistant(text).await.unwrap();
+    }
+
+    fn native_test_transcript(ctx: &RpcContext, sid: &str) -> Value {
+        serde_json::to_value(
+            ctx.session_repository
+                .as_ref()
+                .unwrap()
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages,
+        )
+        .unwrap()
+    }
+
+    async fn assert_session_data_tools_withheld(
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        foreign_session_key: &str,
+    ) {
+        let agent = agent.lock().await;
+        for name in crate::tools::SESSION_DATA_TOOL_NAMES {
+            assert!(
+                agent.execute_tool_for_test(name, json!({})).await.is_none(),
+                "{name} must be withheld"
+            );
+        }
+        let send = agent
+            .dispatch_tool_for_test(
+                "sessions_send",
+                json!({"session_id": foreign_session_key, "message": "harmless probe"}),
+            )
+            .await;
+        assert!(!send.success);
+        assert_eq!(send.output, "Unknown tool: sessions_send");
+        let history = agent
+            .dispatch_tool_for_test(
+                "sessions_history",
+                json!({"session_id": foreign_session_key}),
+            )
+            .await;
+        assert!(!history.success);
+        assert_eq!(history.output, "Unknown tool: sessions_history");
+        let names = agent.tool_names();
+        assert!(names.contains(&"sessions_current"), "{names:?}");
+        assert!(!names.contains(&"spawn_subagent"), "{names:?}");
+        assert!(names.contains(&"delegate"), "{names:?}");
+        assert!(
+            agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_unrestricted_tools(),
+            "the retained delegate must withhold the tools from its children"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principals_cannot_reach_session_data_tools_even_with_wildcard_selectors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        // The shared fixture selects a minimal built-in set; select
+        // spawn_subagent so the operator control arm constructs it.
+        config.tools.optional.push("spawn_subagent".into());
+        // Hold the coarse `tools:execute` grant so the wildcard tool selector
+        // is in force instead of narrowing every tool away.
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Tools,
+                vec![zeroclaw_api::grants::Verb::Execute],
+            );
+        let (operator, sessions) = make_native_test_dispatcher(config);
+        let ctx = Arc::clone(&operator.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+
+        bob.handle_session_new_for_test(&json!({
+            "agent_alias": "test-agent",
+            "session_id": "bob-chat",
+        }))
+        .await
+        .expect("bob creates his chat session");
+        let bob_key = "bob-chat";
+        seed_native_assistant(&operator, bob_key, "bob private marker").await;
+        let bob_transcript = native_test_transcript(&ctx, bob_key);
+
+        for (sid, chat_mode) in [("alice-acp", "acp"), ("alice-chat", "chat")] {
+            alice
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                    "chat_mode": chat_mode,
+                }))
+                .await
+                .expect("alice creates her session");
+            let agent = sessions
+                .get_agent(sid)
+                .await
+                .expect("alice's session is live");
+            assert_session_data_tools_withheld(&agent, bob_key).await;
+        }
+
+        assert!(sessions.remove("alice-acp").await);
+        let rehydrated = alice
+            .rehydrate_reaped_session("alice-acp", alice.stamped_grants())
+            .await
+            .expect("alice may rehydrate her own session")
+            .expect("the reaped session rehydrates");
+        assert_session_data_tools_withheld(&rehydrated, bob_key).await;
+
+        assert_eq!(
+            native_test_transcript(&ctx, bob_key),
+            bob_transcript,
+            "bob's transcript must be unchanged"
+        );
+
+        // The shared operator keeps the tools, and its delegate withholds
+        // nothing from its children.
+        operator
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "operator-acp",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the operator creates a session");
+        let operator_agent = sessions.get_agent("operator-acp").await.unwrap();
+        let operator_agent = operator_agent.lock().await;
+        let names = operator_agent.tool_names();
+        for name in crate::tools::SESSION_DATA_TOOL_NAMES
+            .iter()
+            .chain(&["sessions_current", "spawn_subagent"])
+        {
+            assert!(names.contains(name), "the operator keeps {name}: {names:?}");
+        }
+        assert!(
+            !operator_agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_unrestricted_tools()
+        );
+    }
+
+    /// Withholding follows the principal's current grants: an administrator's
+    /// session keeps the session-data tools, and loses them when the
+    /// principal is demoted and its next prompt applies the fresh grants.
+    #[tokio::test]
+    async fn demoted_principal_loses_session_data_tools_at_its_next_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // The shared fixture selects a minimal built-in set; select
+        // spawn_subagent so the administrator control arm constructs it.
+        config.tools.optional.push("spawn_subagent".into());
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools
+            .extend(
+                crate::tools::SESSION_DATA_TOOL_NAMES
+                    .iter()
+                    .chain(&["sessions_current"])
+                    .map(|name| (*name).to_string()),
+            );
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = true;
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent","session_id":"principal-demoted"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("principal-demoted").await.unwrap();
+        {
+            let agent = handle.lock().await;
+            let names = agent.tool_names();
+            for name in crate::tools::SESSION_DATA_TOOL_NAMES
+                .iter()
+                .chain(&["spawn_subagent"])
+            {
+                assert!(
+                    names.contains(name),
+                    "an administrator keeps {name}: {names:?}"
+                );
+            }
+        }
+
+        {
+            let mut cfg = dispatcher.ctx.config_authority.snapshot_config();
+            cfg.permission_profiles
+                .get_mut("principal-test")
+                .unwrap()
+                .admin = false;
+            dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            dispatcher.ctx.config_authority.publish_for_test(cfg);
+        }
+        let current = dispatcher.current_prompt_authority().unwrap();
+        let grants = current
+            .stamped_grants()
+            .expect("the refreshed handle carries grants")
+            .clone();
+        let mut agent = handle.lock().await;
+        current.apply_principal_grants_to_agent(&grants, &mut agent);
+        let names = agent.tool_names();
+        for name in crate::tools::SESSION_DATA_TOOL_NAMES
+            .iter()
+            .chain(&["spawn_subagent"])
+        {
+            assert!(
+                !names.contains(name),
+                "a demoted principal keeps {name}: {names:?}"
+            );
+        }
+        for name in ["sessions_current", "calculator", "delegate"] {
+            assert!(names.contains(&name), "{name} stays: {names:?}");
+        }
+        assert!(
+            agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_unrestricted_tools()
+        );
+    }
+
+    struct PrincipalHistoryProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        results: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PrincipalHistoryProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "principal-history-probe"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for PrincipalHistoryProbe {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            if !first {
+                *self.results.lock().unwrap() = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|message| message.role == "tool")
+                    .take(4)
+                    .map(|message| {
+                        json!({"tool_call_id": message.tool_result.as_ref().unwrap().tool_call_id, "content": message.content}).to_string()
+                    })
+                    .collect();
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
+                text: (!first).then(|| "probe complete".into()),
+                tool_calls: if first {
+                    [
+                        ("sessions_history", json!({"session_id":"victim"})),
+                        ("peek__history", json!({"session_id":"victim"})),
+                        ("calculator", json!({"function":"add", "values":[2,2]})),
+                        ("sessions_current", json!({})),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (name, args))| zeroclaw_providers::ToolCall {
+                        id: format!("probe-{index}"),
+                        name: name.into(),
+                        arguments: args.to_string(),
+                        extra_content: None,
+                    })
+                    .collect()
+                } else {
+                    Vec::new()
+                },
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn install_principal_history_probe(
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut guard = agent.lock().await;
+        guard.set_tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher));
+        guard.set_model_provider(Box::new(PrincipalHistoryProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            results: Arc::clone(&results),
+        }));
+        results
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn principal_native_history_uses_final_admission_and_monotonic_withholding() {
+        for boundary in ["provider", "prompt-agent", "prompt-task"] {
+            for demote in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = two_user_config_with_administrator_alice(&tmp);
+                config
+                    .permission_profiles
+                    .get_mut("member")
+                    .unwrap()
+                    .grants
+                    .insert(
+                        zeroclaw_api::grants::Resource::Tools,
+                        vec![zeroclaw_api::grants::Verb::Execute],
+                    );
+                let risk = config.risk_profiles.get_mut("test-profile").unwrap();
+                risk.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                risk.allowed_tools.extend(
+                    [
+                        "sessions_history",
+                        "sessions_current",
+                        "calculator",
+                        "delegate",
+                        "peek__history",
+                    ]
+                    .map(str::to_owned),
+                );
+                let bundle = tmp.path().join("skills");
+                std::fs::create_dir_all(bundle.join("peek")).unwrap();
+                std::fs::write(bundle.join("peek/SKILL.toml"), "[skill]\nname='peek'\ndescription='History boundary fixture'\n[[tools]]\nname='history'\ndescription='Read history'\nkind='builtin'\ncommand=''\ntarget='sessions_history'\n").unwrap();
+                config.skill_bundles.insert(
+                    "probe".into(),
+                    zeroclaw_config::schema::SkillBundleConfig {
+                        directory: Some(bundle.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                );
+                config.agents.get_mut("test-agent").unwrap().skill_bundles = vec!["probe".into()];
+                let (fixture, sessions) = make_native_test_dispatcher(config);
+                let ctx = Arc::clone(&fixture.ctx);
+                scoped_dispatcher(&ctx, 4343).await.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"victim", "chat_mode":"chat"})).await.unwrap();
+                seed_native_assistant(&fixture, "victim", "foreign-history-marker").await;
+                let before = native_test_transcript(&ctx, "victim");
+                let alice = Arc::new(scoped_dispatcher(&ctx, 4242).await);
+                alice.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"actor", "chat_mode":"chat"})).await.unwrap();
+                let agent = sessions.get_agent("actor").await.unwrap();
+                assert!(
+                    agent.lock().await.tool_names().contains(&"peek__history"),
+                    "the real registry must install the alias; loaded skills: {:?}",
+                    crate::skills::load_skills_for_agent_from_config(
+                        &ctx.config.read(),
+                        "test-agent"
+                    )
+                );
+                let results = install_principal_history_probe(&agent).await;
+                let provider_guard = if boundary == "provider" {
+                    Some(sessions.lock_model_provider_update("actor").await.unwrap())
+                } else {
+                    None
+                };
+                let provider_wait = sessions.model_provider_update_waiting();
+                let provider_arrived = provider_wait.notified();
+                let pause = if boundary == "provider" {
+                    None
+                } else {
+                    Some(sessions.set_test_effect_pause(boundary))
+                };
+                let call = Arc::clone(&alice);
+                let prompt = zeroclaw_spawn::spawn!(async move {
+                    call.handle_session_prompt(
+                        &json!({"session_id":"actor", "prompt":"probe foreign history"}),
+                    )
+                    .await
+                });
+                if let Some((arrived, _)) = &pause {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), provider_arrived)
+                        .await
+                        .unwrap();
+                }
+                if demote {
+                    set_alice_administrator(&ctx, false);
+                }
+                drop(provider_guard);
+                if let Some((_, release)) = pause {
+                    release.notify_one();
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(10), prompt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let output = results.lock().unwrap().clone();
+                assert_eq!(output.len(), 4, "{boundary}: {output:?}");
+                assert_eq!(
+                    output
+                        .iter()
+                        .filter(|text| text.contains("foreign-history-marker"))
+                        .count(),
+                    if demote { 0 } else { 2 },
+                    "{boundary}: {output:?}"
+                );
+                assert!(
+                    output.iter().any(|text| {
+                        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+                        result["tool_call_id"] == "probe-2" && result["content"] == "4"
+                    }),
+                    "calculator remains executable: {output:?}"
+                );
+                assert!(
+                    output.iter().any(|text| text.contains("actor")),
+                    "sessions_current remains executable: {output:?}"
+                );
+                assert_eq!(
+                    native_test_transcript(&ctx, "victim"),
+                    serde_json::to_value(&before).unwrap()
+                );
+                if demote {
+                    let record = alice
+                        .authorize_session_owner("actor", Method::SessionPrompt)
+                        .await
+                        .unwrap();
+                    let port = alice
+                        .native_session_command(
+                            "actor",
+                            "actor",
+                            record.as_ref(),
+                            Method::SessionPrompt,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        port.history_reader()
+                            .unwrap()
+                            .history("victim", 10)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "a narrowed local principal cannot bypass tool withholding through its reader"
+                    );
+                    assert_session_data_tools_withheld(&agent, "victim").await;
+                    set_alice_administrator(&ctx, true);
+                    let regrant = install_principal_history_probe(&agent).await;
+                    alice
+                        .handle_session_prompt(
+                            &json!({"session_id":"actor", "prompt":"regrant stays narrowed"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        !regrant
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|text| text.contains("foreign-history-marker"))
+                    );
+                    assert_session_data_tools_withheld(&agent, "victim").await;
+                    sessions.remove("actor").await;
+                    alice.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"actor", "chat_mode":"chat"})).await.unwrap();
+                    let restored = sessions.get_agent("actor").await.unwrap();
+                    assert!(!Arc::ptr_eq(&agent, &restored));
+                    let promoted = install_principal_history_probe(&restored).await;
+                    alice
+                        .handle_session_prompt(
+                            &json!({"session_id":"actor", "prompt":"rehydrated admin control"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        promoted
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|text| text.contains("foreign-history-marker"))
+                            .count(),
+                        2
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -30837,8 +32419,6 @@ mod tests {
 
     #[test]
     fn agent_delete_rpc_persists_on_default_worker_stack() {
-        use zeroclaw_infra::session_queue::SessionActorQueue;
-
         // Deliberately the DEFAULT 2 MiB worker stack: this regression pins
         // the delete-RPC path to the stack every Tokio worker gets on Windows
         // CI, where the production default applies.
@@ -30857,9 +32437,8 @@ mod tests {
                     .create_map_key("agents", "delete_me")
                     .expect("create disposable agent");
                 config.save().await.expect("seed persisted agent config");
-                let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
-                let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-                let ctx = RpcContext::minimal(config, sessions);
+                let (fixture, _) = make_native_test_dispatcher(config);
+                let ctx = Arc::clone(&fixture.ctx);
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                 let mut dispatcher =
                     RpcDispatcher::new(ctx, tx, "test-peer-agent-delete-stack:pid=1".into());
@@ -31001,7 +32580,7 @@ mod tests {
             .create_map_key("agents", "preserve")
             .expect("create disposable agent");
         config.agents.get_mut("preserve").unwrap().workspace.path = Some(workspace.clone());
-        let dispatcher = make_config_set_test_dispatcher(config);
+        let (dispatcher, _) = make_native_test_dispatcher(config);
         let generation = dispatcher.ctx.agent_lifecycle.alias_generation("preserve");
 
         dispatcher
@@ -37354,6 +38933,546 @@ mod tests {
                 MethodAuthz::Requires(Resource::Sessions, verb),
                 "{wire}"
             );
+        }
+    }
+    /// Remote sessions whose client is gone for good are closed, so they stop
+    /// holding the daemon's live session map until a restart.
+    mod orphaned_session_retirement {
+        use super::*;
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::orphans::{retire_orphaned_sessions, spawn_orphan_retirement};
+        use crate::rpc::session::SessionStore;
+        use crate::rpc::transport::TransportKind;
+        use crate::security::auth_provider::Credential;
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        /// The default `wss.orphaned_session_timeout_secs`.
+        const TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+        fn context(
+            timeout_secs: Option<u64>,
+        ) -> (tempfile::TempDir, Arc<SessionStore>, Arc<RpcContext>) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_acp_test_config(&tmp);
+            if let Some(secs) = timeout_secs {
+                config.wss.orphaned_session_timeout_secs = secs;
+            }
+            // The daemon's own values (daemon/mod.rs).
+            let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
+            let sessions = Arc::new(SessionStore::new(64, queue));
+            let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+            (tmp, sessions, ctx)
+        }
+
+        /// A WSS client that has completed `initialize` as `tui_id`.
+        fn remote(ctx: &Arc<RpcContext>, tui_id: &str) -> RpcDispatcher {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut client = RpcDispatcher::new_with_access_policy(
+                Arc::clone(ctx),
+                tx,
+                format!("wss:198.51.100.7:{tui_id}"),
+                RpcAccessPolicy::RemoteSessionOwner,
+                None,
+            )
+            .with_transport(TransportKind::Wss, Credential::None);
+            client.set_authenticated_for_test();
+            client.register_tui_for_test(tui_id);
+            client
+        }
+
+        /// A local-socket client that has completed `initialize` as `tui_id`.
+        fn local(ctx: &Arc<RpcContext>, tui_id: &str) -> RpcDispatcher {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut client = RpcDispatcher::new(Arc::clone(ctx), tx, format!("unix:{tui_id}"));
+            client.set_authenticated_for_test();
+            client.register_tui_for_test(tui_id);
+            client
+        }
+
+        /// What a transport does when its peer goes away.
+        async fn disconnect(ctx: &RpcContext, client: &mut RpcDispatcher) {
+            client.shutdown().await;
+            let (tui_id, epoch) = client
+                .tui_registration()
+                .map(|(id, epoch)| (id.to_string(), epoch))
+                .expect("the client registered at initialize");
+            ctx.tui_registry.unregister(&tui_id, epoch);
+        }
+
+        async fn open(client: &RpcDispatcher) -> String {
+            let opened = client
+                .handle_session_new_for_test(
+                    &json!({ "agent_alias": "test-agent", "chat_mode": "chat" }),
+                )
+                .await
+                .expect("session/new");
+            opened["session_id"].as_str().unwrap().to_string()
+        }
+
+        #[tokio::test]
+        async fn disconnected_remote_sessions_are_retired_and_free_the_live_map() {
+            let (_tmp, sessions, ctx) = context(None);
+            for n in 0..64 {
+                let mut client = remote(&ctx, &format!("tui_{n}"));
+                open(&client).await;
+                disconnect(&ctx, &mut client).await;
+            }
+            assert_eq!(sessions.list_ids().await.len(), 64);
+
+            // Within the timeout nothing is closed, and the full map refuses
+            // everyone.
+            assert!(
+                retire_orphaned_sessions(&ctx, Instant::now())
+                    .await
+                    .is_empty()
+            );
+            let refused = remote(&ctx, "tui_early")
+                .handle_session_new_for_test(
+                    &json!({ "agent_alias": "test-agent", "chat_mode": "chat" }),
+                )
+                .await
+                .expect_err("the live map is full");
+            assert!(refused.message.contains("limit"), "{refused:?}");
+
+            // Once their clients have been gone for the timeout, every one of
+            // them is closed and their departures are forgotten.
+            let retired = retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await;
+            assert_eq!(retired.len(), 64);
+            assert!(sessions.list_ids().await.is_empty());
+            for n in 0..64 {
+                assert_eq!(ctx.tui_registry.departure(&format!("tui_{n}")), None);
+            }
+
+            // Remote and local clients can open sessions again.
+            open(&remote(&ctx, "tui_later")).await;
+            open(&local(&ctx, "tui_local")).await;
+        }
+
+        #[tokio::test]
+        async fn retirement_closes_only_idle_sessions_of_remote_clients_that_stayed_away() {
+            let (_tmp, sessions, ctx) = context(None);
+
+            let mut orphan = remote(&ctx, "tui_orphan");
+            let orphaned = open(&orphan).await;
+            disconnect(&ctx, &mut orphan).await;
+
+            let connected = remote(&ctx, "tui_connected");
+            let kept_connected = open(&connected).await;
+
+            let mut local_client = local(&ctx, "tui_local");
+            let kept_local = open(&local_client).await;
+            disconnect(&ctx, &mut local_client).await;
+
+            let mut returning = remote(&ctx, "tui_returning");
+            let kept_returning = open(&returning).await;
+            disconnect(&ctx, &mut returning).await;
+            let _returned = remote(&ctx, "tui_returning");
+
+            let mut turning = remote(&ctx, "tui_turning");
+            let kept_turning = open(&turning).await;
+            disconnect(&ctx, &mut turning).await;
+            sessions
+                .register_cancel_token(&kept_turning, tokio_util::sync::CancellationToken::new());
+
+            let mut asking = remote(&ctx, "tui_asking");
+            let kept_asking = open(&asking).await;
+            disconnect(&ctx, &mut asking).await;
+            let (approval_tx, _approval_rx) = tokio::sync::oneshot::channel();
+            ctx.approval_pending
+                .insert("approval-1".to_string(), kept_asking.clone(), approval_tx);
+
+            // Used after its client left (by a local operator, say): idle for
+            // less than the timeout when the check runs.
+            let mut used = remote(&ctx, "tui_used");
+            let kept_used = open(&used).await;
+            disconnect(&ctx, &mut used).await;
+            let left = ctx.tui_registry.departure("tui_used").unwrap().at;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sessions.touch(&kept_used).await;
+
+            let retired =
+                retire_orphaned_sessions(&ctx, left + TIMEOUT + Duration::from_millis(10)).await;
+
+            assert_eq!(retired, vec![orphaned.clone()]);
+            let live = sessions.list_ids().await;
+            assert!(!live.contains(&orphaned));
+            for kept in [
+                &kept_connected,
+                &kept_local,
+                &kept_returning,
+                &kept_turning,
+                &kept_asking,
+                &kept_used,
+            ] {
+                assert!(live.contains(kept), "{kept} was closed");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_zero_timeout_keeps_orphaned_sessions_open() {
+            let (_tmp, sessions, ctx) = context(Some(0));
+            let mut client = remote(&ctx, "tui_orphan");
+            let session = open(&client).await;
+            disconnect(&ctx, &mut client).await;
+
+            let far_later = Instant::now() + Duration::from_secs(365 * 24 * 60 * 60);
+            assert!(retire_orphaned_sessions(&ctx, far_later).await.is_empty());
+            assert_eq!(sessions.list_ids().await, vec![session]);
+        }
+
+        #[tokio::test]
+        async fn the_retirement_task_closes_an_orphan_once_its_timeout_passes() {
+            let (_tmp, sessions, ctx) = context(Some(1));
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = spawn_orphan_retirement(&ctx, cancel.clone());
+
+            let mut client = remote(&ctx, "tui_orphan");
+            open(&client).await;
+            disconnect(&ctx, &mut client).await;
+
+            let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                while !sessions.list_ids().await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            assert!(closed.is_ok(), "the orphan is still live");
+
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the task stops when cancelled")
+                .expect("the task does not panic");
+        }
+
+        /// Counts session-end hooks, which every close fires.
+        struct EndCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for EndCounter {
+            fn name(&self) -> &str {
+                "end-counter"
+            }
+            async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        /// `context(None)` with a session-end counter installed.
+        fn context_counting_ends() -> (
+            tempfile::TempDir,
+            Arc<SessionStore>,
+            Arc<RpcContext>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let (tmp, sessions, mut ctx) = context(None);
+            let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(EndCounter(Arc::clone(&ends))));
+            Arc::get_mut(&mut ctx)
+                .expect("a fresh context has one owner")
+                .hooks = Some(Arc::new(hooks));
+            (tmp, sessions, ctx, ends)
+        }
+
+        async fn resume(client: &RpcDispatcher, session_id: &str) -> serde_json::Value {
+            client
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "chat",
+                    "session_id": session_id,
+                }))
+                .await
+                .expect("session/new resumes the live session")
+        }
+
+        /// Run one retirement sweep at `now` until it reaches the test pause.
+        async fn retirement_paused_at(
+            ctx: &Arc<RpcContext>,
+            now: Instant,
+        ) -> (
+            tokio::task::JoinHandle<Vec<String>>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let (entered, release) = ctx.sessions.set_test_retirement_pause();
+            let sweep = {
+                let ctx = Arc::clone(ctx);
+                zeroclaw_spawn::spawn!(async move { retire_orphaned_sessions(&ctx, now).await })
+            };
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the sweep judges the orphan due and pauses before removing it");
+            (sweep, release)
+        }
+
+        #[tokio::test]
+        async fn a_local_resume_while_retirement_is_deciding_keeps_the_session() {
+            let (_tmp, sessions, ctx, ends) = context_counting_ends();
+            let mut gone = remote(&ctx, "tui_gone");
+            let session = open(&gone).await;
+            disconnect(&ctx, &mut gone).await;
+
+            let (sweep, release) = retirement_paused_at(&ctx, Instant::now() + TIMEOUT).await;
+            let local_client = local(&ctx, "tui_local");
+            resume(&local_client, &session).await;
+            release.notify_one();
+            let retired = sweep.await.unwrap();
+
+            assert!(retired.is_empty(), "retired {retired:?}");
+            assert_eq!(sessions.list_ids().await, vec![session.clone()]);
+            assert_eq!(
+                sessions.session_owner_tui_id(&session).await,
+                Some(Some("tui_local".to_string()))
+            );
+            let agent = sessions.get_agent(&session).await.unwrap();
+            assert!(
+                agent
+                    .lock()
+                    .await
+                    .channel_handles()
+                    .get_channel("rpc")
+                    .is_some(),
+                "the resumed connection's approval channel was unregistered"
+            );
+            assert_eq!(
+                ends.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a session-end hook fired"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reconnect_while_retirement_is_deciding_keeps_the_session() {
+            let (_tmp, sessions, ctx, ends) = context_counting_ends();
+            let mut gone = remote(&ctx, "tui_back");
+            let session = open(&gone).await;
+            disconnect(&ctx, &mut gone).await;
+
+            let (sweep, release) = retirement_paused_at(&ctx, Instant::now() + TIMEOUT).await;
+            let _back = remote(&ctx, "tui_back");
+            release.notify_one();
+
+            assert!(sweep.await.unwrap().is_empty());
+            assert_eq!(sessions.list_ids().await, vec![session]);
+            assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn reconnect_and_final_retirement_removal_have_a_valid_order() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let (_tmp, sessions, ctx, ends) = context_counting_ends();
+            let mut gone = remote(&ctx, "tui_final_race");
+            let session = open(&gone).await;
+            disconnect(&ctx, &mut gone).await;
+
+            let order = Arc::new(AtomicUsize::new(1));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+            let mut entered_tx = Some(entered_tx);
+            let mut commit_tx = Some(commit_tx);
+            let commit_order = Arc::clone(&order);
+            sessions.set_test_retirement_commit_hook(move |committed| {
+                if committed {
+                    let _ = commit_tx
+                        .take()
+                        .unwrap()
+                        .send(commit_order.fetch_add(1, Ordering::SeqCst));
+                } else {
+                    let _ = entered_tx.take().unwrap().send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release final removal");
+                }
+            });
+            let sweep_ctx = Arc::clone(&ctx);
+            let sweep = zeroclaw_spawn::spawn!(async move {
+                retire_orphaned_sessions(&sweep_ctx, Instant::now() + TIMEOUT).await
+            });
+            tokio::time::timeout(Duration::from_secs(10), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+            let (registered_tx, mut registered_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            let register_ctx = Arc::clone(&ctx);
+            let register_order = Arc::clone(&order);
+            let reconnect = std::thread::spawn(move || {
+                // This selects a schedule, never an assertion: if registration
+                // can finish while removal is paused, force it to do so. If
+                // presence is busy, allow removal to proceed before waiting.
+                let available = register_ctx.tui_registry.test_presence_available();
+                let _ = probe_tx.send(available);
+                let _back = remote(&register_ctx, "tui_final_race");
+                let _ = registered_tx.send(register_order.fetch_add(1, Ordering::SeqCst));
+                finish_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("finish reconnect worker");
+            });
+            let available = tokio::time::timeout(Duration::from_secs(10), probe_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let registration_before_release = if available {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(10), &mut registered_rx)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            release_tx.send(()).unwrap();
+            let committed = tokio::time::timeout(Duration::from_secs(10), commit_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let registered = match registration_before_release {
+                Some(order) => order,
+                None => tokio::time::timeout(Duration::from_secs(10), registered_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            };
+            let retired = tokio::time::timeout(Duration::from_secs(10), sweep)
+                .await
+                .unwrap()
+                .unwrap();
+            let live = sessions.list_ids().await;
+            finish_tx.send(()).unwrap();
+            reconnect.join().unwrap();
+
+            // Allowed linearizations: a completed registration preserves its
+            // session; otherwise removal commits before registration finishes.
+            assert!(
+                registered > committed || (retired.is_empty() && live.contains(&session)),
+                "registration completed at {registered} before removal at {committed}, but its session was retired: {retired:?}"
+            );
+            assert_eq!(ends.load(Ordering::SeqCst), retired.len());
+            assert_eq!(ctx.tui_registry.departure("tui_final_race"), None);
+            assert_eq!(live.contains(&session), retired.is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_identity_with_a_connection_still_open_has_not_left() {
+            let (_tmp, sessions, ctx) = context(None);
+            // A signed reconnect registers B while A is still open, then B goes.
+            let mut first = remote(&ctx, "tui_twice");
+            let session = open(&first).await;
+            let mut second = remote(&ctx, "tui_twice");
+            disconnect(&ctx, &mut second).await;
+
+            assert_eq!(
+                ctx.tui_registry.departure("tui_twice"),
+                None,
+                "A is still connected"
+            );
+            let retired =
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT + Duration::from_secs(1))
+                    .await;
+            assert!(retired.is_empty(), "retired {retired:?} while A is open");
+            resume(&first, &session).await;
+
+            // Only A leaving starts the timeout.
+            disconnect(&ctx, &mut first).await;
+            let left = ctx
+                .tui_registry
+                .departure("tui_twice")
+                .expect("the last connection left")
+                .at;
+            assert!(
+                retire_orphaned_sessions(&ctx, left + TIMEOUT - Duration::from_millis(1))
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                retire_orphaned_sessions(&ctx, left + TIMEOUT).await,
+                vec![session]
+            );
+            assert!(sessions.list_ids().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn initializing_again_does_not_leave_the_earlier_registration_behind() {
+            let (_tmp, _sessions, ctx) = context(None);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+            client
+                .handle_initialize(&json!({ "tui_id": "tui_reinit" }))
+                .await
+                .expect("initialize");
+            client
+                .handle_initialize(&json!({ "tui_id": "tui_reinit" }))
+                .await
+                .expect("initialize again, as a revalidation does");
+            disconnect(&ctx, &mut client).await;
+            assert!(
+                ctx.tui_registry.departure("tui_reinit").is_some(),
+                "the connection is gone, so its identity has no live connection"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cancel_while_retirement_holds_the_session_map_prevents_removal() {
+            let (_tmp, sessions, mut ctx) = context(Some(1));
+            let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(EndCounter(Arc::clone(&ends))));
+            Arc::get_mut(&mut ctx).unwrap().hooks = Some(Arc::new(hooks));
+            let (entered, release) = sessions.set_test_retirement_removal_pause();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = spawn_orphan_retirement(&ctx, cancel.clone());
+
+            let mut client = remote(&ctx, "tui_late_cancel");
+            let session = open(&client).await;
+            disconnect(&ctx, &mut client).await;
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the task reaches the removal step");
+            cancel.cancel();
+            release.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the task stops when cancelled")
+                .expect("the task does not panic");
+            assert_eq!(sessions.list_ids().await, vec![session]);
+            assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn cancelling_the_task_mid_sweep_leaves_the_session_alone() {
+            let (_tmp, sessions, mut ctx) = context(Some(1));
+            let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(EndCounter(Arc::clone(&ends))));
+            Arc::get_mut(&mut ctx).unwrap().hooks = Some(Arc::new(hooks));
+            let (entered, release) = sessions.set_test_retirement_pause();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = spawn_orphan_retirement(&ctx, cancel.clone());
+
+            let mut client = remote(&ctx, "tui_cancel");
+            let session = open(&client).await;
+            disconnect(&ctx, &mut client).await;
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the task reaches the session");
+            cancel.cancel();
+            release.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the task stops when cancelled")
+                .expect("the task does not panic");
+            assert_eq!(sessions.list_ids().await, vec![session]);
+            assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 }

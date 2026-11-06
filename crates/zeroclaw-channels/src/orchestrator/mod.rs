@@ -10638,6 +10638,7 @@ async fn process_channel_message_body_inner(
                     // it binds capabilities once it moves onto the contract.
                     capabilities: None,
                     live_config: Some(ctx.live_config.clone()),
+                    memory_owner: ctx.memory.principal_scope(),
                 }),
             }));
             // Scope this turn's routing handle so concurrent same-agent turns,
@@ -31462,14 +31463,11 @@ for await (const line of createInterface({input:process.stdin})) {
             fail_model: bool,
         }
         #[async_trait::async_trait]
-        impl SessionExecutionPort for RejectReset {
+        impl zeroclaw_api::session_events::capture::SessionContextPort for RejectReset {
             async fn restore_model_override(
                 &self,
             ) -> anyhow::Result<Option<ModelOverrideSelection>> {
                 self.inner.restore_model_override().await
-            }
-            async fn record_control(&self, value: serde_json::Value) -> anyhow::Result<()> {
-                self.inner.record_control(value).await
             }
             async fn replace_context(
                 &self,
@@ -31481,6 +31479,13 @@ for await (const line of createInterface({input:process.stdin})) {
                 }
                 self.inner.replace_context(context, reason).await
             }
+        }
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionControlPort for RejectReset {
+            async fn record_control(&self, value: serde_json::Value) -> anyhow::Result<()> {
+                self.inner.record_control(value).await
+            }
             async fn observe_model_change(
                 &self,
                 _: ModelOverrideSelection,
@@ -31488,6 +31493,10 @@ for await (const line of createInterface({input:process.stdin})) {
             ) -> anyhow::Result<()> {
                 anyhow::bail!("fixture reset selection commit failed")
             }
+        }
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionExecutionPort for RejectReset {
             async fn execute(
                 &self,
                 input: EngineTurnInput,
@@ -36564,7 +36573,13 @@ for await (const line of createInterface({input:process.stdin})) {
             authority: Arc<dyn EngineSessionAuthority>,
         }
         #[async_trait::async_trait]
-        impl SessionExecutionPort for PendingPort {
+        impl zeroclaw_api::session_events::capture::SessionContextPort for PendingPort {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionControlPort for PendingPort {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionExecutionPort for PendingPort {
             async fn reject_pending_input(&self, turn_id: &str, _: &str) -> anyhow::Result<()> {
                 self.rejected.lock().unwrap().push(turn_id.to_owned());
                 Ok(())

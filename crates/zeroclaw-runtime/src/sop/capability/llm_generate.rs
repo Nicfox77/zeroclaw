@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn sop_generation_recovers_only_the_current_step_without_duplicate_model_calls() {
         use zeroclaw_api::session_events::capture::{
-            EngineInputPart, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
+            EngineInputPart, EngineTurnFuture, EngineTurnInput,
         };
 
         struct Port {
@@ -428,7 +428,13 @@ mod tests {
             reject_fails: bool,
         }
         #[async_trait::async_trait]
-        impl SessionExecutionPort for Port {
+        impl zeroclaw_api::session_events::capture::SessionContextPort for Port {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionControlPort for Port {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionExecutionPort for Port {
             async fn pending_inputs(&self, _: String, _: String) -> Result<Vec<EngineTurnInput>> {
                 Ok(self.pending.clone())
             }

@@ -315,7 +315,7 @@ impl EngineSession {
             provider_ref,
             model,
             ..
-        }) = zeroclaw_api::session_events::capture::SessionExecutionPort::restore_model_override(
+        }) = zeroclaw_api::session_events::capture::SessionContextPort::restore_model_override(
             self,
         )
         .await?
