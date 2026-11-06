@@ -10370,10 +10370,11 @@ async fn process_channel_message_body_inner(
     // Preserve the existing typing task placement and lifecycle for all other
     // modes. Matrix single-message has already completed its short typing
     // scope before its first visible draft delivery.
-    let is_partial_draft = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming())
-        || matrix_single_message_streaming;
+    let is_partial_draft = target_channel.as_ref().is_some_and(|ch| {
+        ch.supports_draft_updates()
+            && !ch.supports_multi_message_streaming()
+            && !ch.supports_turn_flush_narration()
+    }) || matrix_single_message_streaming;
     let typing_controller = if is_partial_draft {
         None
     } else {
@@ -29735,6 +29736,137 @@ BTC is currently around $65,000 based on latest tool output."#
             "the allowed final answer must still be delivered; \
              bodies: {send_message_bodies:?}"
         );
+    }
+
+    #[cfg(all(feature = "channel-simplex", feature = "channel-telegram"))]
+    #[tokio::test]
+    #[ignore = "requires Node.js for a mock SimpleX stdio bridge"]
+    async fn simplex_native_delivery_keeps_narration_independent_of_tool_debug_setting() {
+        use zeroclaw_config::{
+            live::LiveConfig,
+            multi_agent::{PeerGroupConfig, PeerUsername},
+            schema::SimplexConfig,
+        };
+        for debug in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let bridge = temp.path().join("bridge.mjs");
+            let output = temp.path().join("outbound.jsonl");
+            std::fs::write(
+                &bridge,
+                r#"import {createInterface} from 'node:readline';
+import {appendFileSync} from 'node:fs';
+for await (const line of createInterface({input:process.stdin})) {
+ const v=JSON.parse(line);
+ if(v.type==='send') appendFileSync(process.argv[2],JSON.stringify(v)+'\n');
+ process.stdout.write(JSON.stringify({type:'result',id:v.id,ok:true})+'\n');
+}
+"#,
+            )
+            .unwrap();
+            let mut config = Config::default();
+            config.channels.show_tool_calls = debug;
+            config.channels.simplex.insert(
+                "personal".into(),
+                SimplexConfig {
+                    enabled: true,
+                    websocket_url: "ws://127.0.0.1:5225".into(),
+                    bridge_command: vec![
+                        "node".into(),
+                        bridge.to_string_lossy().into_owned(),
+                        output.to_string_lossy().into_owned(),
+                    ],
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "test-agent".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    channels: vec!["simplex.personal".into()],
+                    ..Default::default()
+                },
+            );
+            config.peer_groups.insert(
+                "owner".into(),
+                PeerGroupConfig {
+                    channel: "simplex.personal".into(),
+                    external_peers: vec![PeerUsername("17".into())],
+                    ..Default::default()
+                },
+            );
+            let live = LiveConfig::new(config.clone());
+            let channel = Arc::new(crate::simplex::SimplexChannel::new(
+                "personal".into(),
+                live.handle(),
+            ));
+            let mut ctx = test_runtime_ctx_with_observer_and_tools(
+                channel,
+                Arc::new(NarratingNativeToolProvider {
+                    calls: AtomicUsize::new(0),
+                }),
+                config,
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                vec![Box::new(MockPriceTool)],
+            );
+            // This generic test helper enables notifications by default;
+            // production construction resolves this field from channels config.
+            Arc::get_mut(&mut ctx).unwrap().show_tool_calls = debug;
+            process_channel_message(
+                ctx,
+                ChannelMessage {
+                    id: "input".into(),
+                    sender: "17".into(),
+                    platform_sender_id: Some("17".into()),
+                    reply_target: "17".into(),
+                    channel: "simplex".into(),
+                    channel_alias: Some("personal".into()),
+                    content: "Check the fixture price.".into(),
+                    explicitly_addressed: true,
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await;
+            let messages: Vec<serde_json::Value> = std::fs::read_to_string(&output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Понял, запускаю инструмент"))
+                    .count(),
+                1
+            );
+            assert!(
+                messages.last().unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Инструмент отклонён, завершаю ход.")
+            );
+            let tool_messages: Vec<_> = messages
+                .iter()
+                .filter(|m| m["text"].as_str().unwrap().contains("mock_price"))
+                .collect();
+            assert_eq!(
+                !tool_messages.is_empty(),
+                debug,
+                "tool debug must honor the existing setting"
+            );
+            assert!(
+                tool_messages.iter().all(|m| m["voice"].is_null()),
+                "tool status must never generate speech"
+            );
+            if !debug {
+                assert_eq!(messages.len(), 2, "acknowledgment plus final answer only");
+            }
+        }
     }
 
     #[tokio::test]

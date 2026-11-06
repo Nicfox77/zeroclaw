@@ -956,6 +956,39 @@ impl Channel for SimplexChannel {
         self.inner.drafts.lock().insert(id.clone(), draft);
         Ok(Some(id))
     }
+    fn supports_turn_flush_narration(&self) -> bool {
+        true
+    }
+    async fn flush_draft_turn(&self, recipient: &str, id: &str, text: &str) -> Result<()> {
+        ensure!(
+            self.allowed(recipient, false),
+            "simplex_contact_not_authorized"
+        );
+        let suffix = {
+            let drafts = self.inner.drafts.lock();
+            let Some(draft) = drafts.get(id) else {
+                return Ok(());
+            };
+            ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            text.strip_prefix(&draft.narration_delivered)
+                .context("simplex_narration_prefix_mismatch")?
+                .trim()
+                .to_string()
+        };
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        // The shared updater already applies outbound hooks, protocol filtering,
+        // and leak detection. This is a text delivery; call speech and the final
+        // voice note retain their existing owners and must not be generated twice.
+        self.request(json!({"type":"send", "contact":recipient, "text":suffix}))
+            .await?;
+        if let Some(draft) = self.inner.drafts.lock().get_mut(id) {
+            ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            draft.narration_delivered = text.to_string();
+        }
+        Ok(())
+    }
     async fn prepare_voice_draft(&self, recipient: &str, id: &str, text: &str) -> Result<()> {
         ensure!(
             self.allowed(recipient, false),
@@ -1049,6 +1082,9 @@ struct NoteSpeech {
     job: crate::tts::SpeechJob,
 }
 struct VoiceDraft {
+    // Creates the fact that this guarded narration prefix was accepted by the
+    // bridge. Advance only after ACK; this is delivery evidence, not policy.
+    narration_delivered: String,
     contact: String,
     scope: String,
     channel: std::sync::Weak<Inner>,
@@ -1071,6 +1107,7 @@ impl VoiceDraft {
     fn new(channel: SimplexChannel, contact: String, scope: String) -> Self {
         let (updates, _) = watch::channel(SpeechSnapshot::default());
         Self {
+            narration_delivered: String::new(),
             contact,
             scope,
             channel: Arc::downgrade(&channel.inner),
@@ -1534,6 +1571,128 @@ mod tests {
             "the opener must not be synthesized twice"
         );
         assert!(channel.inner.drafts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_tool_narration_is_delivered_once_before_the_final_reply() {
+        for scope in [None, Some("call/u1".to_string())] {
+            let (channel, _) = fixture();
+            assert!(channel.supports_turn_flush_narration());
+            let (writer, mut requests) = mpsc::channel::<Value>(4);
+            *channel.inner.writer.lock() = Some(writer);
+            let responder = channel.clone();
+            let bridge = zeroclaw_spawn::spawn!(async move {
+                for expected in [
+                    "I will check that now.",
+                    "I found the relevant files.",
+                    "Here is the final answer.",
+                ] {
+                    let value = requests.recv().await.unwrap();
+                    assert_eq!(value["type"], "send");
+                    assert_eq!(value["text"], expected);
+                    assert!(value["voice"].is_null());
+                    responder
+                        .inner
+                        .pending
+                        .lock()
+                        .remove(value["id"].as_str().unwrap())
+                        .unwrap()
+                        .send(json!({"ok":true}))
+                        .unwrap();
+                }
+                assert!(requests.try_recv().is_err());
+            });
+            let id = channel
+                .send_draft(&SendMessage::new("", "17").in_thread(scope))
+                .await
+                .unwrap()
+                .unwrap();
+            let opener = "I will check that now.";
+            channel.flush_draft_turn("17", &id, opener).await.unwrap();
+            channel.flush_draft_turn("17", &id, opener).await.unwrap();
+            // A hook-cancelled turn is absent from the guarded snapshot. It
+            // cannot be resurrected by a later flush; the accepted prefix stays.
+            channel.discard_draft_turn("17", &id, opener).await.unwrap();
+            channel
+                .flush_draft_turn(
+                    "17",
+                    &id,
+                    &format!("{opener}\n\nI found the relevant files."),
+                )
+                .await
+                .unwrap();
+            channel
+                .finalize_draft("17", &id, "Here is the final answer.", true)
+                .await
+                .unwrap();
+            bridge.await.unwrap();
+            assert!(channel.inner.drafts.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn narration_respects_scope_revocation_and_confirmed_delivery() {
+        let (channel, live) = fixture();
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            channel
+                .flush_draft_turn("18", &id, "private")
+                .await
+                .is_err()
+        );
+        assert!(requests.try_recv().is_err());
+        let responder = channel.clone();
+        let bridge = zeroclaw_spawn::spawn!(async move {
+            for ok in [false, true] {
+                let value = requests.recv().await.unwrap();
+                assert_eq!(value["text"], "Checking now.");
+                responder
+                    .inner
+                    .pending
+                    .lock()
+                    .remove(value["id"].as_str().unwrap())
+                    .unwrap()
+                    .send(json!({"ok":ok,"not_delivered":!ok}))
+                    .unwrap();
+            }
+        });
+        assert!(
+            channel
+                .flush_draft_turn("17", &id, "Checking now.")
+                .await
+                .is_err()
+        );
+        assert!(
+            channel.inner.drafts.lock()[&id]
+                .narration_delivered
+                .is_empty()
+        );
+        channel
+            .flush_draft_turn("17", &id, "Checking now.")
+            .await
+            .unwrap();
+        bridge.await.unwrap();
+        assert!(
+            channel
+                .flush_draft_turn("17", &id, "A rewrite.")
+                .await
+                .is_err()
+        );
+        let mut config = live.snapshot();
+        config.peer_groups.clear();
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        assert!(
+            channel
+                .flush_draft_turn("17", &id, "Checking now. More.")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
