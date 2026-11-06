@@ -67,8 +67,33 @@ export class VoiceNotes {
       bytes: file.fileSize, duration: content.msgContent.duration, filename: file.fileName});
     return true;
   }
+  async recover(now = Date.now()) {
+    // The CLI is the authority for pending invitations. Read bounded recent
+    // metadata only; native live authorization still precedes every download.
+    const active = await this.rpc('/u');
+    if (this.closed || active.type !== 'activeUser' || !positive(active.user?.userId)) return;
+    const previews = await this.rpc(`/_get chats ${active.user.userId} count=20`);
+    if (previews.type !== 'apiChats') return;
+    for (const chat of (previews.chats ?? []).slice(0, 20)) {
+      if (this.closed) return;
+      const contact = chat.chatInfo?.contact?.contactId;
+      if (chat.chatInfo?.type !== 'direct' || !positive(contact)) continue;
+      const history = await this.rpc(`/_get chat @${contact} count=20`);
+      if (this.closed || history.type !== 'apiChat') continue;
+      const pending = (history.chat?.chatItems ?? []).filter(item => {
+        const created = Date.parse(item.meta?.createdAt);
+        return item.file?.fileStatus?.type === 'rcvInvitation'
+          && created <= now && created >= now - 3600000;
+      }).sort((a, b) => Date.parse(b.meta.createdAt) - Date.parse(a.meta.createdAt));
+      // Retry the newest recent invitation, never replay completed notes or
+      // an entire conversation. Its stable CLI item ID survives recovery.
+      if (pending[0]) await this.invitation({chatInfo: chat.chatInfo, chatItem: pending[0]});
+    }
+  }
   async receive(message) {
     const {contact, message_id: id, file_id: fileId, filename, max_duration: maxDuration} = message;
+    const existing = this.receiving.get(fileId);
+    if (existing?.contact === contact && existing.id === id) return;
     const ext = extname(filename ?? '').toLowerCase();
     if (!positive(Number(contact)) || !positive(Number(id)) || !positive(fileId)
       || !extensions.has(ext) || !positive(maxDuration)
@@ -83,7 +108,19 @@ export class VoiceNotes {
     } catch (error) {await this.remove(record); throw error;}
   }
   async event(resp) {
-    if (resp.type === 'rcvFileComplete') {
+    if (resp.type === 'chatItemUpdated') {
+      const item = resp.chatItem, file = item?.chatItem?.file;
+      const record = this.receiving.get(file?.fileId);
+      const current = identity(item);
+      // An incomplete description may initially be accepted, then rejected by
+      // the CLI relay policy when its final part arrives. That reset is a
+      // terminal outcome for this attempt, not a five-minute pending download.
+      if (record && current.contact === record.contact && current.id === record.id
+        && ['rcvInvitation', 'rcvAborted', 'rcvCancelled', 'rcvError'].includes(file.fileStatus?.type)) {
+        await this.remove(record);
+        await this.emit({type: 'voice_transfer_failed', contact: record.contact, outgoing: false});
+      }
+    } else if (resp.type === 'rcvFileComplete') {
       const item = resp.chatItem, file = item?.chatItem?.file;
       const record = this.receiving.get(file?.fileId);
       if (!record) return;

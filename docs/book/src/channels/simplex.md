@@ -99,8 +99,17 @@ Incoming files are removed after transcription handoff; outgoing source files
 remain until encrypted upload completes. Transfer errors, cancellation, timeout,
 and helper shutdown clean up owned files. The temporary STT copy is plaintext;
 the SimpleX transfer remains encrypted. A failed transfer produces a text notice.
-Pending invitations from before the adapter started are not replayed; resend
-those voice notes after enabling this feature. Generic attachments are ignored.
+On startup, the helper checks at most 20 recent direct chats and 20 items per
+chat, retrying only the newest pending voice invitation created locally within
+the last hour. Completed notes and older history are not replayed. Recovery
+only emits metadata; native live authorization still precedes every download.
+Generic attachments are ignored.
+
+The CLI’s configured server list owns relay approval. Configure the official
+file-relay presets used by your phone (including Flux when enabled there).
+A note can reference several relay replicas; all must satisfy the CLI’s policy.
+The adapter does not bypass this with `approved_relays=on`. A policy rejection
+after a multipart file description arrives produces an immediate text notice.
 
 ## Calls and speech
 
