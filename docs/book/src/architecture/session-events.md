@@ -99,6 +99,17 @@ Gateway HTTP and WebSocket history use this same source. They do not maintain
 a legacy backend handle, transcript watermark or post-turn transcript rewrite.
 Legacy backend factories are available only to explicit test fixtures.
 
+## SQLite file permissions and locking
+
+SQLite owns the ordinary descriptors for its database and WAL sidecars.
+Permission checks must not open and close extra I/O descriptors for these files:
+on POSIX systems a close can discard the process's SQLite record locks. The
+native opener keeps the session directory private, refuses symlink targets,
+uses SQLite's no-follow open mode and repairs file permissions without those
+extra descriptors. Linux uses a checked `O_PATH` handle and, when repair is
+needed, its kernel-owned `/proc/self/fd` link. Database and sidecar files retain
+mode `0600`; unavailable safe repair operations fail closed.
+
 ## Steering input capture
 
 Channel steering uses the active foreground turn's native capture port. A

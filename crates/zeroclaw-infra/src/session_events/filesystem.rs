@@ -61,6 +61,69 @@ pub(super) fn read(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// SQLite owns ordinary handles to its database and sidecars. Closing another
+/// ordinary handle can release all of SQLite's process-wide POSIX locks.
+/// Permission repair must therefore avoid opening those files for I/O.
+pub(super) fn private_sqlite_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{OpenOptionsExt, PermissionsExt},
+        };
+        // O_PATH pins the checked inode without an I/O handle. Linux does not
+        // remove POSIX record locks when an O_PATH descriptor is closed.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other("session file is not a regular file"));
+        }
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
+            // This is the kernel-owned link for the live pinned descriptor,
+            // not a lookup through a replaceable user-supplied symlink.
+            fs::set_permissions(
+                format!("/proc/self/fd/{}", file.as_raw_fd()),
+                fs::Permissions::from_mode(0o600),
+            )?;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other("session file is not a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+            if metadata.permissions().mode() & 0o7777 != 0o600 {
+                let path =
+                    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                    })?;
+                // SAFETY: path is NUL-terminated and valid for the duration
+                // of this call. Never follow a substituted final symlink.
+                if unsafe {
+                    libc::fchmodat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        0o600,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn directory(path: &Path) -> Result<(), AppendError> {
     fs::create_dir_all(path).map_err(jsonl::storage)?;
     let metadata = fs::symlink_metadata(path).map_err(jsonl::storage)?;
