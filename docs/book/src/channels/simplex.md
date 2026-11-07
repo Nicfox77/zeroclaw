@@ -54,7 +54,7 @@ enabled = true
 websocket_url = "ws://127.0.0.1:5225"
 bridge_command = ["node", "/absolute/path/to/contrib/simplex/bridge.mjs"]
 calls_enabled = true
-interrupt_on_new_message = true
+message_arrival = "steer"
 
 [peer_groups.simplex_owner]
 channel = "simplex.personal"
@@ -123,6 +123,8 @@ file-relay presets used by your phone (including Flux when enabled there).
 A note can reference several relay replicas; all must satisfy the CLI’s policy.
 The adapter does not bypass this with `approved_relays=on`. A policy rejection
 after a multipart file description arrives produces an immediate text notice.
+
+Ordinary follow-ups use the shared [message arrival modes](./overview.md#messages-during-an-active-turn).
 
 ## Calls and speech
 

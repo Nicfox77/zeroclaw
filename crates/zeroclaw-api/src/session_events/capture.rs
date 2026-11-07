@@ -1,6 +1,7 @@
 //! Narrow in-process capture ports. Adapters cannot choose a stream, actor or
 //! execution grant. Scope is injected by the admitted execution owner.
 use super::*;
+use crate::ingress::IngressContext;
 use crate::model_provider::ChatMessage;
 use std::future::Future;
 use std::pin::Pin;
@@ -125,6 +126,18 @@ pub trait ProviderAdmissionPort: Send + Sync {
         &self,
         intent: ProviderDispatchIntent,
     ) -> anyhow::Result<Arc<dyn ProviderObservationPort>>;
+
+    /// Capture a separately admitted steering input in the active turn's
+    /// archive before it reaches a provider. False means this exact input was
+    /// already recorded and must not be injected twice. Ephemeral ports may
+    /// omit capture; native session owners implement the durable boundary.
+    async fn record_steering_input(
+        &self,
+        _message: &ChatMessage,
+        _ingress: Option<&IngressContext>,
+    ) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 
     async fn begin_child(
         &self,

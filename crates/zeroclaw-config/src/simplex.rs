@@ -1,5 +1,6 @@
 //! SimpleX transport configuration. Contact authorization remains owned by
 //! peer_groups; this block creates only transport and call activation policy.
+use crate::message_arrival::MessageArrivalMode;
 use serde::{Deserialize, Serialize};
 use zeroclaw_macros::Configurable;
 
@@ -18,6 +19,10 @@ pub struct SimplexConfig {
     pub calls_enabled: bool,
     /// Supersede an earlier turn when this contact sends a new message.
     pub interrupt_on_new_message: bool,
+    /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
+    /// interrupt_on_new_message retains its existing boolean behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arrival: Option<MessageArrivalMode>,
 }
 
 impl SimplexConfig {

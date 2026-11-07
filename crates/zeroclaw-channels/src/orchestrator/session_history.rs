@@ -218,6 +218,35 @@ impl EngineSessionAuthority for ChannelAuthority {
     }
 }
 
+/// Reuse the ordinary channel authority at the runtime consumption boundary.
+pub(super) fn authorize_steering(
+    ctx: &Arc<ChannelRuntimeContext>,
+    message: &ChannelMessage,
+    history_key: &str,
+) -> Result<(), SessionError> {
+    let enabled = {
+        let config = ctx.live_config.read();
+        message.channel_alias.as_deref().is_some_and(|alias| {
+            config
+                .get_prop(&format!("channels.{}.{}.enabled", message.channel, alias))
+                .is_ok_and(|value| value == "true")
+        })
+    };
+    if !enabled || runtime_conversation_history_key(ctx, message) != history_key {
+        return Err(SessionError::PermissionDenied(
+            "channel_steering_binding_changed".into(),
+        ));
+    }
+    ChannelAuthority {
+        ctx: Arc::clone(ctx),
+        message: message.clone(),
+        stream: SessionId::parse(history_key.to_owned()).map_err(AppendError::from)?,
+        agent: ctx.agent_alias.to_string(),
+        child: false,
+    }
+    .current()
+}
+
 pub(super) async fn open(
     ctx: Arc<ChannelRuntimeContext>,
     msg: &ChannelMessage,
