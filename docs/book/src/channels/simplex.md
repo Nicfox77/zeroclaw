@@ -205,6 +205,26 @@ stops synthesis while allowing an already admitted delivery to settle its receip
 The bridge distinguishes a proven pre-playback rejection from an uncertain
 transport failure; interrupted speech must not be retried as a fresh full answer.
 
+## Text formatting
+
+Approved outbound text is converted from standard Markdown to SimpleX's inline
+formatting at the helper's send boundary. This covers ordinary messages,
+intermediate narration and the text delivered alongside voice notes. Conversation
+history and speech synthesis retain their original text.
+
+Bold (`**text**` or `__text__`) becomes `*text*`; italics become `_text_` and
+strikethrough becomes `~text~`. Headings become bold lines; lists and tables use
+readable text layouts. Links retain a visible destination. SimpleX cannot nest
+styles, so nested emphasis is flattened. Intraword emphasis becomes plain text
+to preserve identifiers and words. Inline and fenced code, escaped source and
+raw HTML are passed through verbatim; this does not add a full code-block or
+HTML renderer to SimpleX.
+
+The helper uses a pinned Markdown lexer and never evaluates HTML or fetches
+linked resources. Text is split at the existing 12,000-character limit without
+splitting Unicode characters; each converted emphasis span closes inside its
+message. There is no formatting setting to synchronize with the model.
+
 ## Verification and rollback
 
 Run `npm test` in `contrib/simplex` (ffmpeg and ffprobe are required for note tests). With `CHROMIUM_PATH` and assets configured,
