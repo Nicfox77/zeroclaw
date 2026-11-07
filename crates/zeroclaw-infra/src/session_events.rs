@@ -241,8 +241,20 @@ impl SqliteEventStore {
                 Err(error) => return Err(jsonl::storage(error)),
             }
         }
-        let _private_file = filesystem::file(&path, false).map_err(jsonl::storage)?;
-        let conn = Connection::open(&path).map_err(map_sqlite)?;
+        match filesystem::private_sqlite_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(jsonl::storage(error)),
+        }
+        // Let SQLite own creation and every ordinary file descriptor. The
+        // containing directory is private; harden a new empty database before
+        // any schema or session content is written.
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(map_sqlite)?;
+        filesystem::private_sqlite_file(&path).map_err(jsonl::storage)?;
         let schema_version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(map_sqlite)?;
@@ -295,15 +307,7 @@ impl SqliteEventStore {
         for suffix in ["-wal", "-shm"] {
             let sidecar = dir.join(format!("session-events.db{suffix}"));
             if sidecar.try_exists().map_err(jsonl::storage)? {
-                let file = filesystem::reader(&sidecar).map_err(jsonl::storage)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(fs::Permissions::from_mode(0o600))
-                        .map_err(jsonl::storage)?;
-                }
-                #[cfg(not(unix))]
-                drop(file);
+                filesystem::private_sqlite_file(&sidecar).map_err(jsonl::storage)?;
             }
         }
         // A crash can happen after the redaction transaction commits but
@@ -1113,6 +1117,122 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_api::session_events::{EventActor, EventKind};
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sqlite_lock_probe_child() {
+        use std::os::fd::AsRawFd;
+        let Some(path) = std::env::var_os("ZEROCLAW_SQLITE_DMS_PROBE") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        for (file, byte) in [
+            (path.clone(), 128), // SQLite unix WAL dead-man-switch byte.
+            (path.with_file_name("session-events.db"), 0x40000002), // Database shared lock.
+        ] {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file)
+                .unwrap();
+            // SAFETY: flock is an integer-only C record; every field starts valid.
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::F_WRLCK as _;
+            lock.l_whence = libc::SEEK_SET as _;
+            lock.l_start = byte;
+            lock.l_len = 1;
+            // SAFETY: the live descriptor and writable flock record outlive fcntl.
+            assert_ne!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+                -1
+            );
+            assert_eq!(
+                i32::from(lock.l_type),
+                libc::F_RDLCK,
+                "live SQLite lock at byte {byte} was released"
+            );
+            assert_ne!(lock.l_pid, 0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sqlite_open_preserves_process_wal_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TempDir::new().unwrap();
+        let first = SqliteEventStore::open(directory.path()).unwrap();
+        let probe = || {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session_events::tests::sqlite_lock_probe_child",
+                    "--test-threads=1",
+                ])
+                .env(
+                    "ZEROCLAW_SQLITE_DMS_PROBE",
+                    directory.path().join("sessions/session-events.db-shm"),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+        };
+        probe();
+        for suffix in ["", "-wal", "-shm"] {
+            fs::set_permissions(
+                directory
+                    .path()
+                    .join(format!("sessions/session-events.db{suffix}")),
+                fs::Permissions::from_mode(0o666),
+            )
+            .unwrap();
+        }
+        let second = SqliteEventStore::open(directory.path()).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            assert_eq!(
+                fs::metadata(
+                    directory
+                        .path()
+                        .join(format!("sessions/session-events.db{suffix}"))
+                )
+                .unwrap()
+                .permissions()
+                .mode()
+                    & 0o7777,
+                0o600
+            );
+        }
+        probe();
+        drop(second);
+        probe();
+        let stream = SessionId::new();
+        first
+            .append_batch(request(&stream, "after-peer-close", 0))
+            .unwrap();
+        probe();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlite_refuses_symlink_database_without_changing_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = TempDir::new().unwrap();
+        let target = directory.path().join("victim");
+        fs::write(&target, b"untouched fixture").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let sessions = directory.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        symlink(&target, sessions.join("session-events.db")).unwrap();
+        assert!(SqliteEventStore::open(directory.path()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"untouched fixture");
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
 
     #[test]
     fn latest_typed_lookup_skips_unsupported_body_codecs() {
