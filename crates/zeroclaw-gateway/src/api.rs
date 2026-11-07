@@ -1972,23 +1972,34 @@ fn runtime_work_is_busy(state: &AppState) -> bool {
     })
 }
 
-/// GET /api/sessions/running — list sessions currently in "running" state
+/// Request projection; activity comes from the live admission coordinator,
+/// never from persisted session summaries.
+#[derive(Default, Deserialize)]
+pub struct RunningSessionsQuery {
+    #[serde(default)]
+    pub activity_only: bool,
+}
+
+/// GET /api/sessions/running — optionally probe activity without reading history.
 pub async fn handle_api_sessions_running(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<RunningSessionsQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let busy = runtime_work_is_busy(&state);
+    if query.activity_only {
+        return Json(serde_json::json!({"busy": runtime_work_is_busy(&state)})).into_response();
+    }
     if state.native_sessions.is_some() {
         return crate::session_history::response(
             async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
                 let mut result =
                     crate::session_history::list(&state, subject.as_deref(), true).await?;
-                result["busy"] = serde_json::json!(busy);
+                result["busy"] = serde_json::json!(runtime_work_is_busy(&state));
                 Ok(result)
             }
             .await,
@@ -1996,7 +2007,7 @@ pub async fn handle_api_sessions_running(
     }
 
     Json(serde_json::json!({
-        "busy": busy,
+        "busy": runtime_work_is_busy(&state),
         "sessions": [],
         "message": "Session persistence is disabled"
     }))
@@ -3081,6 +3092,96 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn api_sessions_running_activity_only_uses_live_work_without_opening_history() {
+        use tower::ServiceExt;
+        // A history access would fail: its data directory is a regular file.
+        // Activity must remain available regardless of archive availability.
+        let blocked = tempfile::NamedTempFile::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: blocked.path().to_owned(),
+            ..Default::default()
+        });
+        let mut state = test_state(config);
+        state.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+            state.config.clone(),
+        )));
+        let router = axum::Router::new()
+            .route(
+                "/api/sessions/running",
+                axum::routing::get(handle_api_sessions_running),
+            )
+            .with_state(state.clone());
+        let lease = state.agent_lifecycle.reserve_turn("test-agent").unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sessions/running?activity_only=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({"busy":true})
+        );
+        drop(lease);
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sessions/running?activity_only=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({"busy":false})
+        );
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sessions/running")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_sessions_running_activity_only_preserves_bearer_authentication() {
+        use tower::ServiceExt;
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let router = axum::Router::new()
+            .route(
+                "/api/sessions/running",
+                axum::routing::get(handle_api_sessions_running),
+            )
+            .with_state(state);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sessions/running?activity_only=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn api_sessions_running_reports_runtime_work_without_persisted_sessions() {
         let mut config = config_with_telegram("default");
         config.agents.insert(
@@ -3091,9 +3192,13 @@ pub(crate) mod tests {
         assert!(state.native_sessions.is_none());
         // These leases are the same source used by web, RPC and channel turns.
         let lease = state.agent_lifecycle.reserve_turn("test-agent").unwrap();
-        let response = handle_api_sessions_running(State(state.clone()), HeaderMap::new())
-            .await
-            .into_response();
+        let response = handle_api_sessions_running(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(RunningSessionsQuery::default()),
+        )
+        .await
+        .into_response();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -3101,9 +3206,13 @@ pub(crate) mod tests {
         assert_eq!(body["busy"], true);
         assert_eq!(body["sessions"], serde_json::json!([]));
         drop(lease);
-        let response = handle_api_sessions_running(State(state.clone()), HeaderMap::new())
-            .await
-            .into_response();
+        let response = handle_api_sessions_running(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(RunningSessionsQuery::default()),
+        )
+        .await
+        .into_response();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
