@@ -42,10 +42,13 @@ try {
  const events=[];notes=new VoiceNotes(async cmd=>{const response=await a.rpc(cmd);assert.ok(!['chatCmdError','chatError'].includes(response.type),'send rejected: '+response.type);return response;},async event=>events.push(event));
  a.onEvent=event=>notes.event(event);
  b.events=[];
- await notes.send(aid,'Fixture text plus voice.',result.stdout.toString('base64'));
+ await notes.send(aid,'**Fixture** text plus voice.',result.stdout.toString('base64'));
  const incoming=await until(()=>b.events.find(e=>e.type==='newChatItems' && e.chatItems?.some(i=>i.chatItem?.content?.msgContent?.type==='voice')),'voice_invitation_timeout');
  const wrapper=incoming.chatItems.find(i=>i.chatItem.content.msgContent.type==='voice');
- assert.ok(b.events.some(e=>e.type==='newChatItems' && e.chatItems?.some(i=>i.chatItem?.content?.msgContent?.type==='text')));
+ const receivedText=await until(()=>b.events.flatMap(e=>e.type==='newChatItems' ? e.chatItems ?? [] : []).find(i=>i.chatItem?.content?.msgContent?.type==='text'),'formatted_text_timeout');
+ assert.equal(receivedText.chatItem.content.msgContent.text,'*Fixture* text plus voice.');
+ assert.ok(receivedText.chatItem.formattedText?.some(span=>span.format?.type==='bold' && span.text==='Fixture'),
+   'receiving SimpleX core must recognize a bold span, not display double asterisks');
  const path=join(root,'received.m4a');
  const accepted=await b.rpc(`/freceive ${wrapper.chatItem.file.fileId} encrypt=off ${path}`);
  assert.ok(!['chatCmdError','chatError'].includes(accepted.type),'receive rejected');

@@ -97,10 +97,10 @@ test('one batch creates text plus a native voice note; source survives ACK until
   const commands = [], events = [];
   const notes = new VoiceNotes(async cmd => {commands.push(cmd); return {type: 'newChatItems', chatItems: []};}, async value => events.push(value));
   try {
-    const audio = makeAudio(); await notes.send('17', 'The final reply.', audio.toString('base64'));
+    const audio = makeAudio(); await notes.send('17', '**The final reply.**', audio.toString('base64'));
     assert.equal(commands.length, 1);
     const batch = JSON.parse(commands[0].slice('/_send @17 json '.length));
-    assert.equal(batch[0].msgContent.text, 'The final reply.');
+    assert.equal(batch[0].msgContent.text, '*The final reply.*');
     assert.equal(batch[1].msgContent.type, 'voice'); assert.equal(batch[1].msgContent.duration, 1);
     const path = batch[1].fileSource.filePath;
     const uploaded = await readFile(path);

@@ -7,6 +7,8 @@ import {join, extname} from 'node:path';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 
+import {simplexTextMessages} from './format.mjs';
+
 const execute = promisify(execFile);
 export const MAX_AUDIO = 5 * 1024 * 1024;
 const extensions = new Set(['.m4a', '.mp4', '.wav', '.mp3', '.ogg', '.oga', '.opus', '.webm', '.flac']);
@@ -193,9 +195,7 @@ export class VoiceNotes {
       if (this.closed) throw Error('simplex_voice_closed');
       this.expire(record);
       record.admitted = true;
-      const chars = [...text], messages = [];
-      for (let i = 0; i < chars.length; i += 12000)
-        messages.push({msgContent: {type: 'text', text: chars.slice(i, i + 12000).join('')}});
+      const messages = simplexTextMessages(text);
       messages.push({fileSource: {filePath: record.path}, msgContent: {type: 'voice', text: '', duration: Math.ceil(seconds)}});
       // One CLI batch creates the text and note together. Do not remove the
       // source until the asynchronous encrypted upload reaches a terminal event.
