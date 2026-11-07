@@ -45,6 +45,7 @@ pub(super) async fn run_turn(
     registry: Arc<ConversationLaneRegistry>,
     turn: Box<PendingTurn>,
     queue: &mut tokio::sync::mpsc::Receiver<Box<PendingTurn>>,
+    mut older: VecDeque<Box<PendingTurn>>,
 ) -> VecDeque<Box<PendingTurn>> {
     let (tx, rx) = tokio::sync::mpsc::channel(CONVERSATION_LANE_BACKLOG_LIMIT);
     // Only routing identity is needed after the active turn moves into its
@@ -65,7 +66,14 @@ pub(super) async fn run_turn(
     loop {
         tokio::select! {
             biased;
-            next = queue.recv(), if receiving && retained.len() < CONVERSATION_LANE_BACKLOG_LIMIT => {
+            next = async {
+                // Completion-race fallbacks precede newer transport input.
+                // Consult their owning queue before receiving anything newer.
+                match older.pop_front() {
+                    Some(turn) => Some(turn),
+                    None => queue.recv().await,
+                }
+            }, if receiving && retained.len() < CONVERSATION_LANE_BACKLOG_LIMIT => {
                 let Some(next) = next else { receiving = false; continue; };
                 // The matcher borrows only the active routing facts, not its
                 // permits or lifecycle registration.
@@ -97,6 +105,7 @@ pub(super) async fn run_turn(
         }
     }
     pending.extend(deferred);
+    pending.extend(older);
     pending
 }
 
