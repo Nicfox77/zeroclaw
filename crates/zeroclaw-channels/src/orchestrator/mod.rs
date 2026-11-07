@@ -1268,7 +1268,13 @@ impl ConversationLaneRegistry {
             else {
                 break;
             };
-            deferred.extend(steering::run_turn(Arc::clone(&self), turn, &mut rx).await);
+            deferred = steering::run_turn(
+                Arc::clone(&self),
+                turn,
+                &mut rx,
+                std::mem::take(&mut deferred),
+            )
+            .await;
         }
     }
 

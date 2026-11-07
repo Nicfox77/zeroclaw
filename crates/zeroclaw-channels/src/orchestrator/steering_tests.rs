@@ -116,7 +116,7 @@ impl zeroclaw_runtime::hooks::HookHandler for SteeringReceivedHook {
         &self,
         msg: ChannelMessage,
     ) -> zeroclaw_runtime::hooks::HookResult<ChannelMessage> {
-        if msg.id == "follow-up" {
+        if msg.id == "follow-up" || msg.id == "newest" {
             self.0.notify_one();
         }
         zeroclaw_runtime::hooks::HookResult::Continue(msg)
@@ -128,6 +128,7 @@ enum SteeringCase {
     Steer,
     Queue,
     FinalRace,
+    FinalRaceOrdered,
     Stop,
     Revoked,
     Debounced,
@@ -145,8 +146,11 @@ async fn run_channel_steering_case(native: bool, case: SteeringCase) {
     let release = Arc::new(tokio::sync::Notify::new());
     let received = Arc::new(tokio::sync::Notify::new());
     let completed = Arc::new(AtomicBool::new(false));
-    let final_pause =
-        matches!(case, SteeringCase::FinalRace).then(|| Arc::new(SteeringFinalPause::default()));
+    let final_pause = matches!(
+        case,
+        SteeringCase::FinalRace | SteeringCase::FinalRaceOrdered
+    )
+    .then(|| Arc::new(SteeringFinalPause::default()));
     let provider = Arc::new(SteeringBoundaryProvider {
         requests: Mutex::new(Vec::new()),
         final_pause: final_pause.clone(),
@@ -298,6 +302,19 @@ async fn run_channel_steering_case(native: bool, case: SteeringCase) {
     if matches!(case, SteeringCase::Duplicate) {
         tx.send(followup).await.unwrap();
     }
+    if matches!(case, SteeringCase::FinalRaceOrdered) {
+        // An unknown slash input uses normal admission, blocking steering of
+        // newer inputs until that older message reaches its ordinary turn.
+        tx.send(make_message("older", "/ordinary older detail", 3))
+            .await
+            .unwrap();
+        tx.send(make_message("newest", "Newest detail", 4))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), received.notified())
+            .await
+            .unwrap();
+    }
     // Let the runnable admission/queue tasks reach the parked tool.
     for _ in 0..16 {
         tokio::task::yield_now().await;
@@ -340,6 +357,28 @@ async fn run_channel_steering_case(native: bool, case: SteeringCase) {
         .unwrap()
         .unwrap();
     let requests = provider.requests.lock().unwrap().clone();
+    if matches!(case, SteeringCase::FinalRaceOrdered) {
+        let first_seen = |text: &str| {
+            requests
+                .iter()
+                .enumerate()
+                .find_map(|(round, messages)| {
+                    messages
+                        .iter()
+                        .position(|message| {
+                            message.role == "user" && message.content.ends_with(text)
+                        })
+                        .map(|index| (round, index))
+                })
+                .unwrap()
+        };
+        assert!(first_seen("Also include the final detail") < first_seen("/ordinary older detail"));
+        assert!(
+            first_seen("/ordinary older detail") < first_seen("Newest detail"),
+            "a newer input must not steer ahead of an older completion-race fallback"
+        );
+        return;
+    }
     if matches!(case, SteeringCase::Flood) {
         assert_eq!(requests.len(), 2);
         let users = requests[1]
@@ -471,6 +510,13 @@ async fn channel_steering_queue_mode_keeps_followup_as_a_separate_turn() {
 async fn channel_steering_final_response_race_preserves_unconsumed_message() {
     for native in [false, true] {
         run_channel_steering_case(native, SteeringCase::FinalRace).await;
+    }
+}
+
+#[tokio::test]
+async fn channel_steering_final_response_fallback_preserves_fifo_before_newer_input() {
+    for native in [false, true] {
+        run_channel_steering_case(native, SteeringCase::FinalRaceOrdered).await;
     }
 }
 #[tokio::test]
