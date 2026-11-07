@@ -2099,7 +2099,27 @@ async fn run_tool_call_loop_inner<'a>(
                     }
                     // Not reachable under the default policy; drop the injection
                     // (do not append it) when it is.
-                    IngressDecision::Drop { .. } => continue,
+                    IngressDecision::Drop { .. } => {
+                        steering_input.settle();
+                        continue;
+                    }
+                }
+                if let Some(port) =
+                    zeroclaw_api::session_events::capture::current_provider_admission()
+                {
+                    if !port
+                        .record_steering_input(steering_input.message(), steering_input.ingress())
+                        .await?
+                    {
+                        steering_input.settle();
+                        continue;
+                    }
+                    // Persistence awaited. Recheck the sender immediately
+                    // before their input changes the provider's conversation.
+                    if !matches!(steering_input.admit(), SteeringAdmission::Admitted(posture) if posture == SteeringPosture::default())
+                    {
+                        continue;
+                    }
                 }
                 let msg = steering_input.into_message();
                 has_new_user_input |= msg.role != "tool";

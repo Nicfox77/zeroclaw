@@ -1,3 +1,4 @@
+use crate::message_arrival::MessageArrivalMode;
 pub use crate::simplex::SimplexConfig;
 // Historical schema typed lenses for migration. Each module is frozen after
 // its corresponding version ships; only their `migrate(self) -> ...` methods
@@ -17093,6 +17094,12 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
+    /// interrupt_on_new_message retains its existing boolean behavior.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arrival: Option<MessageArrivalMode>,
+
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[tab(Behavior)]
@@ -17190,6 +17197,7 @@ impl Default for TelegramConfig {
             draft_update_interval_ms: default_draft_update_interval_ms(),
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
+            message_arrival: None,
             mention_only: false,
             unauthorized_message: None,
             per_user_session: true,
@@ -17304,6 +17312,12 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
+    /// interrupt_on_new_message retains its existing boolean behavior.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arrival: Option<MessageArrivalMode>,
+
     /// When true, only respond to messages that @-mention the bot.
     /// Other messages in the guild are silently ignored.
     #[tab(Behavior)]
@@ -17484,6 +17498,12 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
+    /// interrupt_on_new_message retains its existing boolean behavior.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arrival: Option<MessageArrivalMode>,
+
     /// When true (default), replies stay in the originating Slack thread.
     /// When false, replies go to the channel root instead.
     #[tab(Advanced)]
@@ -17741,6 +17761,12 @@ pub struct MattermostConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
+    /// interrupt_on_new_message retains its existing boolean behavior.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arrival: Option<MessageArrivalMode>,
+
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -17810,6 +17836,7 @@ impl Default for MattermostConfig {
             thread_replies: None,
             mention_only: None,
             interrupt_on_new_message: false,
+            message_arrival: None,
             proxy_url: None,
             listen_mode: MattermostListenMode::default(),
             excluded_tools: Vec::new(),
@@ -18011,6 +18038,12 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
+    /// interrupt_on_new_message retains its existing boolean behavior.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arrival: Option<MessageArrivalMode>,
+
     /// Streaming mode for progressive response delivery.
     /// `"off"` (default): single final message. `"partial"`: edit-in-place draft.
     /// `"single_message"`: progress draft plus separate final message.
@@ -18558,6 +18591,12 @@ pub struct WhatsAppConfig {
     /// WhatsApp message arrives. Default: `false`.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
+    /// interrupt_on_new_message retains its existing boolean behavior.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arrival: Option<MessageArrivalMode>,
+
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
     /// `dm_policy` and `group_policy` apply under BOTH modes. Personal mode
     /// additionally applies `self_chat_mode` and the fromMe handling; both are
@@ -34260,6 +34299,7 @@ auto_save = true
                         multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
                         interrupt_on_new_message: false,
+                        message_arrival: None,
                         mention_only: false,
                         unauthorized_message: None,
                         per_user_session: true,
@@ -36301,6 +36341,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 500,
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
+            message_arrival: None,
             mention_only: false,
             unauthorized_message: None,
             per_user_session: true,
@@ -36369,6 +36410,7 @@ stream_mode = "single_message"
             archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,
+            message_arrival: None,
             mention_only: false,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
@@ -36400,6 +36442,7 @@ stream_mode = "single_message"
             archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,
+            message_arrival: None,
             mention_only: false,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
@@ -36460,6 +36503,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             device_id: Some("DEVICE123".into()),
             allowed_rooms: vec!["!room123:matrix.org".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -36500,6 +36544,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             device_id: None,
             allowed_rooms: vec!["!abc:synapse.local".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -36686,6 +36731,7 @@ allowed_users = ["@u:matrix.org"]
                     device_id: None,
                     allowed_rooms: vec!["!r:m".into()],
                     interrupt_on_new_message: false,
+                    message_arrival: None,
                     stream_mode: MatrixStreamMode::default(),
                     draft_update_interval_ms: 1500,
                     multi_message_delay_ms: 800,
@@ -37064,6 +37110,7 @@ bot_token = "xoxb-tok"
             passive_group_context: false,
             document_thumbnails: false,
             interrupt_on_new_message: false,
+            message_arrival: None,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -37101,6 +37148,7 @@ bot_token = "xoxb-tok"
             passive_group_context: false,
             document_thumbnails: false,
             interrupt_on_new_message: false,
+            message_arrival: None,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -37198,6 +37246,7 @@ allowed_numbers = ["+1", "+2"]
             passive_group_context: false,
             document_thumbnails: false,
             interrupt_on_new_message: false,
+            message_arrival: None,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -37232,6 +37281,7 @@ allowed_numbers = ["+1", "+2"]
             passive_group_context: false,
             document_thumbnails: false,
             interrupt_on_new_message: false,
+            message_arrival: None,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -37314,6 +37364,7 @@ allowed_numbers = ["+1", "+2"]
                     passive_group_context: false,
                     document_thumbnails: false,
                     interrupt_on_new_message: false,
+                    message_arrival: None,
                     mode: WhatsAppWebMode::default(),
                     dm_policy: WhatsAppChatPolicy::default(),
                     group_policy: WhatsAppChatPolicy::default(),
@@ -43243,6 +43294,7 @@ high_entropy_tokens = false
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 mention_only: false,
                 unauthorized_message: None,
                 per_user_session: true,
@@ -46939,6 +46991,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -46978,6 +47031,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -47022,6 +47076,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -47055,6 +47110,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -47099,6 +47155,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
@@ -47142,6 +47199,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
@@ -47190,6 +47248,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
@@ -47306,6 +47365,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -47350,6 +47410,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -47390,6 +47451,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
@@ -47425,6 +47487,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
+            message_arrival: None,
             stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
