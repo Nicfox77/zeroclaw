@@ -44,6 +44,14 @@ impl SessionCoordinator {
 
 #[async_trait::async_trait]
 impl ProviderAdmissionPort for ProviderCaptureScope {
+    async fn record_steering_input(
+        &self,
+        message: &zeroclaw_api::model_provider::ChatMessage,
+        ingress: Option<&zeroclaw_api::ingress::IngressContext>,
+    ) -> anyhow::Result<bool> {
+        super::steering_capture::record(self, message, ingress).await
+    }
+
     async fn consume_child_result(
         &self,
         task_id: &str,

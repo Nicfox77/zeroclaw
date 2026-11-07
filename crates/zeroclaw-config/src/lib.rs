@@ -19,6 +19,7 @@ pub mod field_visibility;
 pub mod helpers;
 pub mod live;
 pub mod main_session;
+pub mod message_arrival;
 pub mod migration;
 pub mod multi_agent;
 pub mod opt_in_tools;

@@ -10352,6 +10352,7 @@ mod tests {
                 device_id: None,
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 stream_mode: Default::default(),
                 stream_tool_arguments: vec![],
                 draft_update_interval_ms: 1500,

@@ -8,6 +8,7 @@ pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
 mod session_history;
+mod steering;
 #[cfg(feature = "channel-simplex")]
 pub(crate) use session_history::DeliveryScope;
 
@@ -606,66 +607,9 @@ fn interrupt_on_new_message_config(
     }
 }
 
-fn interrupt_on_new_message_enabled(
-    ctx: &ChannelRuntimeContext,
-    msg: &zeroclaw_api::channel::ChannelMessage,
-) -> bool {
-    let Some(alias) = msg
-        .channel_alias
-        .as_deref()
-        .filter(|alias| !alias.is_empty())
-    else {
-        return ctx
-            .interrupt_on_new_message
-            .enabled_for_channel(msg.channel.as_str());
-    };
-
-    match msg.channel.as_str() {
-        "simplex" => ctx
-            .live_config
-            .read()
-            .channels
-            .simplex
-            .get(alias)
-            .is_some_and(|c| c.interrupt_on_new_message),
-        "telegram" => ctx
-            .prompt_config
-            .channels
-            .telegram
-            .get(alias)
-            .is_some_and(|config| config.interrupt_on_new_message),
-        "slack" => ctx
-            .prompt_config
-            .channels
-            .slack
-            .get(alias)
-            .is_some_and(|config| config.interrupt_on_new_message),
-        "discord" => ctx
-            .prompt_config
-            .channels
-            .discord
-            .get(alias)
-            .is_some_and(|config| config.interrupt_on_new_message),
-        "mattermost" => ctx
-            .prompt_config
-            .channels
-            .mattermost
-            .get(alias)
-            .is_some_and(|config| config.interrupt_on_new_message),
-        "matrix" => ctx
-            .prompt_config
-            .channels
-            .matrix
-            .get(alias)
-            .is_some_and(|config| config.interrupt_on_new_message),
-        "whatsapp" => ctx
-            .prompt_config
-            .channels
-            .whatsapp
-            .get(alias)
-            .is_some_and(|config| config.interrupt_on_new_message),
-        _ => false,
-    }
+fn interrupt_on_new_message_enabled(ctx: &ChannelRuntimeContext, msg: &ChannelMessage) -> bool {
+    steering::arrival_mode(ctx, msg)
+        == zeroclaw_config::message_arrival::MessageArrivalMode::Interrupt
 }
 
 #[derive(Clone)]
@@ -847,6 +791,9 @@ struct PendingTurn {
     /// separate from the execution permit: waiting hooks and queued lanes do
     /// not consume execution capacity, but they still retain bounded memory.
     pending_work: tokio::sync::OwnedSemaphorePermit,
+    /// Final-lane admission credit. Moving a follow-up into steering retains
+    /// this credit so draining the queue cannot widen its bounded backlog.
+    lane_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// A turn waiting for debounce resolution and post-hook routing.
@@ -1117,12 +1064,19 @@ impl IngressTaskTracker {
 /// pending messages — content and attachments included. A separate global
 /// pending-work budget bounds the aggregate across distinct conversations.
 struct ConversationLaneRegistry {
-    lanes: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Box<PendingTurn>>>>,
+    lanes: std::sync::Mutex<HashMap<String, ConversationLane>>,
     drained: tokio::sync::Notify,
     semaphore: Arc<tokio::sync::Semaphore>,
     agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     cancel: CancellationToken,
     tasks: Arc<IngressTaskTracker>,
+}
+
+/// Owns one lane's queue and admission credits. The credits remain owned by
+/// queued/offered PendingTurns until execution or retirement.
+struct ConversationLane {
+    sender: tokio::sync::mpsc::Sender<Box<PendingTurn>>,
+    pending: Arc<tokio::sync::Semaphore>,
 }
 
 /// Maximum queued turns per conversation lane, excluding the one being
@@ -1221,7 +1175,7 @@ impl ConversationLaneRegistry {
     /// can release the turn's registration and apply the drop policy instead
     /// of leaking the turn, and [`LaneAdmission::Canceled`] when the turn was
     /// canceled before admission and must be dropped without a busy notice.
-    fn enqueue(self: &Arc<Self>, key: &str, turn: Box<PendingTurn>) -> LaneAdmission {
+    fn enqueue(self: &Arc<Self>, key: &str, mut turn: Box<PendingTurn>) -> LaneAdmission {
         use tokio::sync::mpsc::error::TrySendError;
         let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
         // The cancellation check and the append are one atomic step under the
@@ -1242,13 +1196,22 @@ impl ConversationLaneRegistry {
             return LaneAdmission::Canceled(turn);
         }
         let turn = match lanes.get(key) {
-            Some(tx) => match tx.try_send(turn) {
-                Ok(()) => return LaneAdmission::Enqueued,
-                // The bounded backlog is the point: a full lane refuses the
-                // turn instead of retaining unbounded pending work.
-                Err(TrySendError::Full(returned)) => return LaneAdmission::Refused(returned),
-                Err(TrySendError::Closed(returned)) => returned,
-            },
+            Some(lane) => {
+                let Ok(credit) = Arc::clone(&lane.pending).try_acquire_owned() else {
+                    return LaneAdmission::Refused(turn);
+                };
+                turn.lane_permit = Some(credit);
+                match lane.sender.try_send(turn) {
+                    Ok(()) => return LaneAdmission::Enqueued,
+                    // The bounded backlog is the point: a full lane refuses the
+                    // turn instead of retaining unbounded pending work.
+                    Err(TrySendError::Full(returned)) => return LaneAdmission::Refused(returned),
+                    Err(TrySendError::Closed(mut returned)) => {
+                        drop(returned.lane_permit.take());
+                        returned
+                    }
+                }
+            }
             None => turn,
         };
 
@@ -1256,7 +1219,19 @@ impl ConversationLaneRegistry {
         // A closed lane can only appear here if its runner retired between the
         // lookup and now, which the registry lock prevents; re-inserting keeps
         // the invariant that a registered lane always has a live runner.
-        lanes.insert(key.to_string(), tx.clone());
+        let pending = Arc::new(tokio::sync::Semaphore::new(CONVERSATION_LANE_BACKLOG_LIMIT));
+        let Ok(credit) = Arc::clone(&pending).try_acquire_owned() else {
+            return LaneAdmission::Refused(turn);
+        };
+        let mut turn = turn;
+        turn.lane_permit = Some(credit);
+        lanes.insert(
+            key.to_string(),
+            ConversationLane {
+                sender: tx.clone(),
+                pending,
+            },
+        );
         let registry = Arc::clone(self);
         let lane_key = key.to_string();
         self.tasks.spawn(registry.run_lane(lane_key, rx));
@@ -1285,32 +1260,26 @@ impl ConversationLaneRegistry {
         key: String,
         mut rx: tokio::sync::mpsc::Receiver<Box<PendingTurn>>,
     ) {
+        let mut deferred = std::collections::VecDeque::new();
         loop {
-            let Some(turn) = self.next_slot(&key, &mut rx) else {
+            let Some(turn) = deferred
+                .pop_front()
+                .or_else(|| self.next_slot(&key, &mut rx))
+            else {
                 break;
             };
-
-            // Contain a turn panic inside its lane without spawning an
-            // unowned descendant that could outlive generation shutdown.
-            let registry = Arc::clone(&self);
-            if std::panic::AssertUnwindSafe(registry.process_turn(turn))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "Channel message worker crashed"
-                );
-            }
+            deferred.extend(steering::run_turn(Arc::clone(&self), turn, &mut rx).await);
         }
     }
 
     /// Process one post-hook turn. The caller awaits this task, so turns of
     /// one final conversation lane still run strictly one at a time.
-    async fn process_turn(self: Arc<Self>, mut turn: Box<PendingTurn>) {
+    async fn process_turn(
+        self: Arc<Self>,
+        mut turn: Box<PendingTurn>,
+        steering: Option<tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::SteeringInput>>,
+    ) {
+        drop(turn.lane_permit.take());
         // `/stop` or a superseding message may have cancelled this turn
         // while it waited in the queue; drop it before it waits for a
         // predecessor or takes an execution permit.
@@ -1360,7 +1329,14 @@ impl ConversationLaneRegistry {
         else {
             return;
         };
-        run_conversation_turn(*turn, permit, self.cancel.clone(), Arc::new(turn_lease)).await;
+        run_conversation_turn(
+            *turn,
+            permit,
+            self.cancel.clone(),
+            Arc::new(turn_lease),
+            steering,
+        )
+        .await;
     }
 
     fn reserve_turn(
@@ -4172,6 +4148,7 @@ fn resync_history_after_trim(
     prior_turns_len_before_loop: usize,
     known_prefix: &[ChatMessage],
     outgoing_user_turn_raw_content: Option<&str>,
+    outgoing_user_turn_rendering: Option<&str>,
 ) {
     let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
     let retained_prior_turns = if last_user_idx >= 1 {
@@ -4180,8 +4157,27 @@ fn resync_history_after_trim(
         &history[1..1]
     };
 
+    let initial_timestamp = known_prefix.last().and_then(|message| message.timestamp);
+    let users_unchanged = retained_prior_turns
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| {
+            let text = if message.timestamp == initial_timestamp
+                && Some(message.content.as_str()) == outgoing_user_turn_rendering
+            {
+                outgoing_user_turn_raw_content.unwrap_or(&message.content)
+            } else {
+                &message.content
+            };
+            (message.timestamp, text)
+        })
+        .eq(known_prefix
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| (message.timestamp, message.content.as_str())));
     if history_has_trim_breadcrumb == crumb_present_before_loop
         && retained_prior_turns.len() == prior_turns_len_before_loop
+        && users_unchanged
     {
         // Serialize with the trim publication path (`resync_sender_history_after_trim`
         // holds this same lock while publishing the cache plus `history_crumb_flags`
@@ -4219,10 +4215,24 @@ fn resync_history_after_trim(
         return;
     }
 
-    let clean_retained_turns = strip_volatile_preamble_before_persist(
-        retained_prior_turns,
-        outgoing_user_turn_raw_content,
-    );
+    // A steering input can now be the last user message. Restore the
+    // initiating message by its existing timestamp, never overwrite that
+    // later follow-up with the initiating message's raw content.
+    let clean_retained_turns = if let (Some(raw), Some(initial)) =
+        (outgoing_user_turn_raw_content, known_prefix.last())
+    {
+        let mut cleaned = retained_prior_turns.to_vec();
+        if let Some(message) = cleaned.iter_mut().find(|message| {
+            message.role == "user"
+                && message.timestamp == initial.timestamp
+                && Some(message.content.as_str()) == outgoing_user_turn_rendering
+        }) {
+            message.content = raw.to_owned();
+        }
+        cleaned
+    } else {
+        strip_volatile_preamble_before_persist(retained_prior_turns, outgoing_user_turn_raw_content)
+    };
     resync_sender_history_after_trim(
         ctx,
         sender_key,
@@ -8195,6 +8205,7 @@ async fn process_channel_message(
         cancellation_token,
         delivery_message_id,
         None,
+        None,
     )
     .await;
 }
@@ -8205,6 +8216,7 @@ async fn process_channel_message_with_delivery_id(
     cancellation_token: CancellationToken,
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
+    steering: Option<tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::SteeringInput>>,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -8232,6 +8244,7 @@ async fn process_channel_message_with_delivery_id(
                 composite_for_body,
                 delivery_message_id,
                 turn_lease,
+                steering,
             ))
             .await;
         }
@@ -9080,6 +9093,7 @@ async fn process_channel_message_body(
     channel_composite: String,
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
+    steering: Option<tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::SteeringInput>>,
 ) {
     if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg)
         && (channel.drop_self_messages(&msg)
@@ -9162,6 +9176,7 @@ async fn process_channel_message_body(
                     recovered_message_id.clone(),
                     turn_lease.clone(),
                     Some(recovered_port.clone()),
+                    None,
                 ));
                 zeroclaw_log::scope!(
                     category: "channel",
@@ -9197,6 +9212,7 @@ async fn process_channel_message_body(
             delivery_message_id,
             turn_lease,
             native.clone(),
+            steering,
         ));
         match (native, input) {
             (Some(port), Some(input)) => port.execute(input, engine).await,
@@ -9211,6 +9227,8 @@ async fn process_channel_message_body(
     }
 }
 
+// Keep the execution lease and optional steering receiver explicit at the turn boundary.
+#[allow(clippy::too_many_arguments)]
 async fn process_channel_message_body_inner(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -9219,6 +9237,7 @@ async fn process_channel_message_body_inner(
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
     native_history: Option<Arc<dyn zeroclaw_api::session_events::capture::SessionExecutionPort>>,
+    mut steering: Option<tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::SteeringInput>>,
 ) -> anyhow::Result<String> {
     ::zeroclaw_log::record!(
         INFO,
@@ -10623,7 +10642,7 @@ async fn process_channel_message_body_inner(
                     .as_ref()
                     .map(|_| tool_receipts_collector.as_ref()),
                 event_tx: None,
-                steering: None,
+                steering: steering.as_mut(),
                 new_messages_out: None,
                 image_cache: None,
                 memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
@@ -10931,6 +10950,9 @@ async fn process_channel_message_body_inner(
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
     // `Drop` path supplies the same matched end on panic or early unwind.
+    let outgoing_user_rendering = outgoing_user_turn_raw_content
+        .as_deref()
+        .map(|raw| compose_outgoing_user_turn_with_context(&preamble, raw));
     resync_history_after_trim(
         ctx.as_ref(),
         &history_key,
@@ -10940,6 +10962,7 @@ async fn process_channel_message_body_inner(
         prior_turns_len_before_loop,
         &known_prefix,
         outgoing_user_turn_raw_content.as_deref(),
+        outgoing_user_rendering.as_deref(),
     );
 
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
@@ -11905,6 +11928,11 @@ async fn register_inbound_turn(
         let mut active = in_flight.lock().unwrap_or_else(|e| e.into_inner());
         let states = active.entry(scope_key.clone()).or_default();
         let previous = states.last().cloned();
+        if interrupt_enabled {
+            for state in states.iter() {
+                state.cancellation.cancel();
+            }
+        }
         // With interruption enabled this registration supersedes `previous`,
         // and its own successor must inherit a completion dependency on every
         // unfinished turn of that chain, not only on this one: a canceled
@@ -11917,8 +11945,15 @@ async fn register_inbound_turn(
         let superseded_completions = match (interrupt_enabled, previous.as_ref()) {
             (true, Some(previous)) => {
                 let mut chain = previous.superseded_completions.clone();
+                for state in states.iter() {
+                    if !chain
+                        .iter()
+                        .any(|done| Arc::ptr_eq(done, &state.completion))
+                    {
+                        chain.push(Arc::clone(&state.completion));
+                    }
+                }
                 chain.retain(|superseded| !superseded.is_done());
-                chain.push(Arc::clone(&previous.completion));
                 chain
             }
             _ => Vec::new(),
@@ -11998,6 +12033,7 @@ async fn run_conversation_turn(
     permit: tokio::sync::OwnedSemaphorePermit,
     generation_cancel: CancellationToken,
     turn_lease: Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>,
+    steering: Option<tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::SteeringInput>>,
 ) {
     let PendingTurn {
         ctx,
@@ -12017,6 +12053,7 @@ async fn run_conversation_turn(
             generation_cancel,
             delivery_message_id,
             Some(Arc::clone(&turn_lease)),
+            steering,
         )
         .await;
         dispatch_ownership.release();
@@ -12041,6 +12078,7 @@ async fn run_conversation_turn(
         registration.cancellation.clone(),
         delivery_message_id,
         Some(Arc::clone(&turn_lease)),
+        steering,
     )
     .await;
     drop(registration);
@@ -12769,7 +12807,9 @@ async fn run_message_dispatch_loop_until_cancelled(
         // ordinary observations never cancel a live turn or answer in the room.
         let transport_interrupt =
             msg.control == Some(zeroclaw_api::channel::ChannelControl::Interrupt);
-        if (transport_interrupt && interrupt_on_new_message_enabled(&ctx, &msg))
+        if (transport_interrupt
+            && steering::arrival_mode(&ctx, &msg)
+                != zeroclaw_config::message_arrival::MessageArrivalMode::Queue)
             || (msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content))
         {
             let scope_key = interruption_scope_key(&msg);
@@ -13044,6 +13084,7 @@ async fn run_message_dispatch_loop_until_cancelled(
                     let source_key = conversation_history_key(&msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
+                            lane_permit: None,
                             agent_generation: router
                                 .turn_generations
                                 .get(ctx.agent_alias.as_str())
@@ -13116,6 +13157,7 @@ async fn run_message_dispatch_loop_until_cancelled(
             Arc::clone(&notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
+                    lane_permit: None,
                     agent_generation: router
                         .turn_generations
                         .get(ctx.agent_alias.as_str())
@@ -18660,6 +18702,7 @@ fn stale_no_trim_completion_does_not_overwrite_a_newer_trims_flag() {
         prior_len_a,
         &known_prefix_a,
         None,
+        None,
     );
     assert_eq!(
         ctx.history_crumb_flags
@@ -19221,6 +19264,7 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    include!("steering_tests.rs");
 
     fn structured_tool_result(content: impl Into<String>) -> ChatMessage {
         ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
@@ -33506,6 +33550,7 @@ for await (const line of createInterface({input:process.stdin})) {
             "default".to_string(),
             zeroclaw_config::schema::SlackConfig {
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -34229,6 +34274,7 @@ for await (const line of createInterface({input:process.stdin})) {
             "default".to_string(),
             zeroclaw_config::schema::SlackConfig {
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -35265,6 +35311,7 @@ for await (const line of createInterface({input:process.stdin})) {
             zeroclaw_config::schema::WhatsAppConfig {
                 session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -35273,6 +35320,7 @@ for await (const line of createInterface({input:process.stdin})) {
             zeroclaw_config::schema::WhatsAppConfig {
                 session_path: Some("/tmp/zeroclaw-whatsapp-disabled-session.db".into()),
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -39507,6 +39555,7 @@ for await (const line of createInterface({input:process.stdin})) {
             "default".into(),
             zeroclaw_config::schema::TelegramConfig {
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -39729,6 +39778,7 @@ for await (const line of createInterface({input:process.stdin})) {
             "default".into(),
             zeroclaw_config::schema::TelegramConfig {
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -40314,6 +40364,7 @@ for await (const line of createInterface({input:process.stdin})) {
         let msg = shared_topic_message("alice", "m1", "canceled during admission");
         let delivery_message_id = msg.id.clone();
         let turn = Box::new(PendingTurn {
+            lane_permit: None,
             ctx,
             agent_generation: 0,
             msg,
@@ -40378,6 +40429,7 @@ for await (const line of createInterface({input:process.stdin})) {
             ack
         };
         let turn = Box::new(PendingTurn {
+            lane_permit: None,
             ctx: Arc::clone(&ctx),
             agent_generation: generation,
             msg,
@@ -41469,6 +41521,7 @@ for await (const line of createInterface({input:process.stdin})) {
             "default".into(),
             zeroclaw_config::schema::TelegramConfig {
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -41871,6 +41924,7 @@ for await (const line of createInterface({input:process.stdin})) {
             "default".into(),
             zeroclaw_config::schema::TelegramConfig {
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -44923,6 +44977,7 @@ for await (const line of createInterface({input:process.stdin})) {
         let pending_work = Arc::clone(&pending_budget).acquire_owned().await.unwrap();
         let delivery_message_id = selection.id.clone();
         let turn = Box::new(PendingTurn {
+            lane_permit: None,
             ctx: Arc::clone(&runtime_ctx),
             agent_generation: 0,
             msg: selection.clone(),
@@ -44936,7 +44991,7 @@ for await (const line of createInterface({input:process.stdin})) {
             zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default(),
             CancellationToken::new(),
         );
-        let worker = zeroclaw_spawn::spawn!(Arc::clone(&lanes).process_turn(turn));
+        let worker = zeroclaw_spawn::spawn!(Arc::clone(&lanes).process_turn(turn, None));
 
         // A newer message interrupts this turn while its predecessor is still
         // pending; only then does the predecessor finish.
@@ -48693,6 +48748,7 @@ This is an example JSON object for profile settings."#;
                 thread_replies: Some(true),
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 proxy_url: None,
                 listen_mode: zeroclaw_config::schema::MattermostListenMode::default(),
                 excluded_tools: vec![],
@@ -48744,6 +48800,7 @@ This is an example JSON object for profile settings."#;
                 thread_replies: Some(true),
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 proxy_url: None,
                 listen_mode: zeroclaw_config::schema::MattermostListenMode::default(),
                 excluded_tools: vec![],
@@ -53117,6 +53174,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 mention_only: false,
                 unauthorized_message: None,
                 per_user_session: true,
@@ -53151,6 +53209,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 mention_only: false,
                 unauthorized_message: None,
                 per_user_session: true,
@@ -53675,6 +53734,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::WhatsAppConfig {
                 session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -53697,6 +53757,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::WhatsAppConfig {
                 session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
                 interrupt_on_new_message: true,
+                message_arrival: None,
                 ..Default::default()
             },
         );
@@ -53715,6 +53776,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::WhatsAppConfig {
                 session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
                 interrupt_on_new_message: false,
+                message_arrival: None,
                 ..Default::default()
             },
         );

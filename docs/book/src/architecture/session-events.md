@@ -99,6 +99,20 @@ Gateway HTTP and WebSocket history use this same source. They do not maintain
 a legacy backend handle, transcript watermark or post-turn transcript rewrite.
 Legacy backend factories are available only to explicit test fixtures.
 
+## Steering input capture
+
+Channel steering uses the active foreground turn's native capture port. A
+`ControlInputRecorded` event preserves the follow-up's own ingress envelope,
+and a causally linked `UserContentRecorded` event preserves its literal text.
+They append atomically before the next model request. This does not create
+another engine execution or reacquire the foreground lane. The runtime checks
+live admission again after the awaited capture before injecting the message.
+Transport identities make capture idempotent; conflicting content or turn
+association fails rather than silently replacing the archived input. Native
+history reads therefore retain steering messages independently of context
+projection and summary-deck rotation. Attachment-bearing inputs keep their
+ordinary channel admission and file-registration path.
+
 ## Execution and recovery
 
 The coordinator commits input and turn admission before polling the supplied

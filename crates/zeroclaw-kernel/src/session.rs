@@ -14,6 +14,7 @@ mod children;
 mod context;
 mod context_messages;
 mod context_summary;
+mod steering_capture;
 pub mod summary_deck;
 pub use context::ContextMaintenanceCommand;
 mod authority;

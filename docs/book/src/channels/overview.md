@@ -20,6 +20,49 @@ cargo build --no-default-features --features "agent-runtime,gateway,channel-slac
 
 </div>
 
+## Messages during an active turn
+
+Telegram, Discord, Slack, Mattermost, Matrix, WhatsApp and SimpleX support an
+optional `message_arrival` setting on each channel alias:
+
+```toml
+[channels.telegram.assistant]
+message_arrival = "steer"
+```
+
+| Mode | Follow-up behavior |
+|---|---|
+| `queue` | Finish the active turn, then process each message as a separate turn. |
+| `interrupt` | Cancel the active turn and start another for the newer message. |
+| `steer` | Finish the current tool round, then include the follow-up before the next model request. |
+
+When this setting is absent, `interrupt_on_new_message = false` still means
+queue and `true` still means interrupt. An explicit `message_arrival` takes
+precedence; existing configurations require no migration.
+
+Steering retains the current turn's completed tool results and follows that turn's
+reply route and output modality. It applies only to
+addressed text or transcribed voice notes from the same sender, agent, reply
+target and thread. Each input carries its own ingress identity and is checked
+against current channel authorization when consumed. Messages requiring
+attachment processing, URL enrichment, SOP dispatch or runtime commands keep
+their ordinary queued lifecycle. A shared main session does not let another
+sender or transport steer a turn through a different connection.
+
+Native sessions archive each admitted steering input and its own ingress facts
+before the next provider request; rolling context is a separate projection.
+Repeated transport identities are recorded and injected once.
+
+The lane retains each follow-up until consumption. If the active turn ends
+without another model round, the follow-up runs as a normal turn instead of
+being discarded. Both lane backlog and aggregate pending work remain bounded.
+`/stop` cancels active and queued work in the sender's scope in every mode.
+Live-call speech-start interruption still stops playback and the prior turn
+promptly in steer mode; voice notes wait for download and transcription first.
+
+This setting controls channel dispatch. It does not change the web dashboard,
+basic CLI input loop or ZeroCode's message queue.
+
 ## Categories
 
 ### Chat platforms

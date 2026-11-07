@@ -43,6 +43,7 @@ pub struct SteeringInput {
     message: zeroclaw_api::model_provider::ChatMessage,
     admit: Option<SteeringAdmit>,
     ingress: Option<IngressContext>,
+    settlement: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl SteeringInput {
@@ -54,6 +55,7 @@ impl SteeringInput {
             message: message.into(),
             admit: None,
             ingress: None,
+            settlement: None,
         }
     }
 
@@ -66,6 +68,7 @@ impl SteeringInput {
             message: message.into(),
             admit: Some(admit),
             ingress: None,
+            settlement: None,
         }
     }
 
@@ -79,6 +82,21 @@ impl SteeringInput {
 
     pub fn ingress(&self) -> Option<&IngressContext> {
         self.ingress.as_ref()
+    }
+
+    /// Notify the caller only once this input was consumed or deliberately
+    /// discarded. Admission alone does not transfer ownership: an awaited
+    /// history write may still fail or be cancelled.
+    #[must_use]
+    pub fn with_settlement(mut self, settlement: Box<dyn Fn() + Send + Sync>) -> Self {
+        self.settlement = Some(settlement);
+        self
+    }
+
+    pub fn settle(&self) {
+        if let Some(settlement) = &self.settlement {
+            settlement();
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -98,6 +116,7 @@ impl SteeringInput {
     }
 
     pub fn into_message(self) -> zeroclaw_api::model_provider::ChatMessage {
+        self.settle();
         self.message
     }
 }
@@ -148,6 +167,23 @@ mod tests {
             SteeringInput::new("hi").admit(),
             SteeringAdmission::Admitted(SteeringPosture::default())
         );
+    }
+
+    #[test]
+    fn admission_does_not_settle_input_before_persistence_and_consumption() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let consumed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&consumed);
+        let input = SteeringInput::new("follow-up").with_settlement(Box::new(move || {
+            flag.store(true, Ordering::Release);
+        }));
+        assert!(matches!(input.admit(), SteeringAdmission::Admitted(_)));
+        assert!(!consumed.load(Ordering::Acquire));
+        assert_eq!(input.into_message().content, "follow-up");
+        assert!(consumed.load(Ordering::Acquire));
     }
 
     #[test]
