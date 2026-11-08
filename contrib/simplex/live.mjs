@@ -121,9 +121,12 @@ export class LiveTexts {
   async recover(contact, id, interrupted, placeholders) {
     const key = `${contact}/${id}`, item = this.orphans.get(key);
     if (!item) throw Object.assign(Error('simplex_live_recovery_scope_missing'),{notDelivered:true});
-    const draft = {contact:String(contact),items:[{...item,live:true}]};
-    const text = placeholders.includes(item.text) ? '' : `${item.text}\n\n${interrupted}`;
-    await this.write(draft,text,false);
+    const draft = {contact:String(contact)};
+    // This text came from the CLI and is already in SimpleX's syntax. Do not
+    // interpret it as Markdown a second time during reconnect cleanup.
+    if (placeholders.includes(item.text))
+      await this.rpc(`/_delete item @${contact} ${id} broadcast`);
+    else await this.edit(draft,{...item,live:true},`${item.text}\n\n${interrupted}`,false);
     this.orphans.delete(key);
   }
 }

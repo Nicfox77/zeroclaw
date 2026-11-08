@@ -106,7 +106,7 @@ test('reconnect discovery only emits sent live item metadata; recovery requires 
     if(cmd==='/u')return {type:'activeUser',user:{userId:1}};
     if(cmd.startsWith('/_get chats'))return {chats:[{chatInfo:{type:'direct',contact:{contactId:17}}}]};
     if(cmd.startsWith('/_get chat'))return {chat:{chatItems:[
-      {meta:{itemId:42,itemLive:true,createdAt:new Date(now).toISOString()},chatDir:{type:'directSnd'},content:{type:'sndMsgContent',msgContent:{type:'text',text:'Partial'}}},
+      {meta:{itemId:42,itemLive:true,createdAt:new Date(now).toISOString()},chatDir:{type:'directSnd'},content:{type:'sndMsgContent',msgContent:{type:'text',text:'*Bold* _italic_'}}},
       {meta:{itemId:43,itemLive:true,createdAt:new Date(now).toISOString()},chatDir:{type:'directRcv'},content:{type:'rcvMsgContent',msgContent:{type:'text',text:'Untrusted'}}},
     ]}};
     response=cmd;return {type:'chatItemUpdated'};
@@ -117,5 +117,5 @@ test('reconnect discovery only emits sent live item metadata; recovery requires 
   await assert.rejects(live.recover('18',42,'[Interrupted]',[]));
   await live.recover('17',42,'[Interrupted]',[]);
   assert(response.startsWith('/_update item @17 42 json '));
-  assert.equal(JSON.parse(response.split(' json ')[1]).msgContent.text,'Partial\n\n[Interrupted]');
+  assert.equal(JSON.parse(response.split(' json ')[1]).msgContent.text,'*Bold* _italic_\n\n[Interrupted]');
 });
