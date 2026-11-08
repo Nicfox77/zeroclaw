@@ -15801,7 +15801,8 @@ pub struct CronJobDecl {
     /// Defaults to `true`; set to `false` for stateless digest jobs.
     #[serde(default = "default_true")]
     pub uses_memory: bool,
-    /// Session target: `"isolated"` (default) or `"main"`.
+    /// Session target: `"isolated"` or `"main"`. Agent jobs default to `"main"`
+    /// when the owning agent enables main_session, otherwise `"isolated"`.
     #[serde(default)]
     pub session_target: Option<String>,
     /// Delivery configuration.

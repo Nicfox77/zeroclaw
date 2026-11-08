@@ -1770,6 +1770,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_target': 'Session Target',
     'cron.session_isolated': 'Isolated',
     'cron.session_main': 'Main',
+    'cron.session_default': 'Agent default',
+    'cron.session_default_hint': 'Uses the shared main conversation when enabled for this agent; otherwise starts an isolated run.',
     'cron.allowed_tools_optional': 'Allowed Tools (optional)',
     'cron.allowed_tools_placeholder': 'e.g. shell, file_read, memory_store',
     'cron.uses_memory': 'Use Memory',

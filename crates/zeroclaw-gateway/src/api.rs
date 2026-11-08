@@ -131,10 +131,10 @@ pub struct CronAddBody {
     pub job_type: Option<String>,
     pub prompt: Option<String>,
     pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
-    /// Agent session context: `"isolated"` (default) or `"main"`. For agent jobs,
-    /// a present value that is not one of those two names is rejected; omitted
-    /// keeps the isolated default. Same contract as the `cron_add` tool. Shell
-    /// jobs ignore this field.
+    /// Agent session context: `"isolated"` or `"main"`. Omitted selects main
+    /// when the owning agent enables its shared main conversation, otherwise
+    /// isolated. Invalid names are rejected. Same contract as `cron_add`;
+    /// shell jobs ignore this field.
     pub session_target: Option<String>,
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
@@ -555,7 +555,7 @@ pub async fn handle_api_cron_add(
                 Ok(target) => target,
                 Err(e) => return bad_request(e).into_response(),
             },
-            None => zeroclaw_runtime::cron::SessionTarget::Isolated,
+            None => zeroclaw_runtime::cron::SessionTarget::default_for_agent(&config, &agent_alias),
         };
 
         let default_delete = matches!(schedule, zeroclaw_runtime::cron::Schedule::At { .. });
@@ -3832,6 +3832,42 @@ pub(crate) mod tests {
             jobs[0].session_target,
             zeroclaw_runtime::cron::SessionTarget::Isolated
         );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_defaults_follow_shared_main_and_allow_explicit_isolation() {
+        for explicit in [None, Some("isolated"), Some("main")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = with_test_agent(zeroclaw_config::schema::Config {
+                data_dir: tmp.path().join("data"),
+                config_path: tmp.path().join("config.toml"),
+                ..Default::default()
+            });
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            config
+                .agents
+                .get_mut("test-agent")
+                .unwrap()
+                .main_session
+                .enabled = true;
+            let state = test_state(config);
+            let mut body = serde_json::json!({
+                "agent":"test-agent", "schedule":"*/5 * * * *", "prompt":"fixture turn"
+            });
+            if let Some(target) = explicit {
+                body["session_target"] = serde_json::json!(target);
+            }
+            let response = handle_api_cron_add(
+                State(state),
+                HeaderMap::new(),
+                Json(serde_json::from_value::<CronAddBody>(body).unwrap()),
+            )
+            .await
+            .into_response();
+            let value = response_json(response).await;
+            assert_eq!(value["status"], "ok", "{value}");
+            assert_eq!(value["job"]["session_target"], explicit.unwrap_or("main"));
+        }
     }
 
     #[tokio::test]

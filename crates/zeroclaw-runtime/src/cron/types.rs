@@ -64,6 +64,19 @@ pub enum SessionTarget {
 }
 
 impl SessionTarget {
+    /// New conversational jobs follow the agent's explicit shared-history policy.
+    /// Stored targets and explicitly isolated jobs retain their own selection.
+    pub fn default_for_agent(config: &zeroclaw_config::schema::Config, agent: &str) -> Self {
+        if config
+            .agent(agent)
+            .is_some_and(|agent| agent.main_session.enabled)
+        {
+            Self::Main
+        } else {
+            Self::Isolated
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Isolated => "isolated",

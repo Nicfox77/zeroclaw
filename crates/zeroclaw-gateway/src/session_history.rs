@@ -146,10 +146,15 @@ pub(crate) async fn recover_pending(
     let (alias, provider, model) = agent.attribution_fields();
     for mut input in port.pending_inputs(provider, model).await? {
         if family == zeroclaw_config::main_session::session_id(&alias)
-            && matches!(
+            && (matches!(
                 input.ingress.transport,
                 zeroclaw_api::ingress::Transport::Channel { .. }
-            )
+            ) || (input.agent_alias.as_deref() == Some(&alias)
+                && input.ingress.origin == zeroclaw_api::ingress::TurnOrigin::Cron
+                && matches!(
+                    input.ingress.internal_principal,
+                    Some(zeroclaw_api::ingress::InternalPrincipal::Cron { .. })
+                )))
         {
             continue;
         }
