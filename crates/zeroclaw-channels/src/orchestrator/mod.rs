@@ -6455,14 +6455,29 @@ async fn run_draft_updater_with_leak_detection(
                 // retaining the raw accumulation here could reintroduce a
                 // protocol payload during finalization.
                 *streamed_text.lock().unwrap_or_else(|e| e.into_inner()) = visible.clone();
-                if let Err(e) = session_history::observe_delivery(
-                    "update_draft",
-                    channel.name(),
-                    &reply_target,
-                    &visible,
-                    channel.update_draft(&reply_target, &draft_id, &visible),
-                )
-                .await
+                // Text previews cross the same outbound boundary as speculative
+                // speech. Hooks must decide before either exposes model text.
+                // Explicitly routed replies also withhold origin-chat previews.
+                let preview_route = turn_routing.as_ref().is_none_or(|routing| {
+                    let routes = routing.lock().unwrap_or_else(|error| error.into_inner());
+                    routes.last().is_none_or(|route| {
+                        route.channel.as_deref().is_none_or(str::is_empty)
+                            && route
+                                .recipient
+                                .as_deref()
+                                .is_none_or(|recipient| recipient == reply_target)
+                    })
+                });
+                if outbound_hooks.is_none()
+                    && preview_route
+                    && let Err(e) = session_history::observe_delivery(
+                        "update_draft",
+                        channel.name(),
+                        &reply_target,
+                        &visible,
+                        channel.update_draft(&reply_target, &draft_id, &visible),
+                    )
+                    .await
                 {
                     ::zeroclaw_log::record!(
                         DEBUG,
@@ -55625,6 +55640,10 @@ Done."#;
             }
 
             if hooks_enabled {
+                assert!(
+                    recording.draft_updates.lock().await.is_empty(),
+                    "outbound hooks must decide before text previews leave the process"
+                );
                 assert!(
                     prepared.is_empty(),
                     "outbound hooks must decide before TTS receives text"
