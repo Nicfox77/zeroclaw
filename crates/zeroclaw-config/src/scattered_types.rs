@@ -573,6 +573,11 @@ pub struct EmailConfig {
     /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
+    /// Permit `email_draft` to append unsent messages to this mailbox's
+    /// server-designated Drafts folder. This creates draft-write authority;
+    /// it does not enable SMTP or an inbound listener. Default: false.
+    #[serde(default)]
+    pub allow_drafts: bool,
     pub imap_host: String,
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
@@ -642,6 +647,7 @@ impl Default for EmailConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_drafts: false,
             imap_host: String::new(),
             imap_port: default_imap_port(),
             imap_folder: default_imap_folder(),
@@ -692,6 +698,12 @@ pub(crate) enum OutboundSmtp {
 }
 
 impl EmailConfig {
+    /// Canonical permission for the optional draft writer. Observer mailboxes
+    /// remain immutable even if draft permission was accidentally also set.
+    pub fn can_save_drafts(&self) -> bool {
+        self.enabled && self.allow_drafts && !self.observer_mode
+    }
+
     /// Whether this alias can send mail.
     ///
     /// The canonical answer to "is outbound configured": `EmailChannel` gates

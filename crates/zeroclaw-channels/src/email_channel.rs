@@ -1380,6 +1380,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            allow_drafts: false,
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -1410,6 +1411,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            allow_drafts: false,
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -1439,6 +1441,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            allow_drafts: false,
         }
     }
 
@@ -2236,6 +2239,7 @@ mod tests {
             html_body: true,
             oauth2: None,
             observer_mode: false,
+            allow_drafts: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();

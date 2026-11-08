@@ -107,7 +107,7 @@ replacement surface exists. Until then, keep them compatible and policy-visible.
 |---|---|---|
 | `notion`, `jira`, `microsoft365`, `google_workspace`, `linkedin`, `composio` | Plugin, MCP server, or CLI-backed integration. | These mostly wrap third-party products and authentication models that can evolve independently from the core runtime. |
 | `claude_code`, `claude_code_runner`, `codex_cli`, `gemini_cli`, `opencode_cli` | CLI-backed integration or skill package. | The external CLI already owns authentication, command behavior, and release cadence; ZeroClaw should preserve receipts and policy if it invokes them. |
-| `email_search`, `email_read` | Channel companion plugin or MCP server. | Email search/read is useful but tied to external account auth and channel setup rather than the baseline agent contract. |
+| `email_search`, `email_read`, `email_draft` | Channel companion plugin or MCP server. | Email access is tied to external account auth and channel setup rather than the baseline agent contract. Draft saving additionally requires an explicit mailbox write grant. |
 | `discord_search` | Channel companion plugin or archive-query skill. | It depends on a Discord archive database produced by the channel; keep it close to that channel until the archive API is explicit. |
 | `image_gen`, `cloud_ops`, `cloud_patterns`, `project_intel`, `report_template` | Skill package, plugin, or MCP server. | These are optional workflows or vendor/data-service wrappers rather than core execution primitives. |
 | `weather` | Skill package or HTTP-backed skill; later plugin or MCP server if parity needs custom formatting or policy. | The current built-in is a no-key `wttr.in` wrapper. A minimal lookup fits the HTTP skill shape, but full externalization still needs parity for formatted output, the `tool.weather` proxy policy, and the built-in tool name / auto-approve behavior. |
@@ -241,7 +241,7 @@ application-owned tool source and for an optional-tools feature (proposed as
 | Coding runner | `claude_code_runner` | No |
 | Ops | `backup`, `data_management`, `cloud_ops`, `cloud_patterns` | `backup` yes; the others no |
 | Media and transfer | `image_gen`, `file_upload`, `file_upload_bundle` | No |
-| Channel companions | `discord_search`, `email_search`, `email_read` | No |
+| Channel companions | `discord_search`, `email_search`, `email_read`, `email_draft` | No |
 | Knowledge | `knowledge` | No |
 
 Registration on a default config follows the config defaults:

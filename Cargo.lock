@@ -14696,6 +14696,7 @@ dependencies = [
  "glob",
  "hex",
  "infer",
+ "lettre",
  "libc",
  "mail-parser",
  "nanohtml2text",
