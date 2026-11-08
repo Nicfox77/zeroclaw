@@ -578,6 +578,10 @@ impl SimplexChannel {
             return Ok(());
         }
         if matches!(kind, "interrupted" | "call_ended") {
+            // Deliver interruption control before waiting for text cleanup ACKs.
+            // A slow platform edit must never delay cancellation of the model.
+            self.playback_observation(&event, tx, kind == "interrupted")
+                .await?;
             // The reader cancels speech immediately. Settle text here, where
             // awaiting an edit ACK cannot block the reader that receives it.
             let call_id = event["call_id"].as_str().unwrap_or("");
@@ -596,7 +600,7 @@ impl SimplexChannel {
             }
         }
         if kind == "interrupted" {
-            return self.playback_observation(&event, tx, true).await;
+            return Ok(());
         }
         if kind == "call_audio" {
             let call = event["call_id"]
@@ -633,7 +637,6 @@ impl SimplexChannel {
             if let Some(call) = event["call_id"].as_str() {
                 self.inner.recognition.lock().remove(call);
             }
-            self.playback_observation(&event, tx, false).await?;
             let prefix = format!("{}/", event["call_id"].as_str().unwrap_or(""));
             self.inner
                 .transcripts
@@ -1709,6 +1712,62 @@ mod tests {
         assert_eq!(values.lock().len(), before);
         assert!(!values.lock().iter().any(|value| value["type"] == "send"));
         worker.abort();
+    }
+    #[tokio::test]
+    async fn call_interruption_reaches_dispatch_before_live_text_cleanup_ack() {
+        let (channel, _) = fixture();
+        let (_, worker) = record_bridge(&channel);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17").in_thread("call/old"))
+            .await
+            .unwrap()
+            .unwrap();
+        let (writer, mut requests) = mpsc::channel::<Value>(2);
+        *channel.inner.writer.lock() = Some(writer);
+        let (tx, mut input) = mpsc::channel(2);
+        let copy = channel.clone();
+        let event = zeroclaw_spawn::spawn!(async move {
+            copy.event(
+                json!({"type":"interrupted","contact":"17","call_id":"call",
+                "scope":"call/next","playback":{"interrupted":false}}),
+                &tx,
+            )
+            .await
+        });
+        let cancel = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancel["type"], "live_cancel");
+        // The platform edit is still in flight; dispatch must already know.
+        assert_eq!(
+            input.try_recv().unwrap().control,
+            Some(ChannelControl::Interrupt)
+        );
+        channel
+            .inner
+            .pending
+            .lock()
+            .remove(cancel["id"].as_str().unwrap())
+            .unwrap()
+            .send(json!({"ok":true}))
+            .unwrap();
+        let audio = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(audio["type"], "stop_audio");
+        channel
+            .inner
+            .pending
+            .lock()
+            .remove(audio["id"].as_str().unwrap())
+            .unwrap()
+            .send(json!({"ok":true}))
+            .unwrap();
+        event.await.unwrap().unwrap();
+        worker.abort();
+        assert!(!channel.inner.drafts.lock().contains_key(&id));
     }
     #[tokio::test]
     async fn live_text_rechecks_permission_when_coalesced_frame_reaches_delivery() {
