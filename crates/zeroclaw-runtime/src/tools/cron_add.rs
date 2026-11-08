@@ -13,6 +13,8 @@ use zeroclaw_config::schema::Config;
 
 pub struct CronAddTool {
     config: Arc<Config>,
+    /// Reference to the canonical published config; no copied session policy.
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — the alias of the agent whose tool loop registered
@@ -30,10 +32,19 @@ impl CronAddTool {
     ) -> Self {
         Self {
             config,
+            live_config: None,
             security,
             runtime,
             agent_alias: agent_alias.into(),
         }
+    }
+
+    pub fn with_live_config(
+        mut self,
+        live: Option<zeroclaw_config::live::LiveConfigHandle>,
+    ) -> Self {
+        self.live_config = live;
+        self
     }
 
     #[cfg(test)]
@@ -265,7 +276,7 @@ impl Tool for CronAddTool {
                 "session_target": {
                     "type": "string",
                     "enum": ["isolated", "main"],
-                    "description": "Agent session context: 'isolated' starts a fresh session each run, 'main' reuses the primary session"
+                    "description": crate::i18n::get_required_cli_string("tool-cron-session-target")
                 },
                 "model": {
                     "type": "string",
@@ -497,7 +508,12 @@ impl Tool for CronAddTool {
                             });
                         }
                     },
-                    None => SessionTarget::Isolated,
+                    None => match self.live_config.as_ref() {
+                        Some(live) => {
+                            SessionTarget::default_for_agent(&live.read(), &self.agent_alias)
+                        }
+                        None => SessionTarget::default_for_agent(&self.config, &self.agent_alias),
+                    },
                 };
 
                 let model = args
@@ -615,6 +631,71 @@ mod tests {
                 runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_jobs_default_to_shared_main_but_preserve_explicit_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp).await;
+        Arc::make_mut(&mut cfg)
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .main_session
+            .enabled = true;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        for explicit in [None, Some("isolated"), Some("main")] {
+            let mut args = json!({
+                "schedule": {"kind":"every", "every_ms":60_000},
+                "job_type":"agent", "prompt":"fixture scheduled turn"
+            });
+            if let Some(target) = explicit {
+                args["session_target"] = json!(target);
+            }
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let value: Value = serde_json::from_str(&result.output.to_string()).unwrap();
+            assert_eq!(value["session_target"], explicit.unwrap_or("main"));
+        }
+    }
+
+    #[tokio::test]
+    async fn held_cron_add_resolves_default_from_current_published_config() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let live = zeroclaw_config::live::LiveConfig::new((*cfg).clone());
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT)
+            .with_live_config(Some(live.handle()));
+        for enabled in [true, false, true] {
+            let mut current = live.snapshot();
+            current
+                .agents
+                .get_mut(TEST_AGENT)
+                .unwrap()
+                .main_session
+                .enabled = enabled;
+            live.publish(live.next_revision().unwrap(), current)
+                .unwrap();
+            let result = tool
+                .execute(json!({
+                    "schedule":{"kind":"every","every_ms":60_000},
+                    "job_type":"agent", "prompt":"fixture scheduled turn"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let value: Value = serde_json::from_str(&result.output.to_string()).unwrap();
+            assert_eq!(
+                value["session_target"],
+                if enabled { "main" } else { "isolated" }
+            );
+        }
+        assert!(
+            tool.parameters_schema()["properties"]["session_target"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("defaults to main")
         );
     }
 

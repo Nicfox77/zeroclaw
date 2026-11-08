@@ -1884,6 +1884,10 @@ pub fn sync_declarative_jobs(
                 Some(raw) => SessionTarget::try_parse(raw).map_err(|err| {
                     anyhow::Error::msg(format!("Declarative cron job '{id}': {err}"))
                 })?,
+                None if job_type == "agent" => config
+                    .agent_for_cron_job(id)
+                    .map(|agent| SessionTarget::default_for_agent(config, agent))
+                    .unwrap_or_default(),
                 None => SessionTarget::Isolated,
             };
             let session_target = session_target.as_str();
@@ -6634,6 +6638,44 @@ mod tests {
         assert!(err.contains("session_target"), "got {err}");
         assert!(err.contains("isolated"), "got {err}");
         assert!(err.contains("main"), "got {err}");
+    }
+
+    #[test]
+    fn sync_agent_job_defaults_follow_owning_agents_main_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["shared", "isolated"]);
+        config
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .main_session
+            .enabled = true;
+        let (id, decl) = make_agent_decl("shared", "*/15 * * * *", "fixture turn");
+        let (isolated_id, mut isolated) =
+            make_agent_decl("isolated", "*/15 * * * *", "fixture turn");
+        isolated.session_target = Some("isolated".into());
+        let decls = decls_map(vec![(id, decl), (isolated_id, isolated)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert_eq!(
+            get_job(&config, "shared").unwrap().session_target,
+            SessionTarget::Main
+        );
+        assert_eq!(
+            get_job(&config, "isolated").unwrap().session_target,
+            SessionTarget::Isolated
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .main_session
+            .enabled = false;
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert_eq!(
+            get_job(&config, "shared").unwrap().session_target,
+            SessionTarget::Isolated
+        );
     }
 
     #[test]

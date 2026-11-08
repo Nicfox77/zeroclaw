@@ -53,6 +53,34 @@ Explicit history erasure and installation backups remain separate operator
 actions. The default is disabled, so existing installations keep their current
 session routing.
 
+## Scheduled turns in the main conversation
+
+For an agent with `main_session.enabled = true`, new agent cron jobs default to
+`session_target = "main"` when created through the cron tool, dashboard/API, or
+a declarative schedule without an explicit target. They use the same canonical
+conversation as bound web and messaging connections: the scheduled prompt and
+response enter permanent history and participate in ordinary summary rotation.
+The next interactive turn can refer to the scheduled response naturally.
+
+Main-target scheduled turns use the shared session's execution lane. A running
+conversation turn finishes before a scheduled turn executes; the scheduled turn
+refreshes committed context before requesting a model response. Delivery remains
+separate: configure the job's announcement channel and recipient to receive it
+in a messaging app. This does not add live transcript broadcasting to other
+connected clients.
+
+An explicit `session_target = "isolated"` retains a separate per-run history.
+Existing imperative jobs retain their stored targets. Declarative jobs without
+an explicit target follow this default when resynchronized from configuration.
+Agents without the shared main conversation enabled keep isolated defaults and
+the existing legacy main target. `uses_memory` separately controls long-term
+memory access; setting it to false does not remove shared conversation context.
+Use delegated workers for lengthy background work from the main conversation.
+A synchronous `cron_run` call inside the same conversation refuses to wait on
+its own active turn; perform the task directly or trigger the job from the
+dashboard instead.
+Previously isolated run histories are not automatically merged.
+
 ## Optional asynchronous summary deck
 
 Native sessions can retain recent verbatim turns plus a rotating deck of older

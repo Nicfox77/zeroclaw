@@ -1218,6 +1218,18 @@ async fn prepare_cron_history_input(
     if !pending.is_empty() {
         let jobs = super::store::list_jobs(config)?;
         for input in pending {
+            // A linked web/channel entrance must recover its own admitted
+            // input with the original sender's authority. Leave it pending
+            // and defer this scheduled occurrence without advancing it.
+            if config
+                .agent(agent_alias)
+                .is_some_and(|agent| agent.main_session.enabled)
+                && job.session_target == SessionTarget::Main
+                && input.agent_alias.as_deref() == Some(agent_alias)
+                && input.ingress.origin != TurnOrigin::Cron
+            {
+                return Ok(None);
+            }
             anyhow::ensure!(
                 input.agent_alias.as_deref() == Some(agent_alias)
                     && input.ingress.origin == TurnOrigin::Cron,
@@ -1382,50 +1394,80 @@ async fn run_agent_job_for_occurrence(
         spawn_site = "cron",
     );
 
-    let history =
-        if let Some(source) = zeroclaw_kernel::session::engine::current_engine_session_source() {
-            let Some(admission) = execution_admission.clone() else {
-                return Some((false, "cron_history_target_admission_missing".into()));
-            };
-            let family = match job.session_target {
-                SessionTarget::Main => format!("main-{agent_alias}"),
-                SessionTarget::Isolated => run_session_id.clone(),
-            };
-            let opened = async {
-                let actor = zeroclaw_api::session_events::EventActor::System {
-                    component: "cron_scheduler".into(),
-                };
-                let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
-                    admission: admission.clone().into(),
-                    actor,
-                    stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
-                    origin: zeroclaw_api::ingress::TurnOrigin::Cron,
-                    parent_alias: None,
-                });
-                source
-                    .open_system(
-                        family,
-                        "cron",
-                        agent_alias.into(),
-                        "cron_scheduler".into(),
-                        authority,
-                        zeroclaw_api::session_events::capture::ContextSnapshot {
-                            messages: vec![],
-                            history_has_trim_breadcrumb: Some(false),
-                        },
-                    )
-                    .await
-            }
-            .await;
-            match opened {
-                Ok(port) => Some(port),
-                Err(error) => {
-                    return Some((false, format!("cron_history_admission_failed: {error}")));
+    let history = if let Some(source) =
+        zeroclaw_kernel::session::engine::current_engine_session_source()
+    {
+        let Some(admission) = execution_admission.clone() else {
+            return Some((false, "cron_history_target_admission_missing".into()));
+        };
+        let family = match job.session_target {
+            SessionTarget::Main => {
+                if config
+                    .agent(agent_alias)
+                    .is_some_and(|agent| agent.main_session.enabled)
+                {
+                    zeroclaw_config::main_session::session_id(agent_alias)
+                } else {
+                    format!("main-{agent_alias}")
                 }
             }
-        } else {
-            None
+            SessionTarget::Isolated => run_session_id.clone(),
         };
+        // A tool cannot synchronously await a new turn on the lane its
+        // parent already owns. Scheduled/dashboard dispatch has no active
+        // parent turn and queues normally on the shared coordinator.
+        if zeroclaw_api::session_events::capture::current_engine_turn_id().is_some()
+            && let Some(reader) = zeroclaw_api::session_events::capture::current_session_execution()
+                .and_then(|port| port.history_reader())
+        {
+            match reader.current().await {
+                Ok(current) if current.stream().as_str() == family => {
+                    return Some((
+                        false,
+                        crate::i18n::get_required_cli_string("cron-main-run-active-conversation"),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Some((false, format!("cron_parent_history_unavailable: {error}")));
+                }
+            }
+        }
+        let opened = async {
+            let actor = zeroclaw_api::session_events::EventActor::System {
+                component: "cron_scheduler".into(),
+            };
+            let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
+                admission: admission.clone().into(),
+                actor,
+                stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
+                origin: zeroclaw_api::ingress::TurnOrigin::Cron,
+                parent_alias: None,
+            });
+            source
+                .open_system(
+                    family,
+                    "cron",
+                    agent_alias.into(),
+                    "cron_scheduler".into(),
+                    authority,
+                    zeroclaw_api::session_events::capture::ContextSnapshot {
+                        messages: vec![],
+                        history_has_trim_breadcrumb: Some(false),
+                    },
+                )
+                .await
+        }
+        .await;
+        match opened {
+            Ok(port) => Some(port),
+            Err(error) => {
+                return Some((false, format!("cron_history_admission_failed: {error}")));
+            }
+        }
+    } else {
+        None
+    };
 
     let engine_input = if let Some(history) = history.as_ref() {
         match prepare_cron_history_input(
@@ -3332,7 +3374,10 @@ mod tests {
                 _authority: Arc<dyn EngineSessionAuthority>,
                 _initial: ContextSnapshot,
             ) -> Result<Arc<dyn SessionExecutionPort>> {
-                assert_eq!(family, format!("main-{TEST_AGENT}"));
+                assert_eq!(
+                    family,
+                    zeroclaw_config::main_session::session_id(TEST_AGENT)
+                );
                 assert_eq!(creation_source, "cron");
                 assert_eq!(alias, TEST_AGENT);
                 assert_eq!(component, "cron_scheduler");
@@ -3349,7 +3394,13 @@ mod tests {
         }
 
         let directory = TempDir::new().expect("directory");
-        let config = test_config(&directory).await;
+        let mut config = test_config(&directory).await;
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .main_session
+            .enabled = true;
         let add_job = |name: &str| {
             super::super::store::add_agent_job(
                 &config,
@@ -3384,6 +3435,26 @@ mod tests {
         .expect("prepare")
         .expect("input");
         let old_turn = original.turn_id.clone();
+        let mut external = original.clone();
+        external.turn_id = "pending-chat-input".into();
+        external.ingress = zeroclaw_api::ingress::IngressContext::interactive();
+        port.pending.lock().unwrap().push(external);
+        assert!(
+            prepare_cron_history_input(
+                &config,
+                TEST_AGENT,
+                &first,
+                &first_occurrence,
+                "fixture scheduled prompt",
+                port.as_ref()
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(port.rejected.lock().unwrap().is_empty());
+        assert_eq!(port.pending.lock().unwrap().len(), 1);
+        port.pending.lock().unwrap().clear();
         port.pending.lock().unwrap().push(original.clone());
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let admission = authority
@@ -3478,6 +3549,160 @@ mod tests {
             port.rejected.lock().unwrap().as_slice(),
             [(old_turn, "cron_recovery_owner_no_longer_active".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn native_cron_shared_main_reads_chat_and_retains_reply_for_next_turn() {
+        use axum::{Json, Router, routing::post};
+        use zeroclaw_api::ingress::TurnOrigin;
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_api::session_events::capture::ContextSnapshot;
+        use zeroclaw_api::session_events::{EventActor, SessionId};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+
+        for backend in ["sqlite", "jsonl"] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let recorded = requests.clone();
+            let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
+                recorded.lock().unwrap().push(body);
+                async { Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"scheduled-fixture-response"},"finish_reason":"stop"}]})) }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let directory = TempDir::new().unwrap();
+            let mut config = test_config(&directory).await;
+            config.channels.session_backend = backend.into();
+            config.memory.backend = "none".into();
+            config.memory.auto_save = false;
+            config.providers.models.ollama.insert(
+                "fixture".into(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("fixture-model".into()),
+                        uri: Some(format!("http://{address}")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let agent = config.agents.get_mut(TEST_AGENT).unwrap();
+            agent.model_provider = "ollama.fixture".into();
+            agent.main_session.enabled = true;
+            agent.main_session.web = true;
+            let security = test_security(&config);
+            let authority = crate::LiveConfigAuthority::new(config.clone());
+            let admission = authority.execution_capability().admit(TEST_AGENT).unwrap();
+            let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                authority.live_handle(),
+            ));
+            let family = zeroclaw_config::main_session::session_id(TEST_AGENT);
+            let history_authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
+                admission: admission.clone().into(),
+                actor: EventActor::System {
+                    component: "cron_scheduler".into(),
+                },
+                stream: SessionId::parse(family.clone()).unwrap(),
+                origin: TurnOrigin::Cron,
+                parent_alias: None,
+            });
+            let port = source
+                .open_system(
+                    family,
+                    "web",
+                    TEST_AGENT.into(),
+                    "cron_scheduler".into(),
+                    history_authority,
+                    ContextSnapshot {
+                        messages: vec![
+                            ConversationMessage::Chat(ChatMessage::system("Fixture assistant")),
+                            ConversationMessage::Chat(ChatMessage::user(
+                                "shared-chat-context-marker",
+                            )),
+                            ConversationMessage::Chat(ChatMessage::assistant(
+                                "prior-chat-response",
+                            )),
+                        ],
+                        history_has_trim_breadcrumb: Some(false),
+                    },
+                )
+                .await
+                .unwrap();
+            let mut job = test_job("");
+            job.job_type = JobType::Agent;
+            job.prompt = Some("fixture scheduled prompt".into());
+            job.allowed_tools = Some(vec![]);
+            job.uses_memory = false;
+            for target in [SessionTarget::Isolated, SessionTarget::Main] {
+                job.session_target = target.clone();
+                let result = zeroclaw_kernel::session::engine::scope_engine_session_source(
+                    source.clone(),
+                    Box::pin(run_agent_job(
+                        &config,
+                        &security,
+                        TEST_AGENT,
+                        &job,
+                        Some(admission.clone()),
+                    )),
+                )
+                .await;
+                assert!(result.0, "{backend}: {}", result.1);
+                let request = requests.lock().unwrap().last().unwrap().to_string();
+                assert_eq!(
+                    request.contains("shared-chat-context-marker"),
+                    target == SessionTarget::Main,
+                    "{backend}"
+                );
+                let restored = port.restore_context().await.unwrap().unwrap();
+                let context = serde_json::to_string(&restored).unwrap();
+                assert!(context.contains("shared-chat-context-marker"));
+                assert_eq!(
+                    context.contains("scheduled-fixture-response"),
+                    target == SessionTarget::Main,
+                    "{backend}"
+                );
+            }
+            let parent_input = prepare_cron_history_input(
+                &config,
+                TEST_AGENT,
+                &job,
+                &CronOccurrence::Manual {
+                    invocation_id: "fixture-parent".into(),
+                },
+                "fixture active conversation",
+                port.as_ref(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let parent = port.execute(
+                parent_input,
+                Box::pin(async {
+                    let (success, output) = run_agent_job(
+                        &config,
+                        &security,
+                        TEST_AGENT,
+                        &job,
+                        Some(admission.clone()),
+                    )
+                    .await;
+                    assert!(!success, "nested force-run must refuse its own lane");
+                    assert_eq!(
+                        output,
+                        crate::i18n::get_required_cli_string("cron-main-run-active-conversation")
+                    );
+                    Ok("nested-run-guard-confirmed".into())
+                }),
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), parent)
+                .await
+                .expect("nested run must not deadlock")
+                .expect("parent turn completes");
+            server.abort();
+        }
     }
 
     #[tokio::test]
