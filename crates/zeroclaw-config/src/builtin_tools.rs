@@ -31,6 +31,7 @@ pub const EXTERNAL_TOOL_NAMES: &[&str] = &[
     "image_gen",
     "email_read",
     "email_search",
+    "email_draft",
 ];
 
 /// Model-visible built-in selection (`[tools]`). Rebuild the registry after edits.

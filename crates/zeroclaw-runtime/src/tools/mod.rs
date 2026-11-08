@@ -75,6 +75,8 @@ pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 #[cfg(feature = "tools-external")]
+pub use zeroclaw_tools::email_draft::{EmailDraftConfigResolver, EmailDraftTool};
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::email_read::EmailReadTool;
 #[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::email_search::EmailSearchTool;
@@ -2560,7 +2562,7 @@ fn all_tools_with_runtime_on_thread(
         .email
         .values()
         .any(|channel| channel.enabled)
-        && (select_tool!("email_search") | select_tool!("email_read"))
+        && (select_tool!("email_search") | select_tool!("email_read") | select_tool!("email_draft"))
     {
         let email_configs: std::collections::HashMap<
             String,
@@ -2591,8 +2593,33 @@ fn all_tools_with_runtime_on_thread(
             );
             register_tool!(
                 "email_read",
-                Arc::new(EmailReadTool::new(Arc::clone(&configs), auth_service,))
+                Arc::new(EmailReadTool::new(
+                    Arc::clone(&configs),
+                    auth_service.clone(),
+                ))
             );
+            if configs.values().any(|account| account.can_save_drafts()) {
+                let alias = agent_alias.to_string();
+                let resolver: EmailDraftConfigResolver = if let Some(live) = live_config.clone() {
+                    Arc::new(move |mailbox| {
+                        EmailDraftTool::resolve_config(&live.read(), &alias, mailbox)
+                    })
+                } else {
+                    // One-shot callers own an immutable Config; supervised
+                    // callers above resolve from their live authority instead.
+                    let canonical = Arc::clone(&config);
+                    Arc::new(move |mailbox| {
+                        EmailDraftTool::resolve_config(&canonical, &alias, mailbox)
+                    })
+                };
+                register_tool!(
+                    "email_draft",
+                    Arc::new(RateLimitedTool::new(
+                        EmailDraftTool::new(resolver, auth_service),
+                        security.clone(),
+                    ))
+                );
+            }
         }
     }
 
@@ -8285,6 +8312,108 @@ permissions = ["http_client"]
         );
     }
 
+    #[cfg(feature = "tools-external")]
+    #[tokio::test]
+    async fn email_draft_factory_requires_grant_and_observes_live_revocation() {
+        use zeroclaw_config::policy::AutonomyLevel;
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.tools.optional = vec!["email_draft".into()];
+        cfg.risk_profiles.insert(
+            "draft".into(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "draft".into(),
+            AliasedAgentConfig {
+                risk_profile: "draft".into(),
+                ..Default::default()
+            },
+        );
+        cfg.channels.email.insert(
+            "mail".into(),
+            zeroclaw_config::scattered_types::EmailConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let build = |cfg: &Config, live: zeroclaw_config::live::LiveConfigHandle| {
+            let security = Arc::new(SecurityPolicy::for_agent(cfg, "draft").unwrap());
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &cfg.risk_profiles["draft"],
+                "draft",
+                Arc::new(NativeRuntime::new()),
+                Arc::new(zeroclaw_memory::NoneMemory::new("draft")),
+                None,
+                None,
+                &cfg.browser,
+                &cfg.http_request,
+                &cfg.web_fetch,
+                tmp.path(),
+                &cfg.agents,
+                None,
+                cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                Some(live),
+            )
+            .unwrap()
+            .tools
+        };
+        let closed = zeroclaw_config::live::LiveConfig::new(cfg.clone());
+        assert!(
+            !build(&cfg, closed.handle())
+                .iter()
+                .any(|tool| tool.name() == "email_draft")
+        );
+
+        cfg.channels.email.get_mut("mail").unwrap().allow_drafts = true;
+        let live = zeroclaw_config::live::LiveConfig::new(cfg.clone());
+        let tools = build(&cfg, live.handle());
+        let draft = tools
+            .iter()
+            .find(|tool| tool.name() == "email_draft")
+            .unwrap();
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| matches!(tool.name(), "email_read" | "email_search"))
+        );
+        let args = serde_json::json!({"channel":"mail","request_id":"one","to":["reader@example.test"],"subject":"Draft","body":"Review me"});
+
+        let mut revoked = live.snapshot();
+        revoked.channels.email.get_mut("mail").unwrap().allow_drafts = false;
+        live.publish(live.next_revision().unwrap(), revoked)
+            .unwrap();
+        assert!(
+            draft
+                .execute(args.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not permitted")
+        );
+
+        let mut readonly = cfg;
+        readonly.risk_profiles.get_mut("draft").unwrap().level = AutonomyLevel::ReadOnly;
+        live.publish(live.next_revision().unwrap(), readonly)
+            .unwrap();
+        assert!(
+            draft.execute(args).await.is_err(),
+            "a held tool must resolve the current agent write policy before connecting"
+        );
+    }
+
     #[test]
     fn every_reentrant_agent_tool_is_inventoried() {
         let missing: Vec<&str> = REENTRANT_AGENT_TOOLS
@@ -8379,6 +8508,7 @@ permissions = ["http_client"]
             "inventory".into(),
             zeroclaw_config::scattered_types::EmailConfig {
                 enabled: true,
+                allow_drafts: true,
                 ..Default::default()
             },
         );

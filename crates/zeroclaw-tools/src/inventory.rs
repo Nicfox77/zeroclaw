@@ -580,6 +580,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
     },
     // Channel companions.
     BuiltinToolSpec {
+        name: "email_draft",
+        tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
+    },
+    BuiltinToolSpec {
         name: "discord_search",
         tier: ToolTier::Optional,
         compilation: BuiltinToolCompilation::Always,
