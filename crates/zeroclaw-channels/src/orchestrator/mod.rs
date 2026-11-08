@@ -17929,9 +17929,10 @@ pub async fn start_channels_with_history(
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
             hooks: if config.hooks.enabled {
-                Some(Arc::new(
-                    zeroclaw_runtime::hooks::HookRunner::from_root_config(&config),
-                ))
+                let runner = zeroclaw_runtime::hooks::HookRunner::from_root_config(&config);
+                // Hooks are enabled by default, even with no installed handlers.
+                // Only a real handler requires content to await its decision.
+                (!runner.is_empty()).then(|| Arc::new(runner))
             } else {
                 None
             },
