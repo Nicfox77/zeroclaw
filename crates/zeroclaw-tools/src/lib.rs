@@ -35,6 +35,8 @@ pub mod composio;
 pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
+#[cfg(feature = "tools-external")]
+pub mod email_draft;
 pub mod email_imap;
 #[cfg(feature = "tools-external")]
 pub mod email_read;

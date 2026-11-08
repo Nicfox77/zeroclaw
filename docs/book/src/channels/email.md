@@ -79,6 +79,55 @@ approval `request_route` / `escalation_route` values and every enabled agent's
 risk-profile `approver_channel` (including a bare `email` route when only one
 email alias is enabled).
 
+### Saving drafts for human review
+
+The optional `email_draft` tool saves unsent plain-text messages through IMAP.
+It requires a build with `tools-external`, the normal tool selection and risk
+policy, and an explicit grant on each mailbox:
+
+```toml
+[channels.email.personal]
+enabled = true
+imap_host = "imap.example.com"
+username = "user@example.com"
+password = "..."
+allow_drafts = true
+```
+
+Leave `smtp_host` and `from_address` unset and keep the alias outside agent
+channel bindings and approval routes for pull-only access with draft saving.
+`allow_drafts` defaults to `false`; `observer_mode = true` always prohibits
+draft writes. Existing read-only mailbox configurations retain their behavior.
+Reload after enabling the tool. A running draft tool resolves the current
+mailbox grant, credentials and agent write policy again before appending.
+
+Ask, for example, "Read this thread in my personal mailbox and save a reply
+draft for me to review." The agent supplies an explicit mailbox alias, recipients,
+subject, body and stable `request_id`. `reply_to_uid` and `reply_folder` optionally
+identify the original message for `In-Reply-To` and `References` headers.
+Reading the source uses IMAP `EXAMINE` and `BODY.PEEK`, preserving read/unread
+flags. The server must identify exactly one selectable mailbox with the RFC 6154
+`\Drafts` attribute; the tool does not guess folder names or create folders.
+
+The only write is an IMAP `APPEND` with `\Draft`. Open the saved draft in your
+mail application to review, edit and send it. The tool neither sends mail nor
+deletes or replaces existing drafts. A changed draft is a new creation request,
+not an update to a draft the user may already be editing.
+
+Sequential retries with identical arguments and the same `request_id` locate
+the original draft by its deterministic Message-ID. Reusing an identifier with
+different arguments is rejected. This is not a distributed exactly-once claim:
+simultaneous identical requests can race, and a mail client may remove the
+receipt headers or move/delete a draft. If an append acknowledgment is lost,
+inspect Drafts or reconcile with the original request before creating a new
+identifier. Draft receipts are stored in the draft's headers, not in a separate
+local task database. Bodies are limited to 256 KiB and recipients to 20 each in
+`to` and `cc`; attachments and saving directly from a chat send button are not
+implemented.
+
+To revoke this capability, set `allow_drafts = false` or exclude `email_draft`
+from the agent's risk profile. Revocation does not delete drafts already saved.
+
 ### Gmail gotchas
 
 - **App passwords required** if 2FA is on. Regular account password is rejected.

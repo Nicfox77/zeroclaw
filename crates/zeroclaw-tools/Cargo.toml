@@ -58,6 +58,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 which = "8.0"
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false }
 mail-parser = "0.11"
+lettre = { version = "0.11.22", default-features = false, features = ["builder"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1.14.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
@@ -74,7 +75,7 @@ libc = "0.2"
 [features]
 default = []
 browser-native = ["tools-external", "dep:fantoccini"]
-tools-external = ["zeroclaw-config/tools-external"]
+tools-external = ["zeroclaw-config/tools-external", "dep:lettre"]
 probe = ["dep:probe-rs"]
 # SaaS and coding-CLI integrations. Each is opt-in; the root crate forwards
 # one `tool-*` feature per integration and bundles them as `tools-saas` and
