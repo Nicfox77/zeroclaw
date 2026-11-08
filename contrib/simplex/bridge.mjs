@@ -11,6 +11,7 @@ import {openRtc} from './rtc.mjs';
 import {Utterances} from './audio.mjs';
 import {VoiceNotes} from './notes.mjs';
 import {simplexTextMessages} from './format.mjs';
+import {LiveTexts} from './live.mjs';
 
 const pending = new Map();
 let socket, call, invitation;
@@ -30,6 +31,7 @@ function rpc(cmd) {
   });
 }
 const notes = new VoiceNotes(rpc, emit);
+const live = new LiveTexts(rpc);
 async function endCall(notify = true) {
   const previous = call; call = undefined;
   if (!previous) return;
@@ -142,7 +144,7 @@ async function command(message) {
         const waiter = pending.get(value.corrId);
         if (waiter) {
           clearTimeout(waiter.timer); pending.delete(value.corrId);
-          if (['chatCmdError', 'chatError'].includes(value.resp?.type)) waiter.reject(Error('simplex_command_failed'));
+          if (['chatCmdError', 'chatError'].includes(value.resp?.type)) waiter.reject(Object.assign(Error('simplex_command_failed'), {notDelivered:true}));
           else waiter.resolve(value.resp);
         } else if (!value.corrId) {
           if (queuedEvents >= 32) {fatal(); return;}
@@ -151,7 +153,7 @@ async function command(message) {
         }
       });
       socket.on('close', fatal); socket.on('error', fatal);
-      setImmediate(() => notes.recover().catch(fatal));
+      setImmediate(() => notes.recover().then(() => live.discover(emit)).catch(fatal));
     } else if (type === 'ping') await rpc('/u');
     else if (type === 'receive_voice') await notes.receive(message);
     else if (type === 'send') {
@@ -161,7 +163,13 @@ async function command(message) {
       for (const content of simplexTextMessages(message.text))
         await rpc(`/_send @${contact} json ${JSON.stringify([content])}`);
       }
-    } else if (type === 'accept') await accept(contactId(Number(message.contact)), message.call_id, message.streaming === true);
+    } else if (type === 'live_start') await live.start(message.draft, contactId(Number(message.contact)), message.text);
+    else if (type === 'live_update' || type === 'live_status') await live.update(message.draft, contactId(Number(message.contact)), message.text, type === 'live_status');
+    else if (type === 'live_flush') await live.flush(message.draft, contactId(Number(message.contact)), message.text, message.receipt);
+    else if (type === 'live_finish') await live.finish(message.draft, contactId(Number(message.contact)), message.text);
+    else if (type === 'live_cancel') await live.cancel(message.draft, contactId(Number(message.contact)), message.interrupted);
+    else if (type === 'live_recover') await live.recover(contactId(Number(message.contact)), message.item_id, message.interrupted, message.placeholders);
+    else if (type === 'accept') await accept(contactId(Number(message.contact)), message.call_id, message.streaming === true);
     else if (type === 'speech_start') {
       if (!call || call.id !== message.call_id || call.contact !== message.contact || typeof message.utterance_id !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(message.utterance_id)) throw Error('simplex_invalid_speech_start');
       observation = await interrupt(call, message.utterance_id, false);
@@ -181,7 +189,7 @@ async function command(message) {
     await emit({type: 'result', id, ok: true, observation});
   } catch (error) {
     if (type === 'accept') await endCall().catch(() => {});
-    await emit({type: 'result', id, ok: false, not_delivered: error.notDelivered === true});
+    await emit({type: 'result', id, ok: false, not_delivered: error.notDelivered === true, no_resend: error.noResend === true});
   }
 }
 let shuttingDown = false;

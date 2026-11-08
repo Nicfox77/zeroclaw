@@ -1,13 +1,14 @@
 import {test} from 'node:test';
 import WebSocket from 'ws';
 import {VoiceNotes} from './notes.mjs';
+import {LiveTexts} from './live.mjs';
 import {spawn,spawnSync} from 'node:child_process';
 import {mkdtemp,rm,writeFile,readFile} from 'node:fs/promises';
 import {tmpdir,homedir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
-test('official CLI encrypts and transfers native voice notes in both directions', {
+test('official CLI delivers live text updates and encrypted voice notes in both directions', {
  skip: process.env.SIMPLEX_CLI_TEST !== '1', timeout: 300000,
 }, async () => {
 process.umask(0o077);
@@ -38,6 +39,30 @@ try {
  const ca=await until(()=>a.events.find(e=>e.type==='contactConnected'),'first_contact_timeout');
  const cb=await until(()=>b.events.find(e=>e.type==='contactConnected'),'second_contact_timeout');
  const aid=String(ca.contact.contactId),bid=String(cb.contact.contactId);
+ // Verify the real receiving core, including parsed formatting and live state.
+ const live=new LiveTexts(async cmd=>{
+  const response=await a.rpc(cmd);
+  assert.ok(!['chatCmdError','chatError'].includes(response.type),'live command rejected: '+JSON.stringify(response));
+  return response;
+ });
+ await live.start('fixture-live',aid,'Processing…');
+ const preview=await until(()=>b.events.flatMap(e=>e.type==='newChatItems'?e.chatItems??[]:[])
+  .find(i=>i.chatItem?.content?.msgContent?.text==='Processing…'),'live_placeholder_timeout');
+ const physicalId=preview.chatItem.meta.itemId;
+ assert.equal(preview.chatItem.meta.itemLive,true);
+ await live.update('fixture-live',aid,'**Streaming** response');
+ const partial=await until(()=>b.events.filter(e=>e.type==='chatItemUpdated')
+  .map(e=>e.chatItem?.chatItem ?? e.chatItem).find(i=>i?.meta?.itemId===physicalId && i.content?.msgContent?.text==='*Streaming* response'),'live_update_timeout');
+ assert.equal(partial.meta.itemLive,true);
+ assert.ok(partial.formattedText?.some(s=>s.format?.type==='bold' && s.text==='Streaming'));
+ await live.finish('fixture-live',aid,'**Streaming** response finished.');
+ const final=await until(()=>b.events.filter(e=>e.type==='chatItemUpdated')
+  .map(e=>e.chatItem?.chatItem ?? e.chatItem).find(i=>i?.meta?.itemId===physicalId && i.content?.msgContent?.text==='*Streaming* response finished.'),'live_finalize_timeout');
+ assert.notEqual(final.meta.itemLive,true);
+ assert.equal(b.events.flatMap(e=>e.type==='newChatItems'?e.chatItems??[]:[])
+  .filter(i=>i.chatItem?.meta?.itemId===physicalId).length,1,'edits must retain the physical message');
+ await live.start('fixture-cancel',aid,'Thinking…');
+ await live.cancel('fixture-cancel',aid,'[Interrupted]');
  const result=spawnSync('ffmpeg',['-v','error','-f','lavfi','-i','anullsrc=r=16000:cl=mono','-t','0.4','-c:a','aac','-movflags','frag_keyframe+empty_moov','-f','mp4','pipe:1']);assert.equal(result.status,0);
  const events=[];notes=new VoiceNotes(async cmd=>{const response=await a.rpc(cmd);assert.ok(!['chatCmdError','chatError'].includes(response.type),'send rejected: '+response.type);return response;},async event=>events.push(event));
  a.onEvent=event=>notes.event(event);
@@ -45,7 +70,7 @@ try {
  await notes.send(aid,'**Fixture** text plus voice.',result.stdout.toString('base64'));
  const incoming=await until(()=>b.events.find(e=>e.type==='newChatItems' && e.chatItems?.some(i=>i.chatItem?.content?.msgContent?.type==='voice')),'voice_invitation_timeout');
  const wrapper=incoming.chatItems.find(i=>i.chatItem.content.msgContent.type==='voice');
- const receivedText=await until(()=>b.events.flatMap(e=>e.type==='newChatItems' ? e.chatItems ?? [] : []).find(i=>i.chatItem?.content?.msgContent?.type==='text'),'formatted_text_timeout');
+ const receivedText=await until(()=>b.events.flatMap(e=>e.type==='newChatItems' ? e.chatItems ?? [] : []).find(i=>i.chatItem?.content?.msgContent?.text==='*Fixture* text plus voice.'),'formatted_text_timeout');
  assert.equal(receivedText.chatItem.content.msgContent.text,'*Fixture* text plus voice.');
  assert.ok(receivedText.chatItem.formattedText?.some(span=>span.format?.type==='bold' && span.text==='Fixture'),
    'receiving SimpleX core must recognize a bold span, not display double asterisks');

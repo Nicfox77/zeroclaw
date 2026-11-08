@@ -97,6 +97,13 @@ If a PR changes one of those responsibilities for only one channel, reviewers
 should ask whether it belongs in the shared lifecycle or in typed channel
 capability metadata.
 
+Speculative text previews and speech must wait when outbound hooks are active.
+The shared draft updater also withholds text previews from the origin chat when
+current reply routing names a different destination. Final replies and completed
+narration continue through their existing outbound checks. Adapter-owned status
+labels may remain visible while content awaits approval; they are not model
+reasoning or conversation history.
+
 ## Gateway webhooks
 
 Gateway webhooks have one legitimate special requirement: the HTTP request may
