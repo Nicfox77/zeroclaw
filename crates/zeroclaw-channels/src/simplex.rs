@@ -1718,7 +1718,7 @@ mod tests {
         let (channel, _) = fixture();
         let (_, worker) = record_bridge(&channel);
         let id = channel
-            .send_draft(&SendMessage::new("", "17").in_thread("call/old"))
+            .send_draft(&SendMessage::new("", "17").in_thread(Some("call/old".into())))
             .await
             .unwrap()
             .unwrap();

@@ -117,7 +117,7 @@ fixture = "17"
     const finished=[...items.values()];
     assert.deepEqual(finished.map(i=>i.text),['Checking now.','The *answer* is ready.']);
     assert(finished.every(i=>!i.live));
-    assert(observed.some(i=>i.text==='The *answer*'&&i.live),'partial answer must reach transport before final');
+    assert(observed.some(i=>i.text==='The *answer*'&&i.live),'partial answer must reach transport before final: '+JSON.stringify(observed));
     assert(!observed.some(i=>i.text.includes('PRIVATE_REASONING_FIXTURE')||i.text.includes('memory_recall')),'reasoning and hidden tool details stay private');
     assert.equal(commands.filter(c=>c.startsWith('/_send ')).length,2,'each response phase creates just one bubble');
     await pause(300);input('fixture followup');
