@@ -2408,12 +2408,15 @@ fn all_tools_with_runtime_on_thread(
     );
     register_tool!(
         "cron_add",
-        Arc::new(CronAddTool::new_with_runtime(
-            config.clone(),
-            security.clone(),
-            agent_alias,
-            runtime.clone(),
-        ))
+        Arc::new(
+            CronAddTool::new_with_runtime(
+                config.clone(),
+                security.clone(),
+                agent_alias,
+                runtime.clone(),
+            )
+            .with_live_config(live_config.clone()),
+        )
     );
     register_tool!(
         "cron_list",

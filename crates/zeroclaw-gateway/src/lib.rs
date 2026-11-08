@@ -10825,7 +10825,7 @@ data: [DONE]\n\n";
             .unwrap();
         let proof = session_history::IngressProof::Paired { subject: None };
         let (_, provider, model) = agent.attribution_fields();
-        let inputs = ["first accepted", "second accepted"]
+        let mut inputs: Vec<_> = ["first accepted", "second accepted"]
             .into_iter()
             .map(|text| {
                 let mut input = session_history::input(
@@ -10839,6 +10839,14 @@ data: [DONE]\n\n";
                 input
             })
             .collect();
+        let mut cron = inputs[0].clone();
+        cron.turn_id = "pending-scheduled-turn".into();
+        cron.ingress = zeroclaw_api::ingress::IngressContext::cron();
+        cron.ingress.internal_principal = Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: "fixture-job".into(),
+            job_name: None,
+        });
+        inputs.push(cron);
         let queue = Arc::new(RecoveryQueue {
             inputs,
             completed: Mutex::new(Vec::new()),
@@ -10861,9 +10869,16 @@ data: [DONE]\n\n";
             .is_err()
         );
         assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
-        session_history::recover_pending(&state, "recovery", &port, &mut agent, &proof, None)
-            .await
-            .unwrap();
+        session_history::recover_pending(
+            &state,
+            &zeroclaw_config::main_session::session_id("web"),
+            &port,
+            &mut agent,
+            &proof,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
         assert_eq!(
             *queue.completed.lock(),

@@ -206,7 +206,7 @@ export default function Cron() {
   const [formJobType, setFormJobType] = useState<'shell' | 'agent'>('shell');
   const [formPrompt, setFormPrompt] = useState('');
   const [formModel, setFormModel] = useState('');
-  const [formSessionTarget, setFormSessionTarget] = useState<'isolated' | 'main'>('isolated');
+  const [formSessionTarget, setFormSessionTarget] = useState<'isolated' | 'main' | null>(null);
   const [formAllowedTools, setFormAllowedTools] = useState('');
   const [formAgent, setFormAgent] = useState('');
   const [formDeliveryMode, setFormDeliveryMode] = useState<'none' | 'announce'>('none');
@@ -229,7 +229,7 @@ export default function Cron() {
     setFormJobType('shell');
     setFormPrompt('');
     setFormModel('');
-    setFormSessionTarget('isolated');
+    setFormSessionTarget(null);
     setFormAllowedTools('');
     setFormAgent(agentOptions[0] ?? '');
     setFormDeliveryMode('none');
@@ -425,7 +425,7 @@ export default function Cron() {
         if (isAgent) {
           body.prompt = formPrompt.trim();
           if (formModel.trim()) body.model = formModel.trim();
-          body.session_target = formSessionTarget;
+          if (formSessionTarget) body.session_target = formSessionTarget;
           const parsedTools = formAllowedTools
             .split(',')
             .map((s) => s.trim())
@@ -792,10 +792,23 @@ export default function Cron() {
                         <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                           {t('cron.session_target')}
                         </label>
+                        <p className="text-xs text-pc-text-muted mb-2">{t('cron.session_default_hint')}</p>
                         <div className="flex gap-2">
                           <button
                             type="button"
+                            onClick={() => setFormSessionTarget(null)}
+                            aria-pressed={formSessionTarget === null}
+                            className={`flex-1 px-3 py-2 rounded-[var(--radius-md)] text-xs font-medium border transition-colors cursor-pointer ${formSessionTarget === null
+                                ? 'border-pc-accent text-pc-accent bg-pc-accent/10'
+                                : 'border-pc-border text-pc-text-muted hover:bg-[var(--pc-hover)] hover:text-pc-text'
+                              }`}
+                          >
+                            {t('cron.session_default')}
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => setFormSessionTarget('isolated')}
+                            aria-pressed={formSessionTarget === 'isolated'}
                             className={`flex-1 px-3 py-2 rounded-[var(--radius-md)] text-xs font-medium border transition-colors cursor-pointer ${formSessionTarget === 'isolated'
                                 ? 'border-pc-accent text-pc-accent bg-pc-accent/10'
                                 : 'border-pc-border text-pc-text-muted hover:bg-[var(--pc-hover)] hover:text-pc-text'
@@ -806,6 +819,7 @@ export default function Cron() {
                           <button
                             type="button"
                             onClick={() => setFormSessionTarget('main')}
+                            aria-pressed={formSessionTarget === 'main'}
                             className={`flex-1 px-3 py-2 rounded-[var(--radius-md)] text-xs font-medium border transition-colors cursor-pointer ${formSessionTarget === 'main'
                                 ? 'border-pc-accent text-pc-accent bg-pc-accent/10'
                                 : 'border-pc-border text-pc-text-muted hover:bg-[var(--pc-hover)] hover:text-pc-text'

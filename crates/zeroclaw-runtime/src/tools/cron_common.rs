@@ -31,6 +31,7 @@ pub(crate) fn cron_add_output(job: &CronJob) -> Value {
         "id": job.id,
         "name": job.name,
         "job_type": job.job_type,
+        "session_target": job.session_target,
         "schedule": job.schedule,
         "next_run": job.next_run,
         "next_run_utc": job.next_run,
