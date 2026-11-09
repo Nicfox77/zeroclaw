@@ -41,7 +41,13 @@ test('daemon receives SimpleX input and delivers live tool narration and final t
     const body=JSON.parse(raw);requests.push(body);
     const messages=body.messages??[],serialized=JSON.stringify(messages);
     const followup=serialized.includes('fixture followup');
-    if(followup){assert(serialized.includes('The **answer** is ready.'));}
+    if(followup){
+      assert(serialized.includes('The **answer** is ready.'));
+      assert(messages.some(m=>m.role==='assistant'&&m.tool_calls?.some(c=>c.function?.name==='memory_recall')),
+        'followup must retain the saved assistant tool call, not just its narration');
+      assert(messages.some(m=>m.role==='tool'),
+        'followup must retain the completed tool result after restoring the main session');
+    }
     assert(!serialized.includes('Processing…')&&!serialized.includes('Thinking…')&&!serialized.includes('Working…'),
       'transport status must not enter model history');
     const toolPhase=!followup&&!messages.some(m=>m.role==='tool');
