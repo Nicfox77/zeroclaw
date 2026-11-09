@@ -903,7 +903,13 @@ impl StreamEvent {
 
     pub fn has_generation_progress(&self) -> bool {
         match self {
-            Self::TextDelta(chunk) => !chunk.delta.is_empty(),
+            Self::TextDelta(chunk) => {
+                !chunk.delta.is_empty()
+                    || chunk
+                        .reasoning
+                        .as_deref()
+                        .is_some_and(|reasoning| !reasoning.is_empty())
+            }
             Self::ThinkingDelta(text) | Self::ReasoningFinalized(text) => !text.is_empty(),
             Self::ToolCall(_)
             | Self::PreExecutedToolCall { .. }
