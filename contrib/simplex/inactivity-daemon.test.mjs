@@ -12,7 +12,7 @@ import {createHash,randomBytes} from 'node:crypto';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 const listen=async server=>{server.listen(0,'127.0.0.1');await once(server,'listening');return server.address().port;};
 
-async function fixture(idle) {
+async function fixture(idle, summary = false) {
   const root=await mkdtemp(join(tmpdir(),'zeroclaw-idle-proof-'));
   const requests=[],output=[];let sequence=100,socket,daemon,logs='',modelError;
   const vendor=new WebSocketServer({host:'127.0.0.1',port:0});await once(vendor,'listening');
@@ -39,6 +39,19 @@ async function fixture(idle) {
     const toolResult=messages.at(-1)?.role==='tool';
     requests.push({last,body});
     assert(body.stream,'proof requires the real streaming provider path');
+    if(body.model==='summary-model'){
+      res.writeHead(200,{'Content-Type':'text/event-stream'});
+      const emit=delta=>res.write('data: '+JSON.stringify({choices:[{index:0,delta,finish_reason:null}]})+'\n\n');
+      // Inference exceeds the one-second allowance while real reasoning keeps
+      // advancing. Metadata/empty frames must not supply that activity.
+      for(let n=0;n<5&&!res.destroyed;n++){emit({reasoning_content:'private summary reasoning'});await pause(450);}
+      if(!res.destroyed){
+        emit({content:'I retained our architecture decisions and the user\'s unresolved questions.'});
+        res.write('data: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\n');
+        res.end('data: [DONE]\n\n');
+      }
+      return;
+    }
     if(last.includes('prefill'))await pause(3000);
     res.writeHead(200,{'Content-Type':'text/event-stream'});
     const emit=(delta,finish_reason=null)=>{if(!res.destroyed)res.write('data: '+JSON.stringify({choices:[{index:0,delta,finish_reason}]})+'\n\n');};
@@ -107,16 +120,26 @@ model = "fixture-model"
 uri = "http://127.0.0.1:${modelPort}"
 timeout_secs = 30
 context_window = 128000
+[providers.models.ollama.summary]
+model = "summary-model"
+uri = "http://127.0.0.1:${modelPort}"
+timeout_secs = 30
+context_window = 128000
 [risk_profiles.fixture]
 level = "full"
 allowed_commands = ["sleep"]
 [runtime_profiles.fixture]
 max_context_tokens = 64000
-max_history_messages = 200
+max_history_messages = ${summary ? 6 : 200}
 max_tool_iterations = 5
 shell_timeout_secs = 10
+[runtime_profiles.fixture.summary_deck]
+enabled = ${summary}
+timeout_secs = 1
+max_summary_tokens = 256
 [agents.fixture]
 model_provider = "ollama.fixture"
+summary_provider = "ollama.summary"
 risk_profile = "fixture"
 runtime_profile = "fixture"
 channels = ["simplex.fixture"]
@@ -154,6 +177,21 @@ fixture = "17"
   catch(error){await close();throw error;}
   return {requests,output,until,send,web,close,logs:()=>logs};
 }
+
+test('summary deck honors the agent summarizer and permits inference longer than its idle allowance',{
+  skip:process.env.SIMPLEX_DAEMON_TEST!=='1',timeout:90000,
+},async()=>{
+  const f=await fixture(10,true);
+  try{
+    for(let n=0;n<9;n++){
+      const result=await f.web('fixture web quick turn '+n);
+      assert.equal(result.type,'done',JSON.stringify(result));
+    }
+    assert(f.requests.some(r=>r.body.model==='summary-model'),'configured summary provider must receive the job');
+    assert(f.requests.some(r=>r.body.model==='fixture-model'&&JSON.stringify(r.body.messages).includes('I retained our architecture decisions')),'published summary must reach a later real chat request');
+    assert(!f.logs().includes('summary_deck_timeout'),'actual progress must keep summary inference alive');
+  }finally{await f.close();}
+});
 
 test('activity mode survives the old wall clock, quiet tools and argument generation; real stalls stop on SimpleX and web',{
   skip:process.env.SIMPLEX_DAEMON_TEST!=='1',timeout:180000,
