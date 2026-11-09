@@ -105,6 +105,21 @@ narration continue through their existing outbound checks. Adapter-owned status
 labels may remain visible while content awaits approval; they are not model
 reasoning or conversation history.
 
+## Turn timeout ownership
+
+The shared engine can opt into `pacing.turn_idle_timeout_secs`. In this mode,
+`zeroclaw-kernel::turn_activity` owns the progress clock and finite quiet-wait
+leases; the channel adapter does not impose its older total-duration cap. The
+same engine policy reaches web, CLI and messaging turns. See
+[Turn inactivity timeout](../agents/internals.md#turn-inactivity-timeout) for
+configuration, provider prefill and cancellation behavior.
+
+The canonical configuration remains `PacingConfig`. A turn resolves that policy
+at entry, and the kernel creates only transient activity facts. Tool adapters
+borrow an observation handle through `ToolExecutionContext` and declare quiet
+allowances from the same values their actual timeout owner enforces. UI draft
+updates, narration delivery and typing timers do not refresh the watchdog.
+
 ## Gateway webhooks
 
 Gateway webhooks have one legitimate special requirement: the HTTP request may

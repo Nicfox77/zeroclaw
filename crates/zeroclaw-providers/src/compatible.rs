@@ -2766,6 +2766,15 @@ fn sse_choice_content_events(
     let mut events = Vec::new();
     if let Some(calls) = &choice.delta.tool_calls {
         for call in calls {
+            let bytes = call
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.as_deref())
+                .or(call.arguments.as_deref())
+                .map_or(0, str::len);
+            if bytes > 0 {
+                events.push(StreamEvent::tool_argument_progress(bytes));
+            }
             if let Some(metadata) = crate::output::chat_tool_metadata(
                 call.id.as_deref(),
                 &call.extensions,

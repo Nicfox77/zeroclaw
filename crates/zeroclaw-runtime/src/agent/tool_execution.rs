@@ -447,7 +447,8 @@ async fn execute_one_tool_with_provenance(
     } else {
         None
     };
-    let context = ToolExecutionContext::new(cancellation_token.cloned());
+    let context = ToolExecutionContext::new(cancellation_token.cloned())
+        .with_activity(zeroclaw_kernel::turn_activity::Activity::tool_observer());
     let tool_future = context
         .run(tool.execute_with_context(call_arguments.clone(), &context))
         .instrument(tool_span.clone());
