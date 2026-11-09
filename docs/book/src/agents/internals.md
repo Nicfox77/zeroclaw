@@ -68,3 +68,47 @@ See [Multi-agent setup walkthrough](./multi-agent-setup.md#rename-an-agent) for 
 2. Automated restore from an agent deletion archive.
 3. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
 4. Lucid wire-format extensions for cross-agent scoping.
+
+## Turn inactivity timeout
+
+Set the shared turn engine's idle window in seconds:
+
+```toml
+[pacing]
+turn_idle_timeout_secs = 600
+```
+
+This opt-in policy replaces the channel's total message duration cap. A turn can
+continue for hours while meaningful work progresses. It applies to shared-engine
+turns from the web dashboard, CLI, SimpleX, Telegram and other channels. Omitting
+the setting preserves existing behavior. Zero is rejected; it does not disable
+stall detection. The setting is resolved at the start of a turn.
+
+Nonempty assistant text, hidden reasoning, incremental tool arguments, and tool
+execution boundaries refresh the window. Empty chunks, protocol keepalives,
+typing indicators and UI status labels do not. Liveness-only argument progress
+is ephemeral and adds no archive rows or prompt content. Activity mode requests
+streaming internally when provider and tool-stream capabilities permit it, even
+if the caller only displays a final answer. Each nonempty semantic chunk counts
+as progress; chunks can contain multiple tokens.
+
+Shell, MCP and delegate operations retain their existing, separately enforced
+execution budgets. An operation with a known deadline may stay quiet until that
+deadline; completing it releases the unused allowance and starts a fresh idle
+window. That allowance includes five seconds for local cleanup and cannot keep a
+hung operation alive indefinitely. Other tools can report actual progress through
+`ToolExecutionContext`, and unbounded silent tools are stopped by the idle window.
+
+On inactivity, the engine requests cooperative cancellation, allowing up to five
+seconds to retain partial output and settle local cleanup. Completed effects are
+not undone or automatically replayed. A capture failure remains fatal. Normal
+cancellation, tool iteration limits, cost limits, approvals and individual
+provider/tool timeouts still apply.
+
+For a local model with a long uncached prefill, increase
+`pacing.turn_idle_timeout_secs`, for example to `7200`. The initial wait for model
+output uses the same window. Also set that provider profile's `timeout_secs`
+large enough for the expected quiet prefill, and raise or remove
+`pacing.step_timeout_secs` if an explicit per-inference deadline was configured.
+Streaming providers can have their own read-idle bounds; the turn policy does not
+silently override those network controls.

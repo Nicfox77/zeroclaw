@@ -26,5 +26,6 @@ anyhow = "1.0"
 futures-util = {version = "0.3", default-features = false, features = ["std"]}
 
 [dev-dependencies]
+tokio = { version = "1.50", features = ["test-util"] }
 zeroclaw-infra.workspace = true
 tempfile = "3.26"
