@@ -372,7 +372,9 @@ pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static st
     match event {
         ProgressEvent::Received => "channel-runtime-progress-received",
         ProgressEvent::Planning => "channel-runtime-progress-planning",
-        ProgressEvent::WaitingOnModel => "channel-runtime-progress-waiting-on-model",
+        ProgressEvent::WaitingOnModel | ProgressEvent::Reasoning => {
+            "channel-runtime-progress-waiting-on-model"
+        }
         ProgressEvent::RunningTool => "channel-runtime-progress-running-tool",
         ProgressEvent::CompactingContext => "channel-runtime-progress-compacting-context",
         ProgressEvent::FinalizingResponse => "channel-runtime-progress-finalizing-response",
@@ -1530,6 +1532,7 @@ mod tests {
                 ProgressEvent::Received,
                 ProgressEvent::Planning,
                 ProgressEvent::WaitingOnModel,
+                ProgressEvent::Reasoning,
                 ProgressEvent::RunningTool,
                 ProgressEvent::CompactingContext,
                 ProgressEvent::FinalizingResponse,
@@ -1538,6 +1541,7 @@ mod tests {
             [
                 "channel-runtime-progress-received",
                 "channel-runtime-progress-planning",
+                "channel-runtime-progress-waiting-on-model",
                 "channel-runtime-progress-waiting-on-model",
                 "channel-runtime-progress-running-tool",
                 "channel-runtime-progress-compacting-context",
