@@ -898,7 +898,9 @@ impl StreamEvent {
     }
 
     pub fn is_transient_progress(&self) -> bool {
-        matches!(self, Self::ProtocolMetadata(metadata) if metadata["kind"] == "generation_progress")
+        matches!(self, Self::ProtocolMetadata(metadata) if metadata.as_object().is_some_and(|fields|
+            fields.len() == 3 && metadata["kind"] == "generation_progress"
+                && metadata["component"] == "tool_arguments" && metadata["bytes"].as_u64().is_some()))
     }
 
     pub fn has_generation_progress(&self) -> bool {
