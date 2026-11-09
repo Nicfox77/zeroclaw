@@ -170,7 +170,7 @@ test('activity mode survives the old wall clock, quiet tools and argument genera
     f.send('fixture stalled partial');
     await f.until(()=>f.output.find(i=>i.text.includes('without model or tool progress')),'SimpleX idle notice');
     assert(f.output.some(i=>i.text.includes('Interrupted partial.')&&i.text.includes('[Interrupted]')));
-    assert.equal(f.requests.filter(r=>r.last==='fixture stalled partial').length,1,'stalled output must never be replayed');
+    assert.equal(f.requests.filter(r=>String(r.last).includes('fixture stalled partial')).length,1,'stalled output must never be replayed');
     const progress=await f.web('fixture web progress');
     assert.equal(progress.type,'done');assert(progress.full_response.includes('Progress kept running.'));
     const stalled=await f.web('fixture web stalled');
