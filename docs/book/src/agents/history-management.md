@@ -146,7 +146,9 @@ Background deck inference also receives current excerpts of the owning agent's
 `IDENTITY.md`, `USER.md` and `SOUL.md`, capped at 1024 UTF-8 bytes per file.
 These optional Markdown references guide names and voice, not claims about
 conversation events or instructions to execute. They are read again for each
-inference call; no second profile or cached identity is stored. Links outside
+inference call; there is no second editable profile or live identity cache.
+Normal captured provider requests retain the supplied briefing for audit.
+Links outside
 the agent workspace are rejected. Tool instructions, config, and the wider
 memory store are not part of this briefing. AIEOS-only identity is not separately
 rendered into this Markdown briefing; names present in the source conversation
