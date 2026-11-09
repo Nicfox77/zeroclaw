@@ -1732,14 +1732,13 @@ async fn run_tool_call_loop_inner<'a>(
                         .with_attrs(serde_json::json!({"idle_timeout_secs":timeout.seconds})),
                     "turn_idle_timeout"
                 );
-                zeroclaw_api::turn_stop::TurnStop::close_out(
+                error.context(zeroclaw_api::turn_stop::TurnStop::close_out(
                     zeroclaw_api::turn_stop::TurnStopCode::TurnTimeout,
                     crate::i18n::get_required_cli_string_with_args(
                         "agent-turn-idle-timeout",
                         &[("seconds", seconds.as_str())],
                     ),
-                )
-                .into()
+                ))
             } else {
                 error
             }
