@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import WebSocket,{WebSocketServer} from 'ws';
 import {once} from 'node:events';
 import {createServer} from 'node:http';
-import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -40,6 +40,9 @@ async function fixture(idle, summary = false) {
     requests.push({last,body});
     assert(body.stream,'proof requires the real streaming provider path');
     if(body.model==='summary-model'){
+      const prompt=JSON.stringify(messages);
+      assert(prompt.includes('Name: Nova')&&prompt.includes('Preferred name: Alex'),'summary must receive the scoped identity briefing');
+      assert(prompt.includes("'I' means that assistant")&&prompt.includes('Alex asked me'),'summary must preserve first-person attribution and known names');
       res.writeHead(200,{'Content-Type':'text/event-stream'});
       const emit=delta=>res.write('data: '+JSON.stringify({choices:[{index:0,delta,finish_reason:null}]})+'\n\n');
       // Inference exceeds the one-second allowance while real reasoning keeps
@@ -89,6 +92,11 @@ async function fixture(idle, summary = false) {
   const modelPort=await listen(model),reservation=createServer(),port=await listen(reservation);
   await new Promise(r=>reservation.close(r));
   const token=randomBytes(32).toString('hex'),hash=createHash('sha256').update(token).digest('hex');
+  if(summary){
+    const workspace=join(root,'agents','fixture','workspace');await mkdir(workspace,{recursive:true});
+    await writeFile(join(workspace,'IDENTITY.md'),'Name: Nova\n');
+    await writeFile(join(workspace,'USER.md'),'Preferred name: Alex\n');
+  }
   await writeFile(join(root,'config.toml'),`schema_version = 4
 [pacing]
 turn_idle_timeout_secs = ${idle}

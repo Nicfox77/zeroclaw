@@ -151,10 +151,18 @@ impl Runtime {
         let session = self.session.to_string();
         Ok(Box::new(move |conversation| {
             Box::pin(async move {
-                let messages: Vec<_> = conversation
+                let mut messages: Vec<_> = conversation
                     .iter()
                     .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
                     .collect();
+                let workspace = live.read().agent_workspace_dir(&agent);
+                let orientation = zeroclaw_infra::memory_orientation::load(&workspace)?;
+                if !orientation.is_empty() {
+                    messages.insert(
+                        0,
+                        zeroclaw_api::model_provider::ChatMessage::user(orientation),
+                    );
+                }
                 let tracker = super::summary_cost::admit(
                     &live,
                     &agent,

@@ -45,6 +45,26 @@ default. A PR that makes one of those surfaces persistent must name the memory
 category, session scope, agent scope, retention behavior, and operator-visible
 control.
 
+Automatic consolidation runs as a separate background model call after a
+completed reply. Its conversation input is the user message and accepted
+assistant reply, capped at 4000 UTF-8 bytes; it does not receive the entire chat
+or the turn's tool trace. Channel and web callers also supply bounded current
+`IDENTITY.md`, `USER.md` and `SOUL.md` excerpts from the owning agent's workspace
+(1024 bytes per file). This Markdown briefing guides naming and voice and is
+explicitly separate from conversation evidence. Missing files are optional;
+other read failures skip consolidation with a diagnostic. It uses the chat
+provider, independently of the summary deck's summarizer selection.
+
+Both extraction schemas request first-person writing from the conversational
+assistant's perspective, including daily entries, durable facts and trends.
+Use an established preferred name when the supplied context identifies the
+user unambiguously; otherwise use “the user.” User preferences must not become
+assistant preferences, and tool/delegate observations must retain their source.
+The main agent receives the same guidance for new memory writes. Existing
+memories, raw autosaved messages and the permanent transcript retain their
+original wording. Formatting remains model-authored, not a mechanical rewrite
+or a guarantee that every sentence contains a first-person pronoun.
+
 ## Prompt context and recall
 
 At turn start, the runtime can recall relevant memories and inject a bounded

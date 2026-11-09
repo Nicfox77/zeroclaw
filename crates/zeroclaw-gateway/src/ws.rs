@@ -2476,9 +2476,11 @@ async fn process_chat_message(
                     let memory_config = state.config.read().memory.clone();
                     let user_msg = content.content.clone();
                     let assistant_resp = outcome.response.clone();
+                    let memory_agent = turn_alias.clone();
                     let live_config = state.config.clone();
                     zeroclaw_spawn::spawn!(async move {
                         let config = live_config.read().clone();
+                        let workspace = config.agent_workspace_dir(&memory_agent);
                         let Some((model_provider, model, temperature)) =
                             ws_consolidation_model(&config, &live_provider_ref, &live_model)
                         else {
@@ -2492,17 +2494,21 @@ async fn process_chat_message(
                             );
                             return;
                         };
-                        if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                            model_provider.as_ref(),
-                            &model,
-                            temperature,
-                            mem.as_ref(),
-                            &memory_config,
-                            &user_msg,
-                            &assistant_resp,
-                        )
-                        .await
-                        {
+                        let consolidation = async {
+                            let orientation = zeroclaw_infra::memory_orientation::load(&workspace)?;
+                            zeroclaw_memory::consolidation::consolidate_turn_with_orientation(
+                                model_provider.as_ref(),
+                                &model,
+                                temperature,
+                                mem.as_ref(),
+                                &memory_config,
+                                &user_msg,
+                                &assistant_resp,
+                                &orientation,
+                            )
+                            .await
+                        };
+                        if let Err(e) = consolidation.await {
                             ::zeroclaw_log::record!(
                                 DEBUG,
                                 ::zeroclaw_log::Event::new(
