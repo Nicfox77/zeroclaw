@@ -28,7 +28,7 @@ async fn stalled_work_is_cancelled_after_the_last_real_progress() {
             Activity::progress_current();
         }
         cancel.cancelled().await;
-        Err::<(), _>(anyhow::anyhow!("cooperative stop"))
+        Err::<(), _>(anyhow::Error::msg("cooperative stop"))
     })
     .await
     .unwrap_err();
@@ -62,7 +62,7 @@ async fn a_bounded_wait_is_not_an_infinite_heartbeat() {
             .unwrap()
             .bounded_wait(Duration::from_secs(3));
         cancel.cancelled().await;
-        Err::<(), _>(anyhow::anyhow!("cooperative stop"))
+        Err::<(), _>(anyhow::Error::msg("cooperative stop"))
     })
     .await
     .unwrap_err();
@@ -82,7 +82,7 @@ async fn completed_operation_releases_unused_quiet_allowance() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         drop(wait);
         cancel.cancelled().await;
-        Err::<(), _>(anyhow::anyhow!("cooperative stop"))
+        Err::<(), _>(anyhow::Error::msg("cooperative stop"))
     })
     .await
     .unwrap_err();
@@ -133,7 +133,7 @@ async fn capture_failure_during_idle_cleanup_stays_fatal() {
     let error = run(Some(2), &cancel, async {
         cancel.cancelled().await;
         Err::<(), _>(zeroclaw_api::session_events::capture::capture_stopped(
-            anyhow::anyhow!("fixture"),
+            anyhow::Error::msg("fixture"),
         ))
     })
     .await
