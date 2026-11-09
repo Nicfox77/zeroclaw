@@ -37,6 +37,45 @@ pub struct IdleTimeout {
 }
 
 impl Activity {
+    pub(crate) fn new() -> Self {
+        let (changed, _) = watch::channel(());
+        Self(Arc::new(Inner {
+            state: Mutex::new(State {
+                last_progress: Instant::now(),
+                waits: HashMap::new(),
+            }),
+            changed,
+            next_wait: AtomicU64::new(0),
+        }))
+    }
+
+    /// A foreground waiter observes the job's canonical activity. No timer or
+    /// polling heartbeat manufactures progress, and no policy is copied here.
+    pub(crate) async fn observe<T>(&self, future: impl Future<Output = T>) -> T {
+        let Some(parent) = Self::current() else {
+            return future.await;
+        };
+        if Arc::ptr_eq(&self.0, &parent.0) {
+            return future.await;
+        }
+        let mut updates = self.0.changed.subscribe();
+        let mut observed = self.0.state.lock().last_progress;
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut future => return result,
+                _ = updates.changed() => {
+                    let latest = self.0.state.lock().last_progress;
+                    if latest > observed {
+                        parent.progress();
+                        observed = latest;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn current() -> Option<Self> {
         CURRENT.try_with(Clone::clone).ok().flatten()
     }
@@ -107,16 +146,17 @@ pub async fn run<T>(
     let Some(seconds) = seconds else {
         return CURRENT.scope(None, engine).await;
     };
+    run_with_activity(seconds, cancel, Activity::new(), engine).await
+}
+
+pub(crate) async fn run_with_activity<T>(
+    seconds: u64,
+    cancel: &CancellationToken,
+    activity: Activity,
+    engine: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
     anyhow::ensure!(seconds > 0, "turn_idle_timeout_secs must be positive");
-    let (changed, mut updates) = watch::channel(());
-    let activity = Activity(Arc::new(Inner {
-        state: Mutex::new(State {
-            last_progress: Instant::now(),
-            waits: HashMap::new(),
-        }),
-        changed,
-        next_wait: AtomicU64::new(0),
-    }));
+    let mut updates = activity.0.changed.subscribe();
     let idle = Duration::from_secs(seconds);
     let engine = CURRENT.scope(Some(activity.clone()), engine);
     tokio::pin!(engine);
