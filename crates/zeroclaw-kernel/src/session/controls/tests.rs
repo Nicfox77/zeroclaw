@@ -401,6 +401,132 @@ async fn complete_context_restores_tool_pairing_and_reasoning_without_disclosure
 }
 
 #[tokio::test]
+async fn in_turn_flat_chat_context_retains_tool_pairs_and_metadata_after_reopen() {
+    use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+    for backend in ["sqlite", "jsonl"] {
+        for cancelled in [false, true] {
+            let dir = tempfile::TempDir::new().expect("directory");
+            let (session, authority) = session(dir.path(), backend);
+            // The channel and CLI owners persist their flat ChatMessage history,
+            // rather than the alternate AssistantToolCalls/ToolResults variants.
+            let mut assistant = ChatMessage::assistant_tool_calls(
+                "Checking the model files.",
+                vec![ToolCall {
+                    id: "inventory-call".into(),
+                    name: "file_read".into(),
+                    arguments: "{\"path\":\"/fixture/models\"}".into(),
+                    extra_content: Some(serde_json::json!({"thought_signature":"fixture"})),
+                }],
+                Some("fixture reasoning continuation".into()),
+            );
+            assistant.timestamp = Some(1700000000000);
+            let mut timestamped = ChatMessage::assistant("Observed file inventory.");
+            timestamped.timestamp = Some(1700000000001);
+            let mut reasoning_only = ChatMessage::assistant("");
+            reasoning_only.reasoning_content = Some("opaque continuation fixture".into());
+            let snapshot = ContextSnapshot {
+                messages: vec![
+                    ChatMessage::user("List the model files."),
+                    assistant,
+                    ChatMessage::tool_result(ToolResultMessage {
+                        tool_call_id: "inventory-call".into(),
+                        tool_name: "file_read".into(),
+                        success: Some(true),
+                        content: "fixture-model.safetensors".into(),
+                        attachments: Vec::new(),
+                    }),
+                    ChatMessage::assistant_tool_calls(
+                        "",
+                        vec![ToolCall {
+                            id: "bare-call".into(),
+                            name: "file_read".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        None,
+                    ),
+                    ChatMessage::tool_result(ToolResultMessage {
+                        tool_call_id: "bare-call".into(),
+                        tool_name: "file_read".into(),
+                        success: Some(false),
+                        content: "fixture file unavailable".into(),
+                        attachments: Vec::new(),
+                    }),
+                    timestamped,
+                    reasoning_only,
+                    ChatMessage::assistant("Inventory complete."),
+                ]
+                .into_iter()
+                .map(ConversationMessage::Chat)
+                .collect(),
+                history_has_trim_breadcrumb: Some(false),
+            };
+            let expected = canonical_json(&snapshot).expect("snapshot codec");
+            let write = session.clone();
+            let result = session
+                .execute(
+                    input(),
+                    Box::pin(async move {
+                        write
+                            .replace_context(snapshot, "turn_history_projection")
+                            .await?;
+                        if cancelled {
+                            Err(zeroclaw_api::turn_stop::ToolLoopCancelled.into())
+                        } else {
+                            Ok("Inventory complete.".into())
+                        }
+                    }),
+                )
+                .await;
+            if cancelled {
+                assert!(zeroclaw_api::turn_stop::is_tool_loop_cancelled(
+                    &result.expect_err("cancelled turn")
+                ));
+            } else {
+                result.expect("completed turn");
+            }
+            let stream = session.stream.clone();
+            let branch = session.branch.clone();
+            drop(session);
+            let store = zeroclaw_infra::session_events::open_event_store(dir.path(), backend)
+                .expect("reopen store");
+            let reopened = EngineSession::new(
+                Arc::new(SessionCoordinator::new(store)),
+                stream,
+                branch,
+                PrincipalId::shared_operator(),
+                authority,
+            );
+            let restored = reopened
+                .restore_context()
+                .await
+                .expect("restore")
+                .expect("snapshot");
+            assert_eq!(
+                canonical_json(&restored).expect("restored codec"),
+                expected,
+                "{backend}: completed={}; flat tool calls, results, reasoning and timestamps must survive",
+                !cancelled,
+            );
+            // A subsequent activation must also keep the original paired exchange.
+            let next = reopened.clone();
+            reopened
+                .execute(
+                    input(),
+                    Box::pin(async move {
+                        let restored = next.restore_context().await?.expect("next context");
+                        assert_eq!(canonical_json(&restored).expect("next codec"), expected);
+                        next.replace_context(restored, "next_turn_history").await?;
+                        Ok("Follow-up complete.".into())
+                    }),
+                )
+                .await
+                .expect("next turn");
+        }
+    }
+}
+
+#[tokio::test]
 async fn inherited_model_selection_round_trips_without_freezing_configured_route() {
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::TempDir::new().expect("directory");

@@ -127,7 +127,18 @@ impl SessionCoordinator {
             else {
                 continue;
             };
-            if chat.role != "assistant" || !chat.attachments.is_empty() {
+            // A content event represents literal text only. Keep the canonical
+            // conversation payload whenever it carries metadata that this
+            // representation cannot restore. Otherwise the next activation
+            // loses call identity and prunes its completed results as orphans.
+            if chat.role != "assistant"
+                || !chat.attachments.is_empty()
+                || !chat.tool_calls.is_empty()
+                || chat.tool_result.is_some()
+                || chat.reasoning_content.is_some()
+                || chat.timestamp.is_some()
+                || chat.recalled_memory.is_some()
+            {
                 continue;
             }
             let matching_provider = chat.content == provider_text;
