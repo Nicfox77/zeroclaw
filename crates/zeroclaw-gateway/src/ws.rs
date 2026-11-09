@@ -3219,8 +3219,15 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                     let arrivals = arrivals.clone();
                     let mock_tails = mock_tails.clone();
                     async move {
+                        if request["messages"].to_string().contains("Summarize part ") {
+                            assert_eq!(request["stream"].as_bool(), Some(true));
+                            return (
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture-summary\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"usage\":{\"input_tokens\":120,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Retained architecture: permanent originals with a rotating summary deck.\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":20}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                            ).into_response();
+                        }
                         if request["stream"].as_bool() != Some(true) {
-                            assert!(request["messages"].to_string().contains("Summarize"), "only the background summary uses nonstreaming inference: {request}");
+                            assert!(request["messages"].to_string().contains("Summarize"), "only context summarization uses nonstreaming inference: {request}");
                             return Json(serde_json::json!({
                                 "id":"fixture-summary", "type":"message", "role":"assistant", "model":"claude-test",
                                 "content":[{"type":"text", "text":"Retained architecture: permanent originals with a rotating summary deck."}],

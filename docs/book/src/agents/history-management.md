@@ -96,8 +96,9 @@ enabled = true
 summary_share = 0.15
 trigger_ratio = 0.8
 max_summary_tokens = 1000
-timeout_secs = 60
-# Optional configured model-provider alias; otherwise use the session route.
+timeout_secs = 600
+# Optional configured model-provider alias; otherwise inherit summary_provider,
+# then context_compression.summary_provider, then the session route.
 # provider = "openai.summarizer"
 ```
 
@@ -105,6 +106,16 @@ The default is disabled. Existing `max_context_tokens` and
 `context_compact_ratio` remain the overall budget controls. An explicit zero
 token budget disables automatic deck maintenance as well. Keep
 `max_history_messages` at four or more when enabling the deck.
+
+`timeout_secs` is an inactivity allowance, not a total generation deadline.
+Summaries use streaming inference; nonempty text or reasoning refreshes the
+allowance, while transport keepalives and empty frames do not. Cold prefill is
+silent, so choose an allowance long enough for the slowest expected prefill
+(for example, `1800` for a local model). The default is 600 seconds. The same
+setting bounds waiting to publish a completed card while a foreground turn is
+busy. The deck's explicit `provider` takes precedence over the agent's
+`summary_provider`, then the runtime profile's compression summary provider;
+with none configured, the current session route is used.
 
 The implementation reserves 15% of the resolved input target for request
 overhead, then subtracts the current system messages. `summary_share` divides

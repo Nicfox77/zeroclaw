@@ -14559,9 +14559,11 @@ version = "0.8.7"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures-util",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",
