@@ -181,7 +181,7 @@ fixture = "17"
 test('summary deck honors the agent summarizer and permits inference longer than its idle allowance',{
   skip:process.env.SIMPLEX_DAEMON_TEST!=='1',timeout:90000,
 },async()=>{
-  const f=await fixture(10,true);
+  const f=await fixture(1,true);
   try{
     for(let n=0;n<9;n++){
       const result=await f.web('fixture web quick turn '+n);

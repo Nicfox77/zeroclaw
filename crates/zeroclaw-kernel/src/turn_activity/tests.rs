@@ -1,6 +1,36 @@
 use super::*;
 
 #[tokio::test(start_paused = true)]
+async fn waiting_turn_observes_background_progress_without_creating_heartbeats() {
+    for progressing in [true, false] {
+        let job = Activity::new();
+        let worker = job.clone();
+        let child = tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            run_with_activity(1, &cancel, worker, async {
+                for _ in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if progressing {
+                        Activity::progress_current();
+                    }
+                }
+                Ok(())
+            })
+            .await
+        });
+        let cancel = CancellationToken::new();
+        let result = run(Some(1), &cancel, job.observe(async { child.await? })).await;
+        if progressing {
+            result.unwrap();
+            assert!(!cancel.is_cancelled());
+        } else {
+            assert!(result.unwrap_err().is::<IdleTimeout>());
+            assert!(cancel.is_cancelled());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn continuing_progress_can_outlive_many_idle_windows() {
     let cancel = CancellationToken::new();
     let started = Instant::now();
