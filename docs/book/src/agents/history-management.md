@@ -135,6 +135,23 @@ checked against its captured provider result before publication. The oldest
 cards leave the deck when its token allocation fills. Cards do not recursively
 fold the entire old deck into every new summary.
 
+New summaries are written from the conversational assistant's first-person
+perspective, preserving attribution: “I checked the logs” for its own actions,
+and “Alex asked me…” when the supplied context establishes the user's preferred
+name. Otherwise the summary says “the user.” Plans, tool observations and other
+agents' work must remain distinguishable from completed assistant actions.
+Existing cards and original messages are not rewritten.
+
+Background deck inference also receives current excerpts of the owning agent's
+`IDENTITY.md`, `USER.md` and `SOUL.md`, capped at 1024 UTF-8 bytes per file.
+These optional Markdown references guide names and voice, not claims about
+conversation events or instructions to execute. They are read again for each
+inference call; no second profile or cached identity is stored. Links outside
+the agent workspace are rejected. Tool instructions, config, and the wider
+memory store are not part of this briefing. AIEOS-only identity is not separately
+rendered into this Markdown briefing; names present in the source conversation
+remain available.
+
 Normal requests continue while inference runs. At the recent-context or turn
 limit, context preparation waits for the pending job. A failed, empty,
 oversized, unavailable or unauthorized summary never authorizes deleting the
