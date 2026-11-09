@@ -19,7 +19,13 @@ async fn waiting_turn_observes_background_progress_without_creating_heartbeats()
             .await
         });
         let cancel = CancellationToken::new();
-        let result = run(Some(1), &cancel, job.observe(async { child.await? })).await;
+        let result = run(Some(1), &cancel, async {
+            // A summary may already be progressing before the foreground
+            // discovers it needs to wait. Credit that actual progress too.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            job.observe(async { child.await? }).await
+        })
+        .await;
         if progressing {
             result.unwrap();
             assert!(!cancel.is_cancelled());
