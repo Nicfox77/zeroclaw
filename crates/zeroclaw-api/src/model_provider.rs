@@ -889,6 +889,55 @@ pub struct ProviderContentPosition {
 }
 
 impl StreamEvent {
+    /// Ephemeral semantic progress for an incremental tool-argument fragment.
+    /// Carries no argument text, is never replayed, and is not a keepalive.
+    pub fn tool_argument_progress(bytes: usize) -> Self {
+        Self::ProtocolMetadata(
+            serde_json::json!({"kind":"generation_progress","component":"tool_arguments","bytes":bytes}),
+        )
+    }
+
+    pub fn is_transient_progress(&self) -> bool {
+        matches!(self, Self::ProtocolMetadata(metadata) if metadata.as_object().is_some_and(|fields|
+            fields.len() == 3 && metadata["kind"] == "generation_progress"
+                && metadata["component"] == "tool_arguments" && metadata["bytes"].as_u64().is_some()))
+    }
+
+    pub fn has_generation_progress(&self) -> bool {
+        match self {
+            Self::TextDelta(chunk) => {
+                !chunk.delta.is_empty()
+                    || chunk
+                        .reasoning
+                        .as_deref()
+                        .is_some_and(|reasoning| !reasoning.is_empty())
+            }
+            Self::ThinkingDelta(text) | Self::ReasoningFinalized(text) => !text.is_empty(),
+            Self::ToolCall(_)
+            | Self::PreExecutedToolCall { .. }
+            | Self::PreExecutedToolResult { .. } => true,
+            Self::OutputBlock(ProviderOutputBlock::ProtocolMetadata { .. }) => false,
+            Self::OutputBlock(_) => true,
+            Self::ProtocolMetadata(metadata) if self.is_transient_progress() => {
+                metadata["bytes"].as_u64().is_some_and(|bytes| bytes > 0)
+            }
+            Self::ProtocolMetadata(metadata) if metadata["kind"] == "tool_arguments_delta" => {
+                metadata["delta"]
+                    .as_str()
+                    .is_some_and(|delta| !delta.is_empty())
+            }
+            Self::ProtocolMetadata(metadata)
+                if metadata["kind"] == "partial_content"
+                    && metadata["type_name"] == "input_json_delta" =>
+            {
+                metadata["activity"]["delta"]["partial_json"]
+                    .as_str()
+                    .is_some_and(|delta| !delta.is_empty())
+            }
+            _ => false,
+        }
+    }
+
     pub fn from_chunk(chunk: StreamChunk) -> Self {
         if chunk.is_final {
             Self::Final

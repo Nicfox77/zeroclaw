@@ -3,6 +3,16 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+/// Turn-owned liveness observation, not tool policy or permission.
+pub trait ToolActivity: std::fmt::Debug + Send + Sync {
+    fn progress(&self);
+    /// A real operation with its own enforced deadline may remain quiet until
+    /// that deadline. Dropping the lease ends that allowance immediately.
+    fn bounded_wait(&self, timeout: std::time::Duration) -> Box<dyn ToolActivityLease>;
+}
+
+pub trait ToolActivityLease: Send + Sync {}
+
 tokio::task_local! {
     static TOOL_EXECUTION_CONTEXT: ToolExecutionContext;
 }
@@ -15,6 +25,7 @@ tokio::task_local! {
 #[derive(Debug, Clone, Default)]
 pub struct ToolExecutionContext {
     cancellation_token: Option<CancellationToken>,
+    activity: Option<std::sync::Arc<dyn ToolActivity>>,
 }
 
 /// The execution future was dropped because its owner cancelled the call.
@@ -24,7 +35,27 @@ pub struct ToolExecutionCancelled;
 
 impl ToolExecutionContext {
     pub fn new(cancellation_token: Option<CancellationToken>) -> Self {
-        Self { cancellation_token }
+        Self {
+            cancellation_token,
+            activity: None,
+        }
+    }
+
+    pub fn with_activity(mut self, activity: Option<std::sync::Arc<dyn ToolActivity>>) -> Self {
+        self.activity = activity;
+        self
+    }
+
+    pub fn progress(&self) {
+        if let Some(activity) = &self.activity {
+            activity.progress();
+        }
+    }
+
+    pub fn bounded_wait(&self, timeout: std::time::Duration) -> Option<Box<dyn ToolActivityLease>> {
+        self.activity
+            .as_ref()
+            .map(|activity| activity.bounded_wait(timeout))
     }
 
     pub fn cancellation_token(&self) -> Option<&CancellationToken> {
@@ -45,7 +76,8 @@ impl ToolExecutionContext {
         &self,
         future: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        TOOL_EXECUTION_CONTEXT
+        self.progress();
+        let result = TOOL_EXECUTION_CONTEXT
             .scope(self.clone(), async {
                 match self.cancellation_token() {
                     Some(token) => {
@@ -58,7 +90,9 @@ impl ToolExecutionContext {
                     None => future.await,
                 }
             })
-            .await
+            .await;
+        self.progress();
+        result
     }
 }
 

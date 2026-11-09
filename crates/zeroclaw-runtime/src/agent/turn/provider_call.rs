@@ -195,6 +195,7 @@ pub(crate) async fn announce_llm_request(
     }
 
     let llm_started_at = Instant::now();
+    zeroclaw_kernel::turn_activity::Activity::progress_current();
 
     // Fire void hook before LLM call
     if let Some(hooks) = ctx.hooks {

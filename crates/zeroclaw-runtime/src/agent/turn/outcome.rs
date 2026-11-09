@@ -310,6 +310,16 @@ fn terminal_completion_error_message_with_renderer(
     agent_name: Option<&str>,
     render: CliStringRenderer,
 ) -> Option<String> {
+    if let Some(idle) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<zeroclaw_kernel::turn_activity::IdleTimeout>())
+    {
+        let seconds = idle.seconds.to_string();
+        return Some(render(
+            "agent-turn-idle-timeout",
+            &[("seconds", seconds.as_str())],
+        ));
+    }
     if context_window_exceeded_from_error(err).is_some() {
         return Some(render("turn-context-window-exceeded-error", &[]));
     }

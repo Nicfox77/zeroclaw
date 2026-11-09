@@ -6858,12 +6858,19 @@ fn default_max_system_prompt_chars() -> usize {
 /// Pacing controls for slow/local LLM workloads (`[pacing]` section).
 ///
 /// All fields are optional and default to values that preserve existing
-/// behavior. When set, they extend — not replace — the existing timeout
-/// and loop-detection subsystems.
+/// behavior. The optional turn idle policy replaces the channel wall-clock
+/// budget; other controls extend existing timeout and loop-detection behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "pacing"]
 pub struct PacingConfig {
+    /// Maximum seconds without meaningful turn progress. When set, this
+    /// replaces the channel's total-duration budget for the shared turn engine.
+    /// Text/reasoning and tool boundaries refresh it. Bounded quiet operations
+    /// keep their existing execution deadlines. Increase for slow, uncached
+    /// local-model prompt processing. None preserves legacy timeout behavior.
+    #[serde(default)]
+    pub turn_idle_timeout_secs: Option<u64>,
     /// Per-step timeout in seconds: the maximum time allowed for a single
     /// LLM inference turn, independent of the total message budget.
     /// `None` means no per-step timeout (existing behavior).
@@ -6932,6 +6939,7 @@ fn default_loop_detection_no_progress_min_calls() -> usize {
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
+            turn_idle_timeout_secs: None,
             step_timeout_secs: None,
             loop_detection_min_elapsed_secs: None,
             loop_ignore_tools: Vec::new(),
@@ -16329,6 +16337,8 @@ pub struct ChannelsConfig {
     #[nested]
     pub plugin: HashMap<String, PluginChannelConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
+    /// The shared engine's `pacing.turn_idle_timeout_secs`, when set, replaces
+    /// this total-duration budget with progress-based inactivity supervision.
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
     /// entire conversation budget.
@@ -24354,6 +24364,15 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        if let Some(seconds) = self.pacing.turn_idle_timeout_secs {
+            anyhow::ensure!(
+                seconds > 0
+                    && std::time::Instant::now()
+                        .checked_add(std::time::Duration::from_secs(seconds))
+                        .is_some(),
+                "pacing.turn_idle_timeout_secs must be positive and representable"
+            );
+        }
         for (alias, agent) in &self.agents {
             agent.main_session.validate(self, alias)?;
         }
@@ -35314,6 +35333,7 @@ runtime_profile = "long_turn"
     #[test]
     async fn pacing_config_defaults_are_all_none_or_empty() {
         let cfg = PacingConfig::default();
+        assert!(cfg.turn_idle_timeout_secs.is_none());
         assert!(cfg.step_timeout_secs.is_none());
         assert!(cfg.loop_detection_min_elapsed_secs.is_none());
         assert!(cfg.loop_ignore_tools.is_empty());
@@ -35325,12 +35345,14 @@ runtime_profile = "long_turn"
         let raw = r#"
 default_temperature = 0.7
 [pacing]
+turn_idle_timeout_secs = 600
 step_timeout_secs = 120
 loop_detection_min_elapsed_secs = 60
 loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
 message_timeout_scale_max = 8
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.pacing.turn_idle_timeout_secs, Some(600));
         assert_eq!(parsed.pacing.step_timeout_secs, Some(120));
         assert_eq!(parsed.pacing.loop_detection_min_elapsed_secs, Some(60));
         assert_eq!(
@@ -35338,6 +35360,25 @@ message_timeout_scale_max = 8
             vec!["browser_screenshot", "browser_navigate"]
         );
         assert_eq!(parsed.pacing.message_timeout_scale_max, Some(8));
+    }
+
+    #[test]
+    async fn pacing_idle_timeout_rejects_disabled_or_unrepresentable_budgets() {
+        for seconds in [0, u64::MAX] {
+            let mut config = Config::default();
+            config.pacing.turn_idle_timeout_secs = Some(seconds);
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pacing.turn_idle_timeout_secs")
+            );
+        }
+        let parsed: PacingConfig = toml::from_str("turn_idle_timeout_secs = 7200").unwrap();
+        assert_eq!(parsed.turn_idle_timeout_secs, Some(7200));
+        let restored: PacingConfig = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(restored.turn_idle_timeout_secs, Some(7200));
     }
 
     #[test]

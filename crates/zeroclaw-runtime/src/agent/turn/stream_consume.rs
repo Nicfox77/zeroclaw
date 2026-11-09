@@ -285,6 +285,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 .into());
             }
         };
+        if event.has_generation_progress() {
+            zeroclaw_kernel::turn_activity::Activity::progress_current();
+        }
         match event {
             StreamEvent::OutputBlock(block) => {
                 replay_blocking_activity = true;
