@@ -59,7 +59,8 @@ impl Activity {
             return future.await;
         }
         let mut updates = self.0.changed.subscribe();
-        let mut observed = self.0.state.lock().last_progress;
+        let latest = self.0.state.lock().last_progress;
+        parent.note_progress(latest);
         tokio::pin!(future);
         loop {
             tokio::select! {
@@ -67,12 +68,18 @@ impl Activity {
                 result = &mut future => return result,
                 _ = updates.changed() => {
                     let latest = self.0.state.lock().last_progress;
-                    if latest > observed {
-                        parent.progress();
-                        observed = latest;
-                    }
+                    parent.note_progress(latest);
                 }
             }
+        }
+    }
+
+    fn note_progress(&self, observed: Instant) {
+        let mut state = self.0.state.lock();
+        if observed > state.last_progress {
+            state.last_progress = observed;
+            drop(state);
+            self.0.changed.send_replace(());
         }
     }
 
@@ -103,8 +110,7 @@ impl Activity {
 }
 impl ToolActivity for Activity {
     fn progress(&self) {
-        self.0.state.lock().last_progress = Instant::now();
-        self.0.changed.send_replace(());
+        self.note_progress(Instant::now());
     }
     fn bounded_wait(&self, timeout: Duration) -> Box<dyn ToolActivityLease> {
         // IDs are only transient lease identities. A turn cannot create 2^64
