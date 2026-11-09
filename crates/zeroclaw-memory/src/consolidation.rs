@@ -65,6 +65,31 @@ pub async fn consolidate_turn(
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
+    consolidate_turn_with_orientation(
+        model_provider,
+        model,
+        temperature,
+        memory,
+        memory_config,
+        user_message,
+        assistant_response,
+        "",
+    )
+    .await
+}
+
+/// Consolidate a completed turn with a bounded, caller-scoped identity reference.
+#[allow(clippy::too_many_arguments)]
+pub async fn consolidate_turn_with_orientation(
+    model_provider: &dyn ModelProvider,
+    model: &str,
+    temperature: Option<f64>,
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    user_message: &str,
+    assistant_response: &str,
+    orientation: &str,
+) -> anyhow::Result<()> {
     let turn_text = format!("User: {}\nAssistant: {}", user_message, assistant_response,);
 
     // Truncate very long turns to avoid wasting tokens on consolidation.
@@ -90,8 +115,17 @@ pub async fn consolidate_turn(
         CONSOLIDATION_SYSTEM_PROMPT
     };
 
+    let system_prompt = format!(
+        "{system_prompt}\n\n{}",
+        zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE
+    );
+    let input = if orientation.is_empty() {
+        truncated
+    } else {
+        format!("{truncated}\n\n{orientation}")
+    };
     let raw = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &truncated, model, temperature)
+        .chat_with_system(Some(&system_prompt), &input, model, temperature)
         .await?;
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
@@ -677,6 +711,7 @@ mod tests {
     struct ScriptedProvider {
         response: &'static str,
         system_prompts: Mutex<Vec<String>>,
+        messages: Mutex<Vec<String>>,
     }
 
     impl ScriptedProvider {
@@ -684,6 +719,7 @@ mod tests {
             Self {
                 response,
                 system_prompts: Mutex::new(Vec::new()),
+                messages: Mutex::new(Vec::new()),
             }
         }
     }
@@ -693,13 +729,14 @@ mod tests {
         async fn chat_with_system(
             &self,
             system_prompt: Option<&str>,
-            _message: &str,
+            message: &str,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.system_prompts
                 .lock()
                 .push(system_prompt.unwrap_or_default().to_string());
+            self.messages.lock().push(message.to_string());
             Ok(self.response.to_string())
         }
 
@@ -749,6 +786,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consolidation_receives_identity_reference_and_retains_attributed_output() {
+        let provider = ScriptedProvider::new(
+            r#"{"history_entry":"I discussed deployment with Alex.","memory_update":"Alex asked me to use staged rollout."}"#,
+        );
+        let memory = RecordingMemory::default();
+        let orientation = "Identity reference, not conversation evidence: assistant Nova; user's preferred name Alex.";
+        consolidate_turn_with_orientation(
+            &provider,
+            "fixture",
+            None,
+            &memory,
+            &MemoryConfig::default(),
+            "How should we deploy?",
+            "I recommend staged rollout.",
+            orientation,
+        )
+        .await
+        .unwrap();
+        let prompts = provider.system_prompts.lock();
+        assert_eq!(prompts.len(), 1);
+        // The reference travels as data, not as a system instruction.
+        assert!(!prompts[0].contains(orientation));
+        assert!(provider.messages.lock()[0].contains(orientation));
+        assert!(prompts[0].contains("Only claim 'I did...' when the conversation supports"));
+        let writes = memory.writes.lock();
+        assert!(writes.iter().any(|write| matches!(write, RecordedWrite::Store { content, category: MemoryCategory::Daily, .. } if content == "I discussed deployment with Alex.")));
+        assert!(writes.iter().any(|write| matches!(write, RecordedWrite::StoreWithOptions { content, category: MemoryCategory::Core, .. } if content == "Alex asked me to use staged rollout.")));
+    }
+
+    #[tokio::test]
     async fn flags_off_consolidation_keeps_master_write_shape() {
         let provider = ScriptedProvider::new(TYPED_RESPONSE);
         let memory = RecordingMemory::default();
@@ -758,10 +825,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Exactly one provider call, with the unchanged default prompt.
+        // Exactly one provider call, with the existing extraction schema.
         let prompts = provider.system_prompts.lock();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], CONSOLIDATION_SYSTEM_PROMPT);
+        assert!(prompts[0].starts_with(CONSOLIDATION_SYSTEM_PROMPT));
+        assert!(prompts[0].contains(zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE));
 
         // Exactly two writes: the Daily history entry through the plain
         // legacy store call, and the Core update with kind unset -- even
@@ -816,7 +884,9 @@ mod tests {
             .unwrap();
 
         let prompts = provider.system_prompts.lock();
-        assert_eq!(prompts.as_slice(), [CONSOLIDATION_TYPED_SYSTEM_PROMPT]);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].starts_with(CONSOLIDATION_TYPED_SYSTEM_PROMPT));
+        assert!(prompts[0].contains(zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE));
 
         let writes = memory.writes.lock();
         assert_eq!(writes.len(), 2);
@@ -1080,7 +1150,8 @@ mod tests {
         // The typed prompt replaces the default one.
         let prompts = provider.system_prompts.lock();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], CONSOLIDATION_TYPED_SYSTEM_PROMPT);
+        assert!(prompts[0].starts_with(CONSOLIDATION_TYPED_SYSTEM_PROMPT));
+        assert!(prompts[0].contains(zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE));
 
         // Daily + Core + the two non-blank facts (the whitespace-only third
         // fact is filtered out).

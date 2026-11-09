@@ -4,6 +4,7 @@
 pub mod conversation_owners;
 pub mod cost_ledger;
 pub mod debounce;
+pub mod memory_orientation;
 pub mod net_guard;
 pub mod session_events;
 pub mod session_queue;

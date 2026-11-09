@@ -454,6 +454,12 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     }
     prompt.push('\n');
 
+    if inject_memory {
+        prompt.push_str("## Writing memories\n\n");
+        prompt.push_str(zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE);
+        prompt.push_str("\n\n");
+    }
+
     // ── 2b. Shell dialect ───────────────────────────────────────
     // Only when a registered tool takes a model-authored command: the syntax
     // list is dead weight otherwise. Skipped in compact_context for the same

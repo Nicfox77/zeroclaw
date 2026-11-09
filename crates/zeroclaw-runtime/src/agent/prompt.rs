@@ -340,6 +340,10 @@ impl PromptSection for IdentitySection {
             )
         };
         prompt.push_str(&profile.render());
+        if ctx.inject_memory {
+            prompt.push_str("\n\n## Writing memories\n\n");
+            prompt.push_str(zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE);
+        }
 
         Ok(prompt)
     }
