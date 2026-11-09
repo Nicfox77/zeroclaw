@@ -1709,6 +1709,48 @@ async fn run_tool_call_loop_inner<'a>(
     seed_reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> Result<String> {
+    let idle = p.exec.pacing.turn_idle_timeout_secs;
+    let cancel = p
+        .cancellation_token
+        .as_ref()
+        .map(CancellationToken::child_token)
+        .unwrap_or_default();
+    if idle.is_some() {
+        p.cancellation_token = Some(cancel.clone());
+    }
+    let engine = run_tool_call_loop_body(p, initial_ingress, seed_reported_usage, repetition_guard);
+    zeroclaw_kernel::turn_activity::run(idle, &cancel, engine)
+        .await
+        .map_err(|error| {
+            if let Some(timeout) =
+                error.downcast_ref::<zeroclaw_kernel::turn_activity::IdleTimeout>()
+            {
+                let seconds = timeout.seconds.to_string();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_attrs(serde_json::json!({"idle_timeout_secs":timeout.seconds})),
+                    "turn_idle_timeout"
+                );
+                error.context(zeroclaw_api::turn_stop::TurnStop::close_out(
+                    zeroclaw_api::turn_stop::TurnStopCode::TurnTimeout,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "agent-turn-idle-timeout",
+                        &[("seconds", seconds.as_str())],
+                    ),
+                ))
+            } else {
+                error
+            }
+        })
+}
+
+async fn run_tool_call_loop_body<'a>(
+    mut p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -2883,9 +2925,12 @@ async fn run_tool_call_loop_inner<'a>(
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();
-        let should_consume_provider_stream = (on_delta.is_some() || event_tx.is_some())
-            && active_provider_supports_streaming
-            && (request_tools.is_none() || active_provider_supports_streaming_tool_events);
+        // Inactivity supervision needs generation progress even when a caller
+        // has no incremental display sink. Respect provider/tool capabilities.
+        let should_consume_provider_stream =
+            (on_delta.is_some() || event_tx.is_some() || pacing.turn_idle_timeout_secs.is_some())
+                && active_provider_supports_streaming
+                && (request_tools.is_none() || active_provider_supports_streaming_tool_events);
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -12077,6 +12122,199 @@ mod tool_lifecycle_abandonment_tests {
                 .expect("retaining state lock")
                 .retain(|id| id != context.invocation_id());
         }
+    }
+
+    struct InactivityStreamingProvider {
+        meaningful: bool,
+    }
+    impl zeroclaw_api::attribution::Attributable for InactivityStreamingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "inactivity-fixture"
+        }
+    }
+    #[async_trait::async_trait]
+    impl ModelProvider for InactivityStreamingProvider {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("fixture must use streaming even without a UI sink")
+        }
+        fn stream_chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            let meaningful = self.meaningful;
+            Box::pin(futures_util::stream::unfold(0, move |index| async move {
+                use zeroclaw_api::model_provider::{StreamChunk, StreamEvent};
+                if index > 12 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let event = if meaningful {
+                    match index {
+                        0..=2 => StreamEvent::ThinkingDelta("hidden reasoning".into()),
+                        3..=9 => StreamEvent::TextDelta(StreamChunk::reasoning("hidden reasoning")),
+                        10 => StreamEvent::TextDelta(StreamChunk::delta("done")),
+                        _ => StreamEvent::Final,
+                    }
+                } else if index % 2 == 0 {
+                    StreamEvent::TextDelta(StreamChunk::delta(""))
+                } else {
+                    StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"ping"}))
+                };
+                Some((Ok(event), index + 1))
+            }))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_streams_without_ui_and_accepts_hidden_reasoning_progress() {
+        let registry = registry_with(vec![]);
+        let mut history = vec![ChatMessage::user("fixture")];
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            turn_idle_timeout_secs: Some(2),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let reply = run_scripted_loop_with_budget(
+            &InactivityStreamingProvider { meaningful: true },
+            &registry,
+            &NoopObserver,
+            None,
+            &pacing,
+            "idle-stream",
+            false,
+            None,
+            &mut history,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, "done");
+        assert_eq!(started.elapsed(), Duration::from_secs(12));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_ignores_empty_chunks_and_protocol_keepalives() {
+        let registry = registry_with(vec![]);
+        let mut history = vec![ChatMessage::user("fixture")];
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            turn_idle_timeout_secs: Some(2),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let error = run_scripted_loop_with_budget(
+            &InactivityStreamingProvider { meaningful: false },
+            &registry,
+            &NoopObserver,
+            None,
+            &pacing,
+            "idle-noise",
+            false,
+            None,
+            &mut history,
+            0,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<zeroclaw_api::turn_stop::TurnStop>()
+                .unwrap()
+                .code,
+            zeroclaw_api::turn_stop::TurnStopCode::TurnTimeout
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_timeout_cooperatively_abandons_a_stalled_tool() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            turn_idle_timeout_secs: Some(2),
+            ..Default::default()
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RetainingHook {
+            events: events.clone(),
+            retained: retained.clone(),
+        }));
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
+                text: None,
+                tool_calls: vec![tool_call("call-a", "hang_tool", serde_json::json!({}))],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![Box::new(HangingTool {
+            name: "hang_tool".into(),
+        })]);
+        let mut history = vec![ChatMessage::user("fixture request")];
+        let started = tokio::time::Instant::now();
+        let error = run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "idle-turn",
+            false,
+            Some(CancellationToken::new()),
+            &mut history,
+        )
+        .await
+        .unwrap_err();
+        let stop = error
+            .downcast_ref::<zeroclaw_api::turn_stop::TurnStop>()
+            .unwrap();
+        assert_eq!(
+            stop.code,
+            zeroclaw_api::turn_stop::TurnStopCode::TurnTimeout
+        );
+        assert!(stop.detail.contains("without model or tool progress"));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(
+            retained.lock().unwrap().is_empty(),
+            "cooperative stop must release hook state"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("abandoned:"))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event.starts_with("after:")));
     }
 
     #[tokio::test]

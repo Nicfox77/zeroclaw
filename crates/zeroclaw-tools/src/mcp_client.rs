@@ -623,6 +623,8 @@ impl McpServer {
         timeout_secs: u64,
         operation: &str,
     ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+        let _activity_wait = zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.bounded_wait(Duration::from_secs(timeout_secs)));
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut pre_write_retries = 0;
 

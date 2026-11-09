@@ -43,7 +43,8 @@ impl MemoryStrategy for DefaultMemoryStrategy {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<()> {
-        zeroclaw_memory::consolidation::consolidate_turn(
+        let orientation = zeroclaw_infra::memory_orientation::load(&self.workspace_dir)?;
+        zeroclaw_memory::consolidation::consolidate_turn_with_orientation(
             provider,
             model,
             temperature,
@@ -51,6 +52,7 @@ impl MemoryStrategy for DefaultMemoryStrategy {
             &self.memory_config,
             user_message,
             assistant_response,
+            &orientation,
         )
         .await
     }

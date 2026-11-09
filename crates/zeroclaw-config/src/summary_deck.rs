@@ -16,9 +16,12 @@ pub struct SummaryDeckConfig {
     pub trigger_ratio: f64,
     /// Maximum estimated tokens in one generated summary; provenance headers also count against the deck allocation.
     pub max_summary_tokens: usize,
-    /// Bound each background inference attempt, in seconds.
+    /// Maximum seconds without model progress during background inference.
+    /// Nonempty text/reasoning refreshes this allowance; prefill has no progress
+    /// until the provider emits output. Also bounds waiting to publish a card.
     pub timeout_secs: u64,
-    /// Optional configured model-provider reference; empty uses the session's current route.
+    /// Optional deck-specific model-provider reference. Empty inherits the
+    /// agent/compression summary provider, then the session's current route.
     pub provider: ModelProviderRef,
 }
 
@@ -29,7 +32,7 @@ impl Default for SummaryDeckConfig {
             summary_share: 0.15,
             trigger_ratio: 0.8,
             max_summary_tokens: 1_000,
-            timeout_secs: 60,
+            timeout_secs: 600,
             provider: ModelProviderRef::default(),
         }
     }
@@ -50,8 +53,11 @@ impl SummaryDeckConfig {
             "summary_deck.max_summary_tokens must be at least 64"
         );
         anyhow::ensure!(
-            self.timeout_secs > 0 && self.timeout_secs <= 600,
-            "summary_deck.timeout_secs must be between 1 and 600"
+            self.timeout_secs > 0
+                && std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(self.timeout_secs))
+                    .is_some(),
+            "summary_deck.timeout_secs must be positive and representable"
         );
         Ok(())
     }
@@ -97,6 +103,22 @@ mod tests {
         assert!(
             SummaryDeckConfig {
                 timeout_secs: 0,
+                ..policy.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SummaryDeckConfig {
+                timeout_secs: 1800,
+                ..policy.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            SummaryDeckConfig {
+                timeout_secs: u64::MAX,
                 ..policy
             }
             .validate()

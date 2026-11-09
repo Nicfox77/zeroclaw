@@ -1,5 +1,9 @@
 //! Live runtime policy and provider composition for the kernel summary deck.
 use super::*;
+use futures_util::{StreamExt, stream::BoxStream};
+use zeroclaw_api::model_provider::{
+    ChatRequest, ProviderOutputBlock, StreamEvent, StreamOptions, StreamResult,
+};
 use zeroclaw_api::session_events::capture::ContextSummaryExecutor;
 use zeroclaw_kernel::session::summary_deck::{ResolvedSummaryDeck, SummaryDeckRuntime};
 
@@ -45,6 +49,21 @@ impl SummaryDeckRuntime for Runtime {
 }
 
 impl Runtime {
+    // The deck-specific override wins; otherwise share the canonical agent /
+    // compression summary route. Resolve from live config at the use boundary.
+    fn configured_provider(&self, config: &zeroclaw_config::schema::Config) -> Option<String> {
+        config
+            .runtime_profile_for_agent(&self.agent)
+            .map(|profile| profile.summary_deck.provider.trim())
+            .filter(|provider| !provider.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                config
+                    .effective_summary_provider(&self.agent)
+                    .map(|provider| provider.trim().to_owned())
+            })
+    }
+
     fn policy(
         &self,
         selected: Option<(&str, &str)>,
@@ -69,12 +88,9 @@ impl Runtime {
         let budget = config
             .resolved_context_limits_for_route(&self.agent, active_ref, active_model)
             .context_token_budget;
-        let provider_ref = if profile.summary_deck.provider.trim().is_empty() {
-            active_ref.to_owned()
-        } else {
-            profile.summary_deck.provider.trim().to_owned()
-        };
-        let model = if profile.summary_deck.provider.trim().is_empty() {
+        let configured = self.configured_provider(&config);
+        let provider_ref = configured.as_deref().unwrap_or(active_ref);
+        let model = if configured.is_none() {
             Some(active_model)
         } else {
             None
@@ -82,10 +98,10 @@ impl Runtime {
         let source_window = config
             .resolved_context_limits_for_route(
                 &self.agent,
-                &provider_ref,
+                provider_ref,
                 &zeroclaw_providers::factory::resolve_session_model_name(
                     &config,
-                    &provider_ref,
+                    provider_ref,
                     model,
                 )?,
             )
@@ -112,14 +128,15 @@ impl Runtime {
         let (family, alias, _) = config
             .resolved_model_provider_for_agent(&self.agent)
             .ok_or_else(|| anyhow::Error::msg("summary_deck_provider_unavailable"))?;
-        let provider_ref = if profile.summary_deck.provider.trim().is_empty() {
+        let configured = self.configured_provider(&config);
+        let provider_ref = if let Some(provider) = configured.as_ref() {
+            provider.clone()
+        } else {
             selected
                 .map(|(provider, _)| provider.to_owned())
                 .unwrap_or_else(|| format!("{family}.{alias}"))
-        } else {
-            profile.summary_deck.provider.trim().to_owned()
         };
-        let model = if profile.summary_deck.provider.trim().is_empty() {
+        let model = if configured.is_none() {
             selected.map(|(_, model)| model)
         } else {
             None
@@ -134,10 +151,18 @@ impl Runtime {
         let session = self.session.to_string();
         Ok(Box::new(move |conversation| {
             Box::pin(async move {
-                let messages: Vec<_> = conversation
+                let mut messages: Vec<_> = conversation
                     .iter()
                     .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
                     .collect();
+                let workspace = live.read().agent_workspace_dir(&agent);
+                let orientation = zeroclaw_infra::memory_orientation::load(&workspace)?;
+                if !orientation.is_empty() {
+                    messages.insert(
+                        0,
+                        zeroclaw_api::model_provider::ChatMessage::user(orientation),
+                    );
+                }
                 let tracker = super::summary_cost::admit(
                     &live,
                     &agent,
@@ -147,20 +172,21 @@ impl Runtime {
                 )?;
                 let accounting = zeroclaw_providers::dispatch::AccountedChatScope::new();
                 let response = accounting
-                    .scope(
+                    .scope(consume_summary(
                         zeroclaw_providers::dispatch::ProviderDispatch::from_ref(
                             binding.provider.as_ref(),
                         )
-                        .chat(
-                            zeroclaw_api::model_provider::ChatRequest {
+                        .stream_chat(
+                            ChatRequest {
                                 messages: &messages,
                                 tools: None,
                                 thinking: None,
                             },
                             &binding.model,
                             Some(0.0),
+                            StreamOptions::new(true).with_token_count(),
                         ),
-                    )
+                    ))
                     .await;
                 if response.is_ok() {
                     accounting.mark_logical_success();
@@ -172,13 +198,150 @@ impl Runtime {
                     &session,
                     accounting.take(),
                 )?;
-                let response = response?;
-                anyhow::ensure!(
-                    response.tool_calls.is_empty(),
-                    "summary_deck_unexpected_tool_calls"
-                );
-                Ok(response.text_or_empty().to_owned())
+                response
             })
         }))
+    }
+}
+
+async fn consume_summary(
+    mut stream: BoxStream<'static, StreamResult<StreamEvent>>,
+) -> anyhow::Result<String> {
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        let event = event?;
+        if event.has_generation_progress() {
+            zeroclaw_kernel::turn_activity::Activity::progress_current();
+        }
+        match event {
+            StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
+            StreamEvent::OutputBlock(ProviderOutputBlock::Text { text: block }) => {
+                text.push_str(&block)
+            }
+            StreamEvent::OutputBlock(
+                ProviderOutputBlock::ProtocolMetadata { .. }
+                | ProviderOutputBlock::Reasoning { .. },
+            ) => {}
+            StreamEvent::Final => return Ok(text),
+            StreamEvent::ToolCall(_)
+            | StreamEvent::PreExecutedToolCall { .. }
+            | StreamEvent::PreExecutedToolResult { .. } => {
+                anyhow::bail!("summary_deck_unexpected_tool_calls")
+            }
+            StreamEvent::OutputBlock(_) => anyhow::bail!("summary_deck_unexpected_output_block"),
+            _ => {}
+        }
+    }
+    anyhow::bail!("summary_deck_incomplete_stream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream;
+    use std::time::Duration;
+    use zeroclaw_api::model_provider::StreamChunk;
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_stream_counts_real_progress_but_not_keepalives() {
+        for progressing in [true, false] {
+            let stream = stream::unfold(0, move |n| async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let event = if !progressing {
+                    StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"keepalive"}))
+                } else if n < 8 {
+                    StreamEvent::ThinkingDelta("private reasoning".into())
+                } else if n == 8 {
+                    StreamEvent::TextDelta(StreamChunk::delta("I checked the result."))
+                } else {
+                    StreamEvent::Final
+                };
+                Some((Ok(event), n + 1))
+            })
+            .boxed();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let started = tokio::time::Instant::now();
+            let result =
+                zeroclaw_kernel::turn_activity::run(Some(1), &cancel, consume_summary(stream))
+                    .await;
+            if progressing {
+                assert_eq!(result.unwrap(), "I checked the result.");
+                assert!(started.elapsed() > Duration::from_secs(1));
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .is::<zeroclaw_kernel::turn_activity::IdleTimeout>()
+                );
+                assert!(cancel.is_cancelled());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_stream_requires_final_and_propagates_provider_errors() {
+        let error = consume_summary(stream::empty().boxed()).await.unwrap_err();
+        assert_eq!(error.to_string(), "summary_deck_incomplete_stream");
+        let error = consume_summary(
+            stream::iter([Err(zeroclaw_api::model_provider::StreamError::Http(
+                "fixture".into(),
+            ))])
+            .boxed(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("fixture"));
+    }
+
+    #[test]
+    fn summary_route_reads_current_overrides_in_precedence_order() {
+        let mut config = config_fixture();
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let runtime = Runtime {
+            config: live.handle(),
+            agent: "fixture".into(),
+            session: SessionId::parse("fixture-session").unwrap(),
+        };
+        assert_eq!(runtime.configured_provider(&config), None);
+        config
+            .runtime_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .context_compression
+            .summary_provider = "custom.profile".into();
+        assert_eq!(
+            runtime.configured_provider(&config).as_deref(),
+            Some("custom.profile")
+        );
+        config.agents.get_mut("fixture").unwrap().summary_provider = "custom.agent".into();
+        assert_eq!(
+            runtime.configured_provider(&config).as_deref(),
+            Some("custom.agent")
+        );
+        config
+            .runtime_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .summary_deck
+            .provider = "custom.deck".into();
+        assert_eq!(
+            runtime.configured_provider(&config).as_deref(),
+            Some("custom.deck")
+        );
+    }
+
+    fn config_fixture() -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "fixture".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "fixture".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .runtime_profiles
+            .insert("fixture".into(), Default::default());
+        config
     }
 }
