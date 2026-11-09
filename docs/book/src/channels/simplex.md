@@ -78,6 +78,29 @@ rules still override grants. Authorization, agent ownership, speech activation,
 and speech-provider selection resolve from live config at use time. Restart or
 reload the daemon after changing the bridge executable or CLI endpoint.
 
+## Live text replies
+
+Live messages are the default for SimpleX. An admitted turn starts with
+`Processing…`, then shows `Thinking…` while waiting for the model. Safe response
+text replaces that label in the same message as it streams. Updates are
+coalesced to at most two per second, and the message leaves live mode when the
+response completes. Completed narration before tools becomes a finished message;
+the next response phase starts another live message. `channels.show_tool_calls`
+continues to control tool details independently of these status labels.
+
+These labels are transport status only: they never enter the conversation or
+speech synthesis. Provider reasoning is not exposed. If outbound hooks must
+approve content, or the reply is explicitly routed elsewhere, speculative text
+is withheld until the shared delivery path approves it. Text finalizes before
+waiting for a voice note, so text and speech do not delay one another.
+
+Cancellation deletes an unused placeholder or finalizes visible partial text
+with `[Interrupted]`. On reconnect, the helper discovers only recent sent live
+items in bounded direct-chat history; native authorization must approve each
+cleanup. It does not replay an answer after an uncertain final edit. Old items
+outside that recovery window can remain unfinished. Update the helper and the
+native binary together when upgrading this adapter.
+
 ## Voice notes
 
 Incoming direct voice notes are downloaded only after checking the live peer
@@ -224,7 +247,7 @@ HTML renderer to SimpleX.
 
 The helper uses a pinned Markdown lexer and never evaluates HTML or fetches
 linked resources. Text is split at the existing 12,000-character limit without
-splitting Unicode characters; each converted emphasis span closes inside its
+splitting Unicode characters; JSON-encoded chunks also respect a byte budget; each converted emphasis span closes inside its
 message. There is no formatting setting to synchronize with the model.
 
 ## Verification and rollback
@@ -232,10 +255,15 @@ message. There is no formatting setting to synchronize with the model.
 Run `npm test` in `contrib/simplex` (ffmpeg and ffprobe are required for note tests). With `CHROMIUM_PATH` and assets configured,
 `SIMPLEX_RTC_TEST=1 npm test` additionally checks encrypted audio in both directions
 through public TURN and rejects mismatched encryption keys. `SIMPLEX_CLI_TEST=1 npm test` additionally
-creates two temporary CLI profiles and verifies encrypted voice-note transfers
+creates two temporary CLI profiles and verifies live message creation, edits,
+finalization, parsed formatting, and encrypted voice-note transfers
 in both directions through public relays; `SIMPLEX_CLI_PATH` selects the CLI binary.
-Rust adapter tests exercise peer denial,
-live policy changes, routing, and speech before finalization.
+`SIMPLEX_DAEMON_TEST=1 node --test live-daemon.test.mjs` drives an isolated real
+daemon and helper with mock model and SimpleX WebSocket endpoints. Build the
+native binary first; `ZEROCLAW_TEST_BINARY` can select its path. This checks
+status, streaming edits, tool narration, finalization, and conversation continuity
+without contacting existing users or model services. Rust adapter tests exercise
+peer denial, live policy changes, routing, and speech before finalization.
 `SIMPLEX_RELAY_TEST=1 npm test` additionally exercises the real helper through
 public TURN relays with simulated CLI signaling, including speech detection and
 interruption. It does not contact phone users or invoke model providers.

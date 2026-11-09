@@ -6,13 +6,14 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     sync::{mpsc, oneshot, watch},
 };
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::channel::{Channel, ChannelControl, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelControl, ChannelMessage, ProgressEvent, SendMessage};
 use zeroclaw_config::live::LiveConfigHandle;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -23,6 +24,12 @@ fn bridge_result(value: Value) -> Result<()> {
         return Ok(());
     }
     let error = anyhow::Error::msg("simplex_bridge_command_failed");
+    if value["no_resend"] == true {
+        return Err(zeroclaw_api::channel::FinalizeUndelivered {
+            reason: "simplex_live_delivery_uncertain".into(),
+        }
+        .into());
+    }
     if value["not_delivered"] == true {
         Err(zeroclaw_api::session_events::capture::delivery_definitely_failed(error))
     } else {
@@ -208,6 +215,13 @@ impl SimplexChannel {
         }
         result
     }
+    fn take_draft(&self, recipient: &str, id: &str) -> Result<Option<VoiceDraft>> {
+        let mut drafts = self.inner.drafts.lock();
+        if let Some(draft) = drafts.get(id) {
+            ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+        }
+        Ok(drafts.remove(id))
+    }
     fn manager(&self, contact: &str, call: bool) -> Result<crate::tts::TtsManager> {
         ensure!(self.allowed(contact, call), "simplex_voice_not_authorized");
         let config = self.inner.config.read();
@@ -244,6 +258,7 @@ impl SimplexChannel {
         &self,
         recipient: &str,
         mut draft: Option<VoiceDraft>,
+        draft_id: Option<&str>,
         text: &str,
         suppress_voice: bool,
         force_voice: bool,
@@ -256,6 +271,27 @@ impl SimplexChannel {
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
         }
         let is_call = draft.as_ref().is_some_and(|d| !d.scope.is_empty());
+        let live_text = draft.as_mut().and_then(|draft| draft.text.as_mut());
+        let text_committed = if let (Some(live), Some(id)) = (live_text, draft_id) {
+            live.stop().await?;
+            // Commit the text immediately; speech may still be synthesizing.
+            // Never replace an uncertain edit with a second full text send.
+            self.request(json!({"type":"live_finish","contact":recipient,"draft":id,"text":text}))
+                .await
+                .map_err(|error| {
+                    if zeroclaw_api::session_events::capture::is_capture_stopped(&error) {
+                        error
+                    } else {
+                        zeroclaw_api::channel::FinalizeUndelivered {
+                            reason: "simplex_live_finalization_failed".into(),
+                        }
+                        .into()
+                    }
+                })?;
+            true
+        } else {
+            false
+        };
         let mut voice = None;
         if !is_call && !suppress_voice && self.wants_note(recipient, force_voice) {
             let prepared = draft.as_mut().and_then(|d| d.note.take());
@@ -288,8 +324,8 @@ impl SimplexChannel {
                 }
             }
         }
-        // Audio failure after text delivery must never trigger a duplicate text
-        // fallback. Deliver audio first and let final text ACK be authoritative.
+        // Live text is committed independently. Direct non-draft replies retain
+        // their combined text/note boundary; speech failure must not repeat text.
         if !suppress_voice
             && let Some(mut draft) = draft
             && let Err(error) = draft.finish(text).await
@@ -305,6 +341,31 @@ impl SimplexChannel {
                     .with_attrs(json!({"error": error.to_string()})),
                 "SimpleX speech failed; delivering final text"
             );
+        }
+        if text_committed {
+            if self.allowed(recipient, false)
+                && let Some(audio) = voice
+                && self.wants_note(recipient, force_voice)
+                && self.manager(recipient, false).is_ok()
+                && let Err(error) = self
+                    .request(json!({"type":"send","contact":recipient,"text":"","voice":audio}))
+                    .await
+            {
+                if zeroclaw_api::session_events::capture::is_capture_stopped(&error) {
+                    return Err(error);
+                }
+                // A failed voice upload/notice cannot authorize a full text resend.
+                self.voice_notice(recipient, true).await.map_err(|error| {
+                    if zeroclaw_api::session_events::capture::is_capture_stopped(&error) {
+                        error
+                    } else {
+                        anyhow::Error::new(zeroclaw_api::channel::FinalizePartialDelivery {
+                            delivered: 1,
+                        })
+                    }
+                })?;
+            }
+            return Ok(());
         }
         ensure!(
             self.allowed(recipient, false),
@@ -507,8 +568,39 @@ impl SimplexChannel {
     async fn event(&self, event: Value, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let kind = event["type"].as_str().unwrap_or("");
         let contact = event["contact"].as_str().unwrap_or("");
+        if kind == "live_orphan" {
+            if self.allowed(contact, false) {
+                self.request(json!({"type":"live_recover","contact":contact,
+                    "item_id":event["item_id"],
+                    "interrupted":simplex_progress("interrupted"),
+                    "placeholders":[simplex_progress("processing"),simplex_progress("thinking"),simplex_progress("working")]})).await?;
+            }
+            return Ok(());
+        }
+        if matches!(kind, "interrupted" | "call_ended") {
+            // Deliver interruption control before waiting for text cleanup ACKs.
+            // A slow platform edit must never delay cancellation of the model.
+            self.playback_observation(&event, tx, kind == "interrupted")
+                .await?;
+            // The reader cancels speech immediately. Settle text here, where
+            // awaiting an edit ACK cannot block the reader that receives it.
+            let call_id = event["call_id"].as_str().unwrap_or("");
+            let ids: Vec<_> = self
+                .inner
+                .drafts
+                .lock()
+                .iter()
+                .filter(|(_, draft)| {
+                    draft.contact == contact && draft.scope.split('/').next() == Some(call_id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in ids {
+                self.cancel_draft(contact, &id).await?;
+            }
+        }
         if kind == "interrupted" {
-            return self.playback_observation(&event, tx, true).await;
+            return Ok(());
         }
         if kind == "call_audio" {
             let call = event["call_id"]
@@ -545,7 +637,6 @@ impl SimplexChannel {
             if let Some(call) = event["call_id"].as_str() {
                 self.inner.recognition.lock().remove(call);
             }
-            self.playback_observation(&event, tx, false).await?;
             let prefix = format!("{}/", event["call_id"].as_str().unwrap_or(""));
             self.inner
                 .transcripts
@@ -851,9 +942,13 @@ impl Channel for SimplexChannel {
                     // Drop synthesis immediately, even while STT is pending.
                     let contact = value["contact"].as_str().unwrap_or("");
                     let call_id = value["call_id"].as_str().unwrap_or("");
-                    channel.inner.drafts.lock().retain(|_, draft| {
-                        draft.contact != contact || draft.scope.split('/').next() != Some(call_id)
-                    });
+                    for draft in channel.inner.drafts.lock().values() {
+                        if draft.contact == contact
+                            && draft.scope.split('/').next() == Some(call_id)
+                        {
+                            draft.cancel.cancel();
+                        }
+                    }
                     events
                         .send(value)
                         .await
@@ -921,6 +1016,7 @@ impl Channel for SimplexChannel {
                 .finish_reply(
                     &message.recipient,
                     None,
+                    None,
                     &message.content,
                     message.suppress_voice,
                     message.force_voice,
@@ -953,11 +1049,72 @@ impl Channel for SimplexChannel {
             message.thread_ts.clone().unwrap_or_default(),
         );
         draft.force_voice = message.force_voice;
+        // The bridge owns physical item IDs. This reference is created only
+        // after its live-start ACK; every subsequent effect rechecks live config.
+        let connected = self.inner.writer.lock().is_some();
+        if connected {
+            self.request(json!({"type":"live_start","contact":message.recipient,
+                "draft":id,"text":simplex_progress("processing")}))
+                .await?;
+            draft.text = Some(LiveTextDraft::new(
+                self.clone(),
+                message.recipient.clone(),
+                id.clone(),
+            ));
+        }
         self.inner.drafts.lock().insert(id.clone(), draft);
         Ok(Some(id))
     }
     fn supports_turn_flush_narration(&self) -> bool {
         true
+    }
+    async fn update_draft(&self, recipient: &str, id: &str, text: &str) -> Result<()> {
+        ensure!(
+            self.allowed(recipient, false),
+            "simplex_contact_not_authorized"
+        );
+        let drafts = self.inner.drafts.lock();
+        if let Some(draft) = drafts.get(id) {
+            ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if let Some(live) = &draft.text {
+                let phase = text
+                    .strip_prefix(&draft.narration_delivered)
+                    .context("simplex_narration_prefix_mismatch")?
+                    .trim();
+                if !phase.is_empty() {
+                    live.update(phase, false);
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn update_draft_lifecycle(
+        &self,
+        recipient: &str,
+        id: &str,
+        event: ProgressEvent,
+    ) -> Result<()> {
+        ensure!(
+            self.allowed(recipient, false),
+            "simplex_contact_not_authorized"
+        );
+        let drafts = self.inner.drafts.lock();
+        if let Some(draft) = drafts.get(id) {
+            ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if let Some(live) = &draft.text {
+                live.update(
+                    &simplex_progress(match event {
+                        ProgressEvent::WaitingOnModel => "thinking",
+                        ProgressEvent::RunningTool
+                        | ProgressEvent::CompactingContext
+                        | ProgressEvent::FinalizingResponse => "working",
+                        ProgressEvent::Received | ProgressEvent::Planning => "processing",
+                    }),
+                    true,
+                );
+            }
+        }
+        Ok(())
     }
     async fn flush_draft_turn(&self, recipient: &str, id: &str, text: &str) -> Result<()> {
         ensure!(
@@ -981,13 +1138,39 @@ impl Channel for SimplexChannel {
         // The shared updater already applies outbound hooks, protocol filtering,
         // and leak detection. This is a text delivery; call speech and the final
         // voice note retain their existing owners and must not be generated twice.
-        self.request(json!({"type":"send", "contact":recipient, "text":suffix}))
-            .await?;
+        let mut live = self
+            .inner
+            .drafts
+            .lock()
+            .get_mut(id)
+            .and_then(|draft| draft.text.take());
+        let result = if let Some(live) = live.as_mut() {
+            live.stop().await?;
+            self.request(
+                json!({"type":"live_flush","contact":recipient,"draft":id,"text":suffix,
+                "receipt":format!("{:x}",Sha256::digest(text.as_bytes()))}),
+            )
+            .await
+        } else {
+            self.request(json!({"type":"send", "contact":recipient, "text":suffix}))
+                .await
+        };
         if let Some(draft) = self.inner.drafts.lock().get_mut(id) {
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
-            draft.narration_delivered = text.to_string();
+            if result.is_ok() {
+                draft.narration_delivered = text.to_string();
+                if live.is_some() {
+                    live = Some(LiveTextDraft::new(
+                        self.clone(),
+                        recipient.into(),
+                        id.into(),
+                    ));
+                }
+            }
+            // Failed flushes suspend previews until a confirmed flush/finalize.
+            draft.text = live;
         }
-        Ok(())
+        result
     }
     async fn prepare_voice_draft(&self, recipient: &str, id: &str, text: &str) -> Result<()> {
         ensure!(
@@ -1023,9 +1206,20 @@ impl Channel for SimplexChannel {
         suppress_voice: bool,
         force_voice: bool,
     ) -> Result<()> {
-        let draft = self.inner.drafts.lock().remove(id);
-        self.finish_reply(recipient, draft, text, suppress_voice, force_voice)
-            .await
+        let draft = self.take_draft(recipient, id)?.ok_or_else(|| {
+            anyhow::Error::new(zeroclaw_api::channel::FinalizeUndelivered {
+                reason: "simplex_draft_not_owned".into(),
+            })
+        })?;
+        self.finish_reply(
+            recipient,
+            Some(draft),
+            Some(id),
+            text,
+            suppress_voice,
+            force_voice,
+        )
+        .await
     }
     async fn stream_voice_draft(
         &self,
@@ -1054,17 +1248,153 @@ impl Channel for SimplexChannel {
         text: &str,
         suppress_voice: bool,
     ) -> Result<()> {
-        let draft = self.inner.drafts.lock().remove(id);
-        self.finish_reply(recipient, draft, text, suppress_voice, false)
-            .await
+        let draft = self.take_draft(recipient, id)?.ok_or_else(|| {
+            anyhow::Error::new(zeroclaw_api::channel::FinalizeUndelivered {
+                reason: "simplex_draft_not_owned".into(),
+            })
+        })?;
+        self.finish_reply(
+            recipient,
+            Some(draft),
+            Some(id),
+            text,
+            suppress_voice,
+            false,
+        )
+        .await
     }
     async fn cancel_draft(&self, recipient: &str, id: &str) -> Result<()> {
-        let draft = self.inner.drafts.lock().remove(id);
+        let mut draft = self.take_draft(recipient, id)?;
+        let text_result = if let Some(text) = draft.as_mut().and_then(|draft| draft.text.as_mut()) {
+            let stopped = text.stop().await;
+            if stopped.is_err() {
+                stopped
+            } else if self.allowed(recipient, false) {
+                self.request(json!({"type":"live_cancel","contact":recipient,"draft":id,
+                    "interrupted":simplex_progress("interrupted")}))
+                    .await
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
         if let Some(draft) = draft
             && !draft.scope.is_empty()
         {
             self.request(json!({"type": "stop_audio", "contact": recipient, "scope": draft.scope}))
                 .await?;
+        }
+        text_result
+    }
+}
+
+fn simplex_progress(phase: &str) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string(match phase {
+        "thinking" => "channel-simplex-progress-thinking",
+        "working" => "channel-simplex-progress-working",
+        "interrupted" => "channel-simplex-progress-interrupted",
+        _ => "channel-simplex-progress-processing",
+    })
+}
+
+#[derive(Clone)]
+struct LiveTextFrame {
+    text: String,
+    status: bool,
+}
+
+/// Owns one coalesced preview stream, never a policy snapshot or transcript.
+/// The bridge alone owns physical message IDs. Native dispatch rechecks the
+/// canonical live peer grant immediately before each external edit.
+struct LiveTextDraft {
+    updates: watch::Sender<Option<LiveTextFrame>>,
+    cancel: CancellationToken,
+    worker: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+impl Drop for LiveTextDraft {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+impl LiveTextDraft {
+    fn new(channel: SimplexChannel, contact: String, id: String) -> Self {
+        let (updates, mut rx) = watch::channel::<Option<LiveTextFrame>>(None);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let channel = Arc::downgrade(&channel.inner);
+        let delivery = crate::orchestrator::DeliveryScope::current();
+        let worker = zeroclaw_spawn::spawn!(async move {
+            let mut last = tokio::time::Instant::now() - Duration::from_millis(500);
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => return Ok(()),
+                    changed = rx.changed() => { if changed.is_err() { return Ok(()); } }
+                }
+                tokio::select! {
+                    () = stop.cancelled() => return Ok(()),
+                    () = tokio::time::sleep_until(last + Duration::from_millis(500)) => {}
+                }
+                let frame = rx.borrow_and_update().clone();
+                let Some(frame) = frame else {
+                    continue;
+                };
+                let Some(inner) = channel.upgrade() else {
+                    return Ok(());
+                };
+                let channel = SimplexChannel { inner };
+                if !channel.allowed(&contact, false) {
+                    return Ok(());
+                }
+                // Let admitted edits settle their receipts even if cancellation
+                // arrives while the CLI acknowledgement is in flight.
+                let result = crate::orchestrator::DeliveryScope::observe(
+                    delivery.as_ref(),
+                    "live_text_preview",
+                    "simplex",
+                    &contact,
+                    &frame.text,
+                    channel.request(
+                        json!({"type":if frame.status {"live_status"} else {"live_update"},
+                        "contact":contact,"draft":id,"text":frame.text}),
+                    ),
+                )
+                .await;
+                if let Err(error) = result {
+                    if zeroclaw_api::session_events::capture::is_capture_stopped(&error) {
+                        return Err(error);
+                    }
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                        "simplex_live_preview_failed"
+                    );
+                }
+                last = tokio::time::Instant::now();
+            }
+        });
+        Self {
+            updates,
+            cancel,
+            worker: Some(worker),
+        }
+    }
+    fn update(&self, text: &str, status: bool) {
+        if self.worker.is_some() {
+            self.updates.send_replace(Some(LiveTextFrame {
+                text: text.into(),
+                status,
+            }));
+        }
+    }
+    async fn stop(&mut self) -> Result<()> {
+        self.cancel.cancel();
+        if let Some(worker) = self.worker.take() {
+            worker.await.map_err(|_| {
+                anyhow::Error::new(zeroclaw_api::channel::FinalizeUndelivered {
+                    reason: "simplex_live_worker_join_failed".into(),
+                })
+            })??;
         }
         Ok(())
     }
@@ -1082,6 +1412,7 @@ struct NoteSpeech {
     job: crate::tts::SpeechJob,
 }
 struct VoiceDraft {
+    text: Option<LiveTextDraft>,
     // Creates the fact that this guarded narration prefix was accepted by the
     // bridge. Advance only after ACK; this is delivery evidence, not policy.
     narration_delivered: String,
@@ -1107,6 +1438,7 @@ impl VoiceDraft {
     fn new(channel: SimplexChannel, contact: String, scope: String) -> Self {
         let (updates, _) = watch::channel(SpeechSnapshot::default());
         Self {
+            text: None,
             narration_delivered: String::new(),
             contact,
             scope,
@@ -1284,6 +1616,222 @@ mod tests {
         assert!(!is_delivery_definitely_failed(
             &bridge_result(json!({"ok":false})).unwrap_err()
         ));
+    }
+
+    fn record_bridge(
+        channel: &SimplexChannel,
+    ) -> (Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let (writer, mut requests) = mpsc::channel::<Value>(32);
+        *channel.inner.writer.lock() = Some(writer);
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let recorded = values.clone();
+        let channel = channel.clone();
+        let worker = zeroclaw_spawn::spawn!(async move {
+            while let Some(value) = requests.recv().await {
+                recorded.lock().push(value.clone());
+                if let Some(waiter) = channel
+                    .inner
+                    .pending
+                    .lock()
+                    .remove(value["id"].as_str().unwrap())
+                {
+                    waiter.send(json!({"ok":true})).ok();
+                }
+            }
+        });
+        (values, worker)
+    }
+    async fn wait_for_live_update(values: &Mutex<Vec<Value>>) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !values
+                .lock()
+                .iter()
+                .any(|value| value["type"] == "live_update")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn live_text_coalesces_updates_and_finalizes_without_a_duplicate_send() {
+        let (channel, _) = fixture();
+        let (values, worker) = record_bridge(&channel);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(values.lock()[0]["type"], "live_start");
+        assert_eq!(values.lock()[0]["text"], simplex_progress("processing"));
+        // Legacy progress can contain arguments or provider reasoning; it must
+        // never acquire the typed lifecycle display authority.
+        channel
+            .update_draft_progress("17", &id, "private tool arguments")
+            .await
+            .unwrap();
+        for index in 0..100 {
+            channel
+                .update_draft("17", &id, &format!("Visible partial {index}"))
+                .await
+                .unwrap();
+        }
+        wait_for_live_update(&values).await;
+        let frames = values.lock().clone();
+        assert!(
+            frames
+                .iter()
+                .filter(|value| value["type"] == "live_update")
+                .count()
+                < 5
+        );
+        assert_eq!(frames.last().unwrap()["text"], "Visible partial 99");
+        assert!(
+            !frames
+                .iter()
+                .any(|value| value["text"] == "private tool arguments")
+        );
+        assert!(channel.cancel_draft("18", &id).await.is_err());
+        assert!(channel.inner.drafts.lock().contains_key(&id));
+        channel
+            .finalize_draft("17", &id, "Final answer", true)
+            .await
+            .unwrap();
+        assert_eq!(values.lock().last().unwrap()["type"], "live_finish");
+        let before = values.lock().len();
+        let error = channel
+            .finalize_draft("17", &id, "Final answer", true)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some()
+        );
+        assert_eq!(values.lock().len(), before);
+        assert!(!values.lock().iter().any(|value| value["type"] == "send"));
+        worker.abort();
+    }
+    #[tokio::test]
+    async fn call_interruption_reaches_dispatch_before_live_text_cleanup_ack() {
+        let (channel, _) = fixture();
+        let (_, worker) = record_bridge(&channel);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17").in_thread(Some("call/old".into())))
+            .await
+            .unwrap()
+            .unwrap();
+        let (writer, mut requests) = mpsc::channel::<Value>(2);
+        *channel.inner.writer.lock() = Some(writer);
+        let (tx, mut input) = mpsc::channel(2);
+        let copy = channel.clone();
+        let event = zeroclaw_spawn::spawn!(async move {
+            copy.event(
+                json!({"type":"interrupted","contact":"17","call_id":"call",
+                "scope":"call/next","playback":{"interrupted":false}}),
+                &tx,
+            )
+            .await
+        });
+        let cancel = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancel["type"], "live_cancel");
+        // The platform edit is still in flight; dispatch must already know.
+        assert_eq!(
+            input.try_recv().unwrap().control,
+            Some(ChannelControl::Interrupt)
+        );
+        channel
+            .inner
+            .pending
+            .lock()
+            .remove(cancel["id"].as_str().unwrap())
+            .unwrap()
+            .send(json!({"ok":true}))
+            .unwrap();
+        let audio = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(audio["type"], "stop_audio");
+        channel
+            .inner
+            .pending
+            .lock()
+            .remove(audio["id"].as_str().unwrap())
+            .unwrap()
+            .send(json!({"ok":true}))
+            .unwrap();
+        event.await.unwrap().unwrap();
+        worker.abort();
+        assert!(!channel.inner.drafts.lock().contains_key(&id));
+    }
+    #[tokio::test]
+    async fn live_text_rechecks_permission_when_coalesced_frame_reaches_delivery() {
+        let (channel, live) = fixture();
+        let (values, worker) = record_bridge(&channel);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17"))
+            .await
+            .unwrap()
+            .unwrap();
+        channel
+            .update_draft("17", &id, "First frame")
+            .await
+            .unwrap();
+        wait_for_live_update(&values).await;
+        channel
+            .update_draft("17", &id, "Must not leave after revocation")
+            .await
+            .unwrap();
+        let mut config = live.snapshot();
+        config
+            .peer_groups
+            .get_mut("owner")
+            .unwrap()
+            .external_peers
+            .clear();
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        channel.cancel_draft("17", &id).await.unwrap();
+        assert!(
+            !values
+                .lock()
+                .iter()
+                .any(|value| value["text"] == "Must not leave after revocation")
+        );
+        assert_eq!(
+            values
+                .lock()
+                .iter()
+                .filter(|value| value["type"] == "live_update")
+                .count(),
+            1
+        );
+        worker.abort();
+    }
+    #[tokio::test]
+    async fn live_recovery_requires_current_grant_and_never_creates_a_user_turn() {
+        let (channel, _) = fixture();
+        let (values, worker) = record_bridge(&channel);
+        let (tx, mut rx) = mpsc::channel(4);
+        for contact in ["18", "17"] {
+            channel
+                .event(
+                    json!({"type":"live_orphan","contact":contact,"item_id":42}),
+                    &tx,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(values.lock().len(), 1);
+        assert_eq!(values.lock()[0]["type"], "live_recover");
+        assert_eq!(values.lock()[0]["contact"], "17");
+        assert!(rx.try_recv().is_err());
+        worker.abort();
     }
 
     #[test]
@@ -1514,13 +2062,31 @@ mod tests {
         *channel.inner.writer.lock() = Some(writer);
         let responder = channel.clone();
         let task = zeroclaw_spawn::spawn!(async move {
+            for expected in ["live_start", "live_finish"] {
+                let value = requests.recv().await.unwrap();
+                assert_eq!(value["type"], expected);
+                if expected == "live_finish" {
+                    assert!(
+                        value["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("The remaining answer.")
+                    );
+                }
+                responder
+                    .inner
+                    .pending
+                    .lock()
+                    .remove(value["id"].as_str().unwrap())
+                    .unwrap()
+                    .send(json!({"ok":true}))
+                    .unwrap();
+            }
             let value = requests.recv().await.unwrap();
             assert_eq!(value["type"], "send");
-            assert!(
-                value["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("The remaining answer.")
+            assert_eq!(
+                value["text"], "",
+                "the voice upload must not repeat finalized text"
             );
             let audio = base64::engine::general_purpose::STANDARD
                 .decode(value["voice"].as_str().unwrap())
@@ -1582,13 +2148,14 @@ mod tests {
             *channel.inner.writer.lock() = Some(writer);
             let responder = channel.clone();
             let bridge = zeroclaw_spawn::spawn!(async move {
-                for expected in [
-                    "I will check that now.",
-                    "I found the relevant files.",
-                    "Here is the final answer.",
+                for (kind, expected) in [
+                    ("live_start", simplex_progress("processing")),
+                    ("live_flush", "I will check that now.".into()),
+                    ("live_flush", "I found the relevant files.".into()),
+                    ("live_finish", "Here is the final answer.".into()),
                 ] {
                     let value = requests.recv().await.unwrap();
-                    assert_eq!(value["type"], "send");
+                    assert_eq!(value["type"], kind);
                     assert_eq!(value["text"], expected);
                     assert!(value["voice"].is_null());
                     responder
@@ -1634,12 +2201,12 @@ mod tests {
     async fn narration_respects_scope_revocation_and_confirmed_delivery() {
         let (channel, live) = fixture();
         let (writer, mut requests) = mpsc::channel::<Value>(4);
-        *channel.inner.writer.lock() = Some(writer);
         let id = channel
             .send_draft(&SendMessage::new("", "17"))
             .await
             .unwrap()
             .unwrap();
+        *channel.inner.writer.lock() = Some(writer);
         assert!(
             channel
                 .flush_draft_turn("18", &id, "private")
