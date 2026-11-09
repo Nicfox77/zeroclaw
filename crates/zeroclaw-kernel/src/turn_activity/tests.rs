@@ -5,7 +5,7 @@ async fn waiting_turn_observes_background_progress_without_creating_heartbeats()
     for progressing in [true, false] {
         let job = Activity::new();
         let worker = job.clone();
-        let child = tokio::spawn(async move {
+        let child = zeroclaw_spawn::spawn!(async move {
             let cancel = CancellationToken::new();
             run_with_activity(1, &cancel, worker, async {
                 for _ in 0..8 {
