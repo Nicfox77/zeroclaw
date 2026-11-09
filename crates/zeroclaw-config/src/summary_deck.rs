@@ -20,7 +20,8 @@ pub struct SummaryDeckConfig {
     /// Nonempty text/reasoning refreshes this allowance; prefill has no progress
     /// until the provider emits output. Also bounds waiting to publish a card.
     pub timeout_secs: u64,
-    /// Optional configured model-provider reference; empty uses the session's current route.
+    /// Optional deck-specific model-provider reference. Empty inherits the
+    /// agent/compression summary provider, then the session's current route.
     pub provider: ModelProviderRef,
 }
 
