@@ -12175,7 +12175,8 @@ mod tool_lifecycle_abandonment_tests {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let event = if meaningful {
                     match index {
-                        0..=9 => StreamEvent::ThinkingDelta("hidden reasoning".into()),
+                        0..=2 => StreamEvent::ThinkingDelta("hidden reasoning".into()),
+                        3..=9 => StreamEvent::TextDelta(StreamChunk::reasoning("hidden reasoning")),
                         10 => StreamEvent::TextDelta(StreamChunk::delta("done")),
                         _ => StreamEvent::Final,
                     }
