@@ -175,6 +175,23 @@ request can schedule fresh summarization. It does not replay a provider or
 tool effect. A completed deck survives restart without regenerating it.
 Live policy and read/effect permissions are rechecked before publication.
 
+When normal session recovery proves that an execution process was lost, an
+unfinished main-provider response with recorded visible text becomes an
+assistant message in the active context, followed by an explicit
+`[Interrupted: ...]` marker. The next turn can see what the assistant had
+partially said. The marker does not claim that planned actions completed or
+that every recorded fragment reached the user. Recovery does not replay tools,
+resume generation, or turn an unknown outcome into a successful completion.
+Reasoning, tool arguments and maintenance-model output are excluded. The
+recovered message references the original text payloads, retaining their
+erasure dependencies; repeated recovery does not add another copy. Existing
+summary cards and prior context references remain in place.
+
+SimpleX also finalizes orphaned live messages in its bounded recent-chat scan
+after native contact authorization. A live message older than an hour is still
+eligible, so a long turn does not leave a permanent live indicator after a
+restart. This display cleanup is separate from restoring model context.
+
 Summaries incur additional model calls. Their provider attempts are captured
 in session history and ordinary completed/failed attempt usage is recorded
 against the agent and session in the existing cost ledger. The foreground
