@@ -148,24 +148,31 @@ async fn recall_references_observe_erasure_and_never_resurrect_the_user_source()
             .iter()
             .find(|item| item.recalled_memory.is_some())
             .expect("annotation");
-        let ContextMessageSource::Content { content_ref, .. } = &annotated.source else {
-            panic!("original source")
-        };
-        let PayloadRead::Present(content) = port
-            .owner
-            .store
-            .read_payload(&content_ref.payload_id)
-            .expect("content")
-        else {
-            panic!("content")
-        };
-        let content: ContentPayload = serde_json::from_slice(&content.body).expect("content");
-        let RecordedContentPart::Text { text_ref } = content.parts[0].clone() else {
-            panic!("text")
+        // Context-only admission can retain the original in a conversation
+        // snapshot. Native turns can instead reference a recorded content leaf.
+        // Erase the actual canonical source in either representation.
+        let source_ref = match &annotated.source {
+            ContextMessageSource::Content { content_ref, .. } => {
+                let PayloadRead::Present(content) = port
+                    .owner
+                    .store
+                    .read_payload(&content_ref.payload_id)
+                    .expect("content")
+                else {
+                    panic!("content")
+                };
+                let content: ContentPayload =
+                    serde_json::from_slice(&content.body).expect("content");
+                let RecordedContentPart::Text { text_ref } = content.parts[0].clone() else {
+                    panic!("text")
+                };
+                text_ref
+            }
+            ContextMessageSource::Conversation { payload_ref, .. } => payload_ref.clone(),
         };
         for (index, target) in [
             annotated.recalled_memory.clone().expect("recall reference"),
-            text_ref,
+            source_ref,
         ]
         .into_iter()
         .enumerate()
