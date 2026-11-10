@@ -180,6 +180,29 @@ impl SessionCoordinator {
             serde_json::to_value(refs).map_err(|e| ReadError::Corrupt(e.to_string()))?;
         let context =
             PayloadRecord::json("session.context/v1", &context).map_err(AppendError::from)?;
+        // The transform link is also the canonical witness for inherited
+        // recall snapshots. Recovery creates a local writer binding only;
+        // it carries no historical or newly invented effect permissions.
+        let binding = PayloadRecord::json("session.execution-binding/v1", &serde_json::json!({
+            "source":"verified_execution_loss_recovery", "execution_incarnation":self.execution_incarnation,
+            "recovery_event_id":cause,
+        })).map_err(AppendError::from)?;
+        let spec = PayloadRecord::json("session.transform/v1", &serde_json::json!({
+            "reason_key":"interrupted_assistant_response", "algorithm_version":"execution-recovery/v1", "budget":0,
+        })).map_err(AppendError::from)?;
+        let mut transform = SessionEvent::typed(
+            started.session_id.clone(),
+            EventData::ContextTransformStarted {
+                input_projection_event_id: input.event_id.clone(),
+                transform_spec_ref: StoredPayloadRef::from(&spec),
+                execution_binding_ref: StoredPayloadRef::from(&binding),
+            },
+            recorded.actor.clone(),
+        )
+        .map_err(AppendError::from)?;
+        transform.branch_id = started.branch_id.clone();
+        transform.turn_id = started.turn_id.clone();
+        transform.causation_id = Some(cause.clone());
         let mut projection = SessionEvent::typed(
             started.session_id.clone(),
             EventData::ContextProjectionCreated {
@@ -190,16 +213,16 @@ impl SessionCoordinator {
                 reason_key: "interrupted_assistant_response".into(),
                 algorithm_version: "execution-recovery/v1".into(),
                 result_ref: StoredPayloadRef::from(&context),
-                transform_started_event_id: None,
+                transform_started_event_id: Some(transform.event_id.clone()),
             },
             recorded.actor.clone(),
         )
         .map_err(AppendError::from)?;
         projection.branch_id = started.branch_id.clone();
         projection.turn_id = started.turn_id.clone();
-        projection.causation_id = Some(cause.clone());
-        events.extend([recorded, projection]);
-        payloads.extend([marker, content, context]);
+        projection.causation_id = Some(transform.event_id.clone());
+        events.extend([recorded, transform, projection]);
+        payloads.extend([marker, content, context, binding, spec]);
         Ok(())
     }
 
