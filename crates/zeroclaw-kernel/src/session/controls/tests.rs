@@ -12,6 +12,9 @@ mod summary_deck_tests;
 #[path = "scaling_tests.rs"]
 mod scaling_tests;
 
+#[path = "interrupted_context_tests.rs"]
+mod interrupted_context_tests;
+
 struct Authority(AtomicBool);
 impl SessionAccessPolicy for Authority {
     fn authorize_actor(

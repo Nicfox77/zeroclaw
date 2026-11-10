@@ -28,6 +28,7 @@ pub mod model_selection;
 mod provider_cancellation;
 pub mod query;
 pub mod recovery;
+mod recovery_context;
 mod requeue;
 mod retry;
 pub mod tool_capture;

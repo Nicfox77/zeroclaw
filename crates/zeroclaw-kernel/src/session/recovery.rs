@@ -269,6 +269,12 @@ impl SessionCoordinator {
                 if state.status != InvocationStatus::Running {
                     continue;
                 }
+                if let Some(started) = history.iter().find(|event| {
+                    event.invocation_id.as_ref() == Some(id)
+                        && event.body.kind() == EventKind::ProviderAttemptStarted
+                }) {
+                    owner.interrupted_context(started, &history, &cause, &mut events, &mut payloads)?;
+                }
                 let mut unknown = event(EventData::InvocationOutcomeUnknown {
                     last_observed_event_id: state.last_event_id.clone(),
                     reason_key: "execution_owner_lost".into(),

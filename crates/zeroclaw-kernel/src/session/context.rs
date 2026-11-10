@@ -48,12 +48,24 @@ impl EngineSession {
         )
         .map_err(|error| ReadError::Corrupt(error.to_string()))?;
         if let Some(nested) = context_read::copy_source(&body)? {
-            let snapshot = self.resolve_copy_context(
+            let mut snapshot = self.resolve_copy_context(
                 &nested.cursor.session_id,
                 nested.cursor.sequence,
                 &nested.branch_id,
                 visited,
             )?;
+            // Recovery may append local interrupted text to a frozen copy.
+            // Keep resolving the inherited prefix through its original scope.
+            for item in zeroclaw_api::session_events::context_read::context_refs(
+                owner.store.as_ref(),
+                &projection,
+            )? {
+                if let Some(message) =
+                    super::context_messages::resolve_message(owner.store.as_ref(), source, &item)?
+                {
+                    snapshot.messages.push(message);
+                }
+            }
             self.authority
                 .authorize_actor(&self.actor, source, SessionAccess::Read)?;
             self.authority.authorize_context(source, branch)?;
@@ -634,12 +646,28 @@ impl EngineSession {
             let snapshot = owner
                 .clone()
                 .blocking(move || {
-                    session.resolve_copy_context(
+                    let mut snapshot = session.resolve_copy_context(
                         &source,
                         sequence,
                         &source_branch,
                         &mut std::collections::HashSet::new(),
-                    )
+                    )?;
+                    for item in zeroclaw_api::session_events::context_read::context_refs(
+                        owner.store.as_ref(),
+                        &event,
+                    )? {
+                        if let Some(message) = super::context_messages::resolve_message(
+                            owner.store.as_ref(),
+                            &session.stream,
+                            &item,
+                        )? {
+                            snapshot.messages.push(message);
+                        }
+                    }
+                    session
+                        .authority
+                        .authorize_context(&session.stream, &session.branch)?;
+                    Ok(snapshot)
                 })
                 .await?;
             return Ok(Some(snapshot));
