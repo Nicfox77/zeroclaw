@@ -145,7 +145,11 @@ models complete, including manually refreshed models. Refresh operation receipts
 survive a restart; no mental-model definitions are copied into the delivery ledger.
 Erasure does not fall back to SQLite recall. Same-frontier validated appends extend
 the receipt atomically, and background frontier checks use bounded indexed
-queries; ordinary turns do not rescan completed delivery history.
+queries; ordinary turns do not rescan completed delivery history. The canonical
+catalog's temporary-session discovery also uses indexed metadata events rather
+than materializing provider progress, and its physical-cleanup probe uses a
+partial index of redacted payloads. Neither index changes transcript contents or
+session lifetime rules.
 
 The dashboard's Memories tab reports the selected backend and delivery health.
 This example uses synthetic queue values and no private memory content:

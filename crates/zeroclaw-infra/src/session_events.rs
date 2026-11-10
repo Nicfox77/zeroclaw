@@ -1440,6 +1440,7 @@ mod tests {
             if backend == "sqlite" {
                 let conn = Connection::open(dir.path().join("sessions/session-events.db"))
                     .expect("connection");
+                let temporary_plan = format!("EXPLAIN QUERY PLAN {}", temporary::CANDIDATE_QUERY);
                 for (sql, index_name) in [
                     (
                         "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE session_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
@@ -1449,6 +1450,15 @@ mod tests {
                         "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE session_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.turn_id')='turn' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
                         "session_events_latest_by_turn_kind",
                     ),
+                    (
+                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE json_extract(event_json,'$.kind')='payload_erasure_requested' AND json_extract(event_json,'$.body.codec_version')=1 ORDER BY event_id",
+                        "session_erasure_requests",
+                    ),
+                    (
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM event_payloads WHERE body IS NULL LIMIT 1",
+                        "session_redacted_payloads",
+                    ),
+                    (temporary_plan.as_str(), "session_metadata_events"),
                 ] {
                     let plan: String = conn
                         .query_row(sql, [], |row| row.get(3))
