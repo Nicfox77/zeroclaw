@@ -4186,7 +4186,8 @@ async fn reopened_queued_inputs_preserve_order_parts_and_current_authorization()
             drop(port);
             let store = zeroclaw_infra::session_events::open_event_store(dir.path(), backend)
                 .expect("reopen");
-            let owner = Arc::new(SessionCoordinator::new(store));
+            let counted = Arc::new(scaling_tests::CountedStore::new(store));
+            let owner = Arc::new(SessionCoordinator::new(counted.clone()));
             owner
                 .recover_interrupted_stream(
                     stream.clone(),
@@ -4390,11 +4391,24 @@ async fn reopened_queued_inputs_preserve_order_parts_and_current_authorization()
             )
             .await
             .expect("second");
+            counted.read_events.store(0, Ordering::SeqCst);
             assert!(
                 port.pending_inputs("current-provider".into(), "current-model".into())
                     .await
                     .expect("drained")
                     .is_empty()
+            );
+            assert!(
+                port.owner
+                    .requeue_for_dispatch(stream.clone(), port.branch.clone(), TurnId::new())
+                    .await
+                    .expect("new turn recovery check")
+                    .is_none()
+            );
+            assert_eq!(
+                counted.read_events.load(Ordering::SeqCst),
+                0,
+                "settled recovery markers must not cause an archive scan"
             );
             let history = port.owner.stream_history(&stream).expect("history");
             assert_eq!(
@@ -4487,7 +4501,9 @@ async fn recovered_queued_input_resolves_the_current_canonical_agent_alias() {
 async fn recovery_never_requeues_a_started_provider_effect() {
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::TempDir::new().expect("directory");
-        let (port, _) = session(dir.path(), backend);
+        let (mut port, _) = session(dir.path(), backend);
+        let counted = Arc::new(scaling_tests::CountedStore::new(port.owner.store.clone()));
+        port.owner = Arc::new(SessionCoordinator::new(counted.clone()));
         let input = input();
         let ready = Arc::new(tokio::sync::Notify::new());
         let notify = ready.clone();
@@ -4526,12 +4542,21 @@ async fn recovery_never_requeues_a_started_provider_effect() {
             )
             .await
             .expect("recover");
+        counted.read_events.store(0, Ordering::SeqCst);
         assert!(
             port.pending_inputs("fixture".into(), "fixture".into())
                 .await
                 .expect("pending")
                 .is_empty()
         );
+        assert!(
+            port.owner
+                .requeue_for_dispatch(port.stream.clone(), port.branch.clone(), TurnId::new())
+                .await
+                .expect("new turn recovery check")
+                .is_none()
+        );
+        assert_eq!(counted.read_events.load(Ordering::SeqCst), 0);
         assert!(
             port.execute(
                 input,

@@ -75,6 +75,68 @@ fn present(
 }
 
 impl SessionCoordinator {
+    /// Use the existing event coordinates to rule out a pending retry before
+    /// replaying history. The frozen head keeps every lookup on one prefix.
+    fn has_pending_requeue(
+        &self,
+        stream: &SessionId,
+        branch: &BranchId,
+    ) -> Result<bool, SessionError> {
+        let head = self.store.head(stream)?.sequence;
+        let mut through = head;
+        let mut consumed = std::collections::HashSet::new();
+        while let Some(event) = self.store.read_latest_event_before(
+            stream,
+            branch,
+            None,
+            &EventKind::RecoveryObserved,
+            through,
+        )? {
+            through = event.sequence.saturating_sub(1);
+            match event.body.data {
+                EventData::RecoveryObserved {
+                    disposition: RecoveryDisposition::Rescheduled { .. },
+                    ..
+                } => {
+                    if let Some(turn) = event.turn_id {
+                        consumed.insert(turn);
+                    }
+                }
+                EventData::RecoveryObserved {
+                    disposition: RecoveryDisposition::Requeued,
+                    ..
+                } => {
+                    let turn = event.turn_id.ok_or(SessionError::InvocationMismatch)?;
+                    if consumed.contains(&turn) {
+                        continue;
+                    }
+                    let mut settled = false;
+                    for kind in [
+                        EventKind::TurnStarted,
+                        EventKind::TurnCommitted,
+                        EventKind::TurnCancelled,
+                        EventKind::TurnOutcomeUnknown,
+                    ] {
+                        if self
+                            .store
+                            .read_latest_event_before(stream, branch, Some(&turn), &kind, head)?
+                            .is_some_and(|later| later.sequence > event.sequence)
+                        {
+                            settled = true;
+                            break;
+                        }
+                    }
+                    if !settled {
+                        return Ok(true);
+                    }
+                    consumed.insert(turn);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) async fn requeue_for_dispatch(
         self: &Arc<Self>,
         stream: SessionId,
@@ -83,11 +145,7 @@ impl SessionCoordinator {
     ) -> Result<Option<SessionEvent>, SessionError> {
         let owner = self.clone();
         self.blocking(move || {
-            if owner
-                .store
-                .read_latest_event(&stream, &branch, None, &EventKind::RecoveryObserved)?
-                .is_none()
-            {
+            if !owner.has_pending_requeue(&stream, &branch)? {
                 return Ok(None);
             }
             let history = owner.stream_history(&stream)?;
@@ -286,6 +344,12 @@ impl EngineSession {
         let (inputs, erased) = self
             .owner
             .blocking(move || {
+                if !session
+                    .owner
+                    .has_pending_requeue(&session.stream, &session.branch)?
+                {
+                    return Ok((Vec::new(), Vec::new()));
+                }
                 let history = session.owner.stream_history(&session.stream)?;
                 let pending = pending_requeues(&history, &session.branch)?;
                 if pending.is_empty() {

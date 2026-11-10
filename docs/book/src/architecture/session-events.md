@@ -84,6 +84,11 @@ These optimizations bound ordinary active-context and status work, not all memor
 or every cold-start path. JSONL and other stores retain safe fallback reads when
 they do not implement persistent checkpoints or coordinate indexes.
 
+Turn admission checks retry eligibility through the existing recovery and
+turn event coordinates. An interruption marker or a settled retry does not
+trigger an archive replay on each new message. An outstanding retry still
+uses the full history checks for effect safety, authorization, and ordering.
+
 The synchronous legacy conversation-binding owner refuses native session
 access without execution admission. It must not acknowledge a cache-only
 exchange that is absent from the event store. Native callers use the session
