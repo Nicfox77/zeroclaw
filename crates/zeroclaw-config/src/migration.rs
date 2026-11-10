@@ -1012,6 +1012,7 @@ const V3_AGENT_FIELDS: &[&str] = &[
     "cron_jobs",
     "delegate_same_risk_profile",
     "delegates",
+    "display_name",
     "enabled",
     "identity",
     "knowledge_bundles",

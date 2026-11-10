@@ -50,17 +50,7 @@ pub struct IdentitySection {
     pub residence: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Names {
-    #[serde(default)]
-    pub first: Option<String>,
-    #[serde(default)]
-    pub last: Option<String>,
-    #[serde(default)]
-    pub nickname: Option<String>,
-    #[serde(default)]
-    pub full: Option<String>,
-}
+pub use zeroclaw_infra::identity_names::Names;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PsychologySection {
@@ -233,7 +223,7 @@ fn normalize_aieos_identity(payload: &Value) -> AieosIdentity {
 fn normalize_identity_section(section: Option<&Value>) -> Option<IdentitySection> {
     let section = section?;
 
-    let names = normalize_names(value_at_path(section, &["names"]));
+    let names = zeroclaw_infra::identity_names::normalize_names(value_at_path(section, &["names"]));
     let bio = value_at_path(section, &["bio"]).and_then(value_to_text);
     let origin = value_at_path(section, &["origin"]).and_then(value_to_text);
     let residence = value_at_path(section, &["residence"]).and_then(value_to_text);
@@ -248,33 +238,6 @@ fn normalize_identity_section(section: Option<&Value>) -> Option<IdentitySection
         origin,
         residence,
     })
-}
-
-fn normalize_names(value: Option<&Value>) -> Option<Names> {
-    let value = value?;
-
-    let mut names = Names {
-        first: value_at_path(value, &["first"]).and_then(scalar_to_string),
-        last: value_at_path(value, &["last"]).and_then(scalar_to_string),
-        nickname: value_at_path(value, &["nickname"]).and_then(scalar_to_string),
-        full: value_at_path(value, &["full"]).and_then(scalar_to_string),
-    };
-
-    if names.full.is_none()
-        && let (Some(first), Some(last)) = (&names.first, &names.last)
-    {
-        names.full = Some(format!("{first} {last}"));
-    }
-
-    if names.first.is_none()
-        && names.last.is_none()
-        && names.nickname.is_none()
-        && names.full.is_none()
-    {
-        return None;
-    }
-
-    Some(names)
 }
 
 fn normalize_psychology_section(section: Option<&Value>) -> Option<PsychologySection> {

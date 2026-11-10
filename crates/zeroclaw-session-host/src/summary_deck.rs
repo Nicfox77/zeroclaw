@@ -155,8 +155,25 @@ impl Runtime {
                     .iter()
                     .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
                     .collect();
-                let workspace = live.read().agent_workspace_dir(&agent);
-                let orientation = zeroclaw_infra::memory_orientation::load(&workspace)?;
+                let (workspace, names) = {
+                    let config = live.read();
+                    let principal = if config.agent(&agent).is_some_and(|a| a.main_session.enabled)
+                        && zeroclaw_config::main_session::session_id(&agent) == session
+                    {
+                        zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR
+                    } else {
+                        ""
+                    };
+                    (
+                        config.agent_workspace_dir(&agent),
+                        zeroclaw_config::speakers::resolve(&config, &agent, principal)?,
+                    )
+                };
+                let orientation = format!(
+                    "{}\n{}",
+                    names.orientation(),
+                    zeroclaw_infra::memory_orientation::load(&workspace)?
+                );
                 if !orientation.is_empty() {
                     messages.insert(
                         0,
