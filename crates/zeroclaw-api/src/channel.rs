@@ -1164,6 +1164,12 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether `update_draft` only queues text locally. A channel returning
+    /// true owns delivery receipts for the external edits its worker performs.
+    fn buffers_draft_text_updates(&self) -> bool {
+        false
+    }
+
     /// Whether this channel can post a native poll through [`Channel::send_poll`].
     /// Callers check this before offering one, so a channel without native
     /// polls keeps whatever fallback the caller already had.
