@@ -22,6 +22,7 @@ use zeroclaw_kernel::session::{
 };
 mod hindsight;
 mod seed;
+pub use hindsight::register as register_hindsight_capture;
 pub use hindsight::schedule_backfill as schedule_hindsight_backfill;
 mod summary_cost;
 mod summary_deck;
