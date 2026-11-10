@@ -178,8 +178,18 @@ pub fn environment(config: &Config) -> anyhow::Result<BTreeMap<String, String>> 
             "HINDSIGHT_API_RERANKER_LOCAL_MODEL",
             local_model(&root, &h.models.reranker),
         ),
+        // Missions apply to the ordinary extraction/consolidation modes.
+        // RETAIN_CUSTOM_INSTRUCTIONS is ignored unless extraction is custom.
         (
-            "HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS",
+            "HINDSIGHT_API_RETAIN_MISSION",
+            zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE.into(),
+        ),
+        (
+            "HINDSIGHT_API_OBSERVATIONS_MISSION",
+            zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE.into(),
+        ),
+        (
+            "HINDSIGHT_API_REFLECT_MISSION",
             zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE.into(),
         ),
         ("HINDSIGHT_API_ENABLE_OBSERVATIONS", "true".into()),
@@ -688,6 +698,11 @@ mod tests {
         assert_eq!(env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"], "0");
         assert!(!env.contains_key("HINDSIGHT_API_RECALL_DECISION_MODEL_PROVIDER"));
         assert_eq!(env["HINDSIGHT_API_HOST"], "127.0.0.1");
+        assert_eq!(
+            env["HINDSIGHT_API_RETAIN_MISSION"],
+            zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE
+        );
+        assert!(!env.contains_key("HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS"));
     }
 }
 
@@ -740,6 +755,24 @@ mod managed_service_tests {
         let client = Client::new(&config.memory.hindsight).unwrap();
         let bank = format!("zeroclaw-managed-fixture-{}", uuid::Uuid::new_v4());
         client.ensure_bank(&bank).await.unwrap();
+        // Verify the real upstream prompt assembly, not only environment names.
+        for operation in ["retain", "consolidation", "reflect"] {
+            let preview = client
+                .request(
+                    reqwest::Method::POST,
+                    &["v1", "default", "banks", &bank, "prompts", "preview"],
+                    Some(&serde_json::json!({"operation":operation})),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(
+                preview
+                    .to_string()
+                    .contains(zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE),
+                "perspective mission missing from real {operation} prompt"
+            );
+        }
         let operation = uuid::Uuid::new_v4().to_string();
         let item=super::super::client::Item {content:"User: I decided the fictional Larch project uses SQLite for its permanent conversation archive. It keeps the deployment lightweight. Assistant: I will keep its rolling summaries separate from long-term memory.".into(),document_id:"fixture-turn".into(),timestamp:"2026-01-01T00:00:00Z".into(),context:"Fictional architecture test conversation".into(),metadata:Default::default()};
         client.retain(&bank, &[item], &operation).await.unwrap();

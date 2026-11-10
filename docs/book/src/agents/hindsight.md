@@ -131,7 +131,9 @@ retention, recall, reflection, and ZeroClaw bank authorization still operate.
 Avoid having ZeroClaw and the Control Center both supervise or rewrite the same
 managed profile. Managed mode remains the recommended initial setup here.
 
-First-person extraction guidance is already enabled. `IDENTITY.md` and `USER.md`
+Retain, observation, and reflection missions inherit the shared first-person
+guidance by default; explicit bank missions edited in Hindsight override those
+process defaults. `IDENTITY.md` and `USER.md`
 are not automatically copied into Hindsight missions. A future identity bridge
 must resolve the current canonical files, screen and bound the selected text,
 and restrict user-profile context to that user's authorized bank. Identity context
