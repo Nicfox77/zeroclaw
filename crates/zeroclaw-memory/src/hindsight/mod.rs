@@ -24,6 +24,29 @@ fn eligible_content(content: &str) -> String {
     .0
 }
 
+const IDENTITY_BEGIN: &str = "\n<zeroclaw-identity-reference>\n";
+const IDENTITY_END: &str = "\n</zeroclaw-identity-reference>";
+
+fn identity_mission(current: &str, briefing: &str) -> anyhow::Result<String> {
+    let mut mission = current.to_owned();
+    if let Some(start) = mission.find(IDENTITY_BEGIN) {
+        let end = mission[start..]
+            .find(IDENTITY_END)
+            .ok_or_else(|| anyhow::Error::msg("hindsight_identity_reference_malformed"))?;
+        mission.replace_range(start..start + end + IDENTITY_END.len(), "");
+    }
+    anyhow::ensure!(
+        !mission.contains(IDENTITY_BEGIN) && !mission.contains(IDENTITY_END),
+        "hindsight_identity_reference_malformed"
+    );
+    if !briefing.is_empty() {
+        mission.push_str(IDENTITY_BEGIN);
+        mission.push_str(briefing);
+        mission.push_str(IDENTITY_END);
+    }
+    Ok(mission)
+}
+
 pub struct HindsightMemory {
     client: Client,
     ledger: Arc<Ledger>,
@@ -140,9 +163,12 @@ impl HindsightMemory {
         self.ledger.record_source_audit(bank, revision.as_str())?;
         Ok(())
     }
-    async fn prepare_bank(&self, bank: &str) -> anyhow::Result<()> {
+    async fn prepare_bank(&self, bank: &str, scope: &PrincipalScope) -> anyhow::Result<()> {
         let config = self.policy()?;
         self.client.ensure_bank(bank).await?;
+        if scope.principal_id == zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR {
+            self.prepare_identity(bank, config.identity_context).await?;
+        }
         for (id, model) in config.mental_models {
             self.policy()?;
             let desired = serde_json::json!({"id":id,"name":model.name,"source_query":model.source_query,"max_tokens":model.max_tokens,"trigger":{"refresh_after_consolidation":true,"min_refresh_interval_seconds":model.min_refresh_interval_seconds}});
@@ -200,6 +226,60 @@ impl HindsightMemory {
         }
         Ok(())
     }
+    async fn prepare_identity(&self, bank: &str, enabled: bool) -> anyhow::Result<()> {
+        // Files and UI missions remain canonical. Only the explicitly marked
+        // reference block is materialized, and it is removed when disabled.
+        let briefing = if enabled {
+            let live = self
+                .policy
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::msg("hindsight_live_policy_required"))?;
+            let (alias, _) = self
+                .agent
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::msg("hindsight_agent_scope_required"))?;
+            let workspace = live.read().agent_workspace_dir(alias);
+            eligible_content(&zeroclaw_infra::memory_orientation::load(&workspace)?)
+        } else {
+            String::new()
+        };
+        let response = self
+            .client
+            .request(
+                reqwest::Method::GET,
+                &["v1", "default", "banks", bank, "config"],
+                None,
+                false,
+            )
+            .await?;
+        let effective = response
+            .get("config")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::Error::msg("hindsight_invalid_bank_config"))?;
+        let mut updates = serde_json::Map::new();
+        for key in ["retain_mission", "observations_mission", "reflect_mission"] {
+            let current = effective
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let desired = identity_mission(current, &briefing)?;
+            if desired != current {
+                updates.insert(key.into(), serde_json::Value::String(desired));
+            }
+        }
+        if !updates.is_empty() {
+            self.policy()?;
+            self.client
+                .request(
+                    reqwest::Method::PATCH,
+                    &["v1", "default", "banks", bank, "config"],
+                    Some(&serde_json::json!({"updates":updates})),
+                    false,
+                )
+                .await?;
+        }
+        Ok(())
+    }
     async fn recall_scoped(
         &self,
         scope: &PrincipalScope,
@@ -221,7 +301,7 @@ impl HindsightMemory {
         let query = eligible_content(query);
         let config = self.policy()?;
         let bank = self.bank(scope)?;
-        self.prepare_bank(&bank).await?;
+        self.prepare_bank(&bank, scope).await?;
         let started = std::time::Instant::now();
         let result = self
             .client
@@ -265,7 +345,7 @@ impl HindsightMemory {
         let query = eligible_content(query);
         let config = self.policy()?;
         let bank = self.bank(scope)?;
-        self.prepare_bank(&bank).await?;
+        self.prepare_bank(&bank, scope).await?;
         // A reflection is model-authored synthesis, never an independently verified fact.
         let started = std::time::Instant::now();
         let response = self
@@ -421,7 +501,7 @@ impl HindsightMemory {
             .note(&operation)?
             .ok_or_else(|| anyhow::Error::msg("hindsight_note_delivery_missing"))?;
         self.policy()?;
-        self.prepare_bank(&bank).await?;
+        self.prepare_bank(&bank, scope).await?;
         self.bank(scope)?;
         self.client.retain(&bank, &note.items, &operation).await?;
         self.ledger.update(&operation, "processing")?;
@@ -739,6 +819,20 @@ impl Memory for HindsightMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_reference_preserves_ui_missions_and_can_be_updated_or_disabled() {
+        let mission = "Focus on architectural decisions.";
+        let first = identity_mission(mission, "Assistant: Nova; user: Alex").unwrap();
+        assert_eq!(
+            identity_mission(&first, "Assistant: Nova; user: Alex").unwrap(),
+            first
+        );
+        let changed = identity_mission(&first, "Assistant: Nova; user: Casey").unwrap();
+        assert!(changed.starts_with(mission));
+        assert!(!changed.contains("Alex") && changed.contains("Casey"));
+        assert_eq!(identity_mission(&changed, "").unwrap(), mission);
+        assert!(identity_mission(&format!("{mission}{IDENTITY_BEGIN}partial"), "").is_err());
+    }
     #[tokio::test]
     async fn exclusive_factory_never_opens_sqlite_memory_and_unscoped_access_fails_closed() {
         let directory = tempfile::tempdir().unwrap();

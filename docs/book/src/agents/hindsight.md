@@ -62,7 +62,10 @@ references have been checked again. A removed source document is deleted through
 Hindsight, including its derived memory links/observations. An in-flight retain is
 allowed to reach its terminal state before document deletion, avoiding the race
 where a cooperatively cancelled worker writes facts after deletion. The bank stays
-blocked during that reconciliation. Erasure does not fall back to SQLite recall. Same-frontier validated appends extend
+blocked during that reconciliation and until native full refreshes of its mental
+models complete, including manually refreshed models. Refresh operation receipts
+survive a restart; no mental-model definitions are copied into the delivery ledger.
+Erasure does not fall back to SQLite recall. Same-frontier validated appends extend
 the receipt atomically, and background frontier checks use bounded indexed
 queries; ordinary turns do not rescan completed delivery history.
 
@@ -135,13 +138,18 @@ managed profile. Managed mode remains the recommended initial setup here.
 
 Retain, observation, and reflection missions inherit the shared first-person
 guidance by default; explicit bank missions edited in Hindsight override those
-process defaults. `IDENTITY.md` and `USER.md`
-are not automatically copied into Hindsight missions. A future identity bridge
-must resolve the current canonical files, screen and bound the selected text,
-and restrict user-profile context to that user's authorized bank. Identity context
-must guide interpretation without being retained as a new conversation, and
-must preserve speaker attribution rather than rewriting user decisions as the
-agent's own actions. Do not copy the full system prompt or hidden reasoning.
+process defaults. With `identity_context = true`, the installation operator's
+bank also receives current bounded `IDENTITY.md`, `USER.md`, and `SOUL.md`
+excerpts from its owning agent's workspace (1024 bytes per file). The shared
+workspace briefing reader rejects escaping links and invalid files. Credentials
+are redacted before delivery. Other principals never receive this profile.
+
+The reference guides naming and voice, separately from source conversation
+evidence. ZeroClaw updates only its marked reference block in each mission;
+operator-authored mission text is preserved. File edits are resolved again at use
+time. Disabling the setting removes the block on the next operation on the
+operator's bank. The full system prompt, stored memories, and hidden reasoning
+are excluded. Speaker attribution remains explicit.
 
 ## Separate decision server
 
@@ -186,6 +194,46 @@ Stock vLLM's OpenAI endpoint does not implement `/v1/systemone`. This fork has n
 validated the vLLM plugin on ROCm or the host AMD GPU. Do not change drivers,
 reallocate another service's GPU, or claim GPU support based on the CPU tests.
 
+### Verified Intel integrated GPU option
+
+On Linux x86-64 with an accessible Intel Arc integrated GPU, provision the opt-in
+XPU runtime after the ordinary setup:
+
+```sh
+./dev/setup-hindsight-xpu.sh /srv/zeroclaw-hindsight
+```
+
+It installs a separate PyTorch 2.15.0 XPU environment and verifies pinned Intel
+compute-runtime 26.40.40196.8, IGC 2.42.6, GMM 22.10.2, and Level Zero 1.34.0
+packages before extracting them privately. No system packages or kernel drivers
+are replaced. The official Hindsight serving package still owns inference and
+`/v1/systemone`. The XPU launcher uses float32 and math attention: the default
+bf16/optimized path failed on the tested Meteor Lake GPU.
+
+In the decision service above, replace `ExecStart` and add its environment file:
+
+```ini
+ExecStart=/srv/zeroclaw-hindsight/decision-xpu-runtime/bin/python /srv/zeroclaw-hindsight/serve-decision-xpu.py
+EnvironmentFile=/srv/zeroclaw-hindsight/decision-xpu.env
+```
+
+Do not retain a second `ExecStart` in the same service. Reload systemd and restart
+that service. An unavailable configured XPU is an explicit failure, not an
+implicit CPU fallback. Check the authenticated `/version` and `/v1/systemone`
+endpoints before connecting Hindsight.
+
+Measured warm synthetic decision latency on the tested Intel Arc integrated GPU:
+
+| Input tokens | CPU, four threads | Intel XPU |
+| --- | --- | --- |
+| 422 | 1.36 s | 0.35–0.37 s |
+| 3662 | 14.6 s | 2.9–3.0 s |
+| 7262 | Not compared | 6.5 s |
+
+Decision probabilities matched the CPU fixtures within floating-point tolerance.
+These measurements exclude first-call kernel warmup and are not a quality
+benchmark. Other devices, distributions, and vLLM/ROCm remain unverified.
+
 ## Configuration
 
 Adapt this example to existing agent/provider aliases. Do not duplicate credentials
@@ -229,6 +277,7 @@ recall_budget = "mid"
 recall_max_tokens = 2048
 reflect_budget = "mid"
 prefer_observations = true
+identity_context = true
 
 [memory.hindsight.runtime]
 binary_path = "/srv/zeroclaw-hindsight/runtime/bin/hindsight-embed"
@@ -408,11 +457,13 @@ Known limitations requiring further work or operator handling:
 - Per-agent alias renaming and bulk principal/namespace purge are not implemented
   for Hindsight; unsupported operations fail explicitly.
 - Backfill merges source event-time frontiers across sessions and resumes after
-  backpressure. Full restart/fault-injection coverage still needs expansion.
+  backpressure. Worker fault tests cover lost acknowledgments, failed extraction,
+  reopened ledgers, retry, in-flight erasure, and mental-model cleanup receipts.
 - CPU decision serving and decision-reranked recall are verified. A three-query
   fixture measured ordinary recall at 32–90 ms and decision recall at roughly
   1.5 seconds. This is a latency smoke test, not a retrieval-quality evaluation;
-  ordinary reranking remains the default. vLLM/ROCm serving is unverified.
+  ordinary reranking remains the default. Intel XPU is separately verified above;
+  vLLM/ROCm serving is unverified.
 
 See upstream [installation](https://hindsight.vectorize.io/developer/installation),
 [embed runtime](https://hindsight.vectorize.io/sdks/embed),

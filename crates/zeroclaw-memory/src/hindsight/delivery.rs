@@ -304,7 +304,7 @@ async fn deliver(
             Err(error) => return Err(error.into()),
         }
     }
-    backend.prepare_bank(&bank).await?;
+    backend.prepare_bank(&bank, &scope).await?;
     let revision = source.revision(stream).await?;
     anyhow::ensure!(
         revision == source_revision,
@@ -354,8 +354,131 @@ async fn erase(
         Err(error) if error.status == Some(404) => {}
         Err(error) => return Err(error.into()),
     }
+    if !refresh_erased_models(&client, ledger, &delivery.id, &bank).await? {
+        return Ok(());
+    }
     ledger.delivery_state(&delivery.id, "erased", None, None)?;
     Ok(())
+}
+
+/// Native deletion schedules automatic retraction refreshes, but does not wait
+/// for them and leaves manual models alone. Keep the bank fenced until every
+/// model has completed an explicit full refresh. Receipts survive a restart.
+async fn refresh_erased_models(
+    client: &super::client::Client,
+    ledger: &Ledger,
+    delivery: &str,
+    bank: &str,
+) -> anyhow::Result<bool> {
+    let active = client
+        .request_query(
+            reqwest::Method::GET,
+            &["v1", "default", "banks", bank, "operations"],
+            None,
+            false,
+            &[
+                ("type", "refresh_mental_model".into()),
+                ("status", "processing".into()),
+                ("limit", "1".into()),
+            ],
+        )
+        .await?;
+    let total = active
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::Error::msg("hindsight_invalid_operations"))?;
+    if total > 0 {
+        return Ok(false);
+    }
+    let response = client
+        .request_query(
+            reqwest::Method::GET,
+            &["v1", "default", "banks", bank, "mental-models"],
+            None,
+            false,
+            &[("limit", "100".into())],
+        )
+        .await?;
+    let models = response
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::Error::msg("hindsight_invalid_mental_models"))?;
+    anyhow::ensure!(
+        response.get("total").and_then(serde_json::Value::as_u64) == Some(models.len() as u64),
+        "hindsight_erasure_model_limit"
+    );
+    let mut complete = true;
+    for model in models {
+        let id = model
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::Error::msg("hindsight_invalid_mental_model"))?;
+        if let Some(operation) = ledger.erasure_refresh(delivery, id)? {
+            match client.operation(bank, &operation).await {
+                Ok(state) if state.status == "completed" => continue,
+                Ok(state) if matches!(state.status.as_str(), "failed" | "cancelled") => {
+                    client
+                        .request(
+                            reqwest::Method::POST,
+                            &[
+                                "v1",
+                                "default",
+                                "banks",
+                                bank,
+                                "operations",
+                                &operation,
+                                "retry",
+                            ],
+                            None,
+                            false,
+                        )
+                        .await?;
+                    complete = false;
+                    continue;
+                }
+                Ok(_) => {
+                    complete = false;
+                    continue;
+                }
+                Err(error) if error.status == Some(404) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // A full refresh deliberately preserves old content when no evidence
+        // remains. Clear the obsolete baseline first, including its embedding,
+        // so "nothing to synthesize" cannot keep a deleted fact retrievable.
+        client
+            .request(
+                reqwest::Method::POST,
+                &["v1", "default", "banks", bank, "mental-models", id, "clear"],
+                None,
+                false,
+            )
+            .await?;
+        let refresh = client
+            .request(
+                reqwest::Method::POST,
+                &[
+                    "v1",
+                    "default",
+                    "banks",
+                    bank,
+                    "mental-models",
+                    id,
+                    "refresh",
+                ],
+                Some(&serde_json::json!({"mode":"full"})),
+                false,
+            )
+            .await?;
+        let operation = refresh
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::Error::msg("hindsight_invalid_refresh_operation"))?;
+        ledger.record_erasure_refresh(delivery, id, operation)?;
+        complete = false;
+    }
+    Ok(complete)
 }
 
 async fn resume_notes(
@@ -436,7 +559,7 @@ async fn resume_notes(
                             )
                             .await?;
                     }
-                    backend.prepare_bank(&bank).await?;
+                    backend.prepare_bank(&bank, &note.scope).await?;
                     backend.policy()?;
                     backend
                         .client
@@ -457,6 +580,10 @@ async fn resume_notes(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

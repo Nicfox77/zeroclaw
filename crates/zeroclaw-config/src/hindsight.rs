@@ -148,6 +148,9 @@ pub struct HindsightConfig {
     pub recall_max_tokens: usize,
     pub reflect_budget: String,
     pub prefer_observations: bool,
+    /// Bridge bounded canonical workspace identity into operator-bank missions.
+    /// Other principals never receive the installation owner's profile.
+    pub identity_context: bool,
     pub retain_async: bool,
     pub retry_failed_retains: bool,
     pub queue_capacity: usize,
@@ -181,6 +184,7 @@ impl Default for HindsightConfig {
             recall_max_tokens: 2048,
             reflect_budget: "mid".into(),
             prefer_observations: true,
+            identity_context: false,
             retain_async: true,
             retry_failed_retains: true,
             queue_capacity: 10_000,

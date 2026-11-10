@@ -625,6 +625,18 @@ mod service_tests {
         config.memory.hindsight.api_url = std::env::var("ZEROCLAW_TEST_HINDSIGHT_URL")
             .expect("explicit local service URL required");
         config.memory.hindsight.mode = zeroclaw_config::hindsight::RuntimeMode::External;
+        config.memory.hindsight.identity_context = true;
+        config.memory.hindsight.mental_models.insert(
+            "fixture-decisions".into(),
+            zeroclaw_config::hindsight::MentalModel {
+                name: "Project decisions".into(),
+                source_query:
+                    "Summarize project decisions supported by the currently stored conversations."
+                        .into(),
+                max_tokens: 512,
+                min_refresh_interval_seconds: 60,
+            },
+        );
         config.agents.insert(
             "fixture".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -634,6 +646,15 @@ mod service_tests {
                 ..Default::default()
             },
         );
+        let workspace = directory.path().join("fixture-profile");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("IDENTITY.md"), "My name is Nova.").unwrap();
+        std::fs::write(
+            workspace.join("USER.md"),
+            "The user's preferred name is Alex.",
+        )
+        .unwrap();
+        config.agents.get_mut("fixture").unwrap().workspace.path = Some(workspace);
         let live = zeroclaw_config::live::LiveConfig::new(config.clone());
         let hub = NativeSessionHub::new(live.handle());
         let authority = Arc::new(crate::tests::Authority(std::sync::atomic::AtomicBool::new(
@@ -699,6 +720,19 @@ mod service_tests {
             .unwrap();
         let client =
             zeroclaw_memory::hindsight::client::Client::new(&config.memory.hindsight).unwrap();
+        let preview = client
+            .request(
+                reqwest::Method::POST,
+                &["v1", "default", "banks", &bank, "prompts", "preview"],
+                Some(&serde_json::json!({"operation":"retain"})),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            preview.to_string().contains("Nova") && preview.to_string().contains("Alex"),
+            "the actual retain prompt must receive the scoped identity reference"
+        );
         loop {
             let stats = client
                 .request(
@@ -718,6 +752,59 @@ mod service_tests {
             );
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+        let refresh = client
+            .request(
+                reqwest::Method::POST,
+                &[
+                    "v1",
+                    "default",
+                    "banks",
+                    &bank,
+                    "mental-models",
+                    "fixture-decisions",
+                    "refresh",
+                ],
+                Some(&serde_json::json!({"mode":"full"})),
+                false,
+            )
+            .await
+            .unwrap();
+        loop {
+            let state = client
+                .operation(&bank, refresh["operation_id"].as_str().unwrap())
+                .await
+                .unwrap();
+            if state.status == "completed" {
+                break;
+            }
+            assert_ne!(state.status, "failed");
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let model = client
+            .request(
+                reqwest::Method::GET,
+                &[
+                    "v1",
+                    "default",
+                    "banks",
+                    &bank,
+                    "mental-models",
+                    "fixture-decisions",
+                ],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            model["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("sqlite"),
+            "the test must first establish derivative mental-model content"
+        );
         assert!(
             !memory
                 .reflect_for_principal(&scope, "Why did we choose SQLite for Larch?")
@@ -800,6 +887,30 @@ mod service_tests {
                 .is_empty()
         );
         assert!(!directory.path().join("memory/brain.db").exists());
+        let model = client
+            .request(
+                reqwest::Method::GET,
+                &[
+                    "v1",
+                    "default",
+                    "banks",
+                    &bank,
+                    "mental-models",
+                    "fixture-decisions",
+                ],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !model["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("sqlite"),
+            "deleted source information must leave the mental model before the bank is unblocked"
+        );
         client
             .request(
                 reqwest::Method::DELETE,
