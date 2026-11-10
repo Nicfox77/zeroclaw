@@ -2235,6 +2235,26 @@ pub(super) fn with_initialized_connection<T>(
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
     initialize_schema(&conn, config)?;
 
+    #[cfg(test)]
+    let conn = {
+        // rusqlite 0.41 requires exclusive access when replacing a callback.
+        // Install the test notifier while this connection is still owned,
+        // after schema setup and before handing out the shared reference.
+        let mut conn = conn;
+        if PATCH_WRITER_WAIT.with(|sender| sender.borrow().is_some()) {
+            conn.busy_handler(Some(|attempt| {
+                PATCH_WRITER_WAIT.with(|sender| {
+                    if let Some(sender) = sender.borrow_mut().take() {
+                        let _ = sender.send(());
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                attempt < 500
+            }))?;
+        }
+        conn
+    };
+
     f(&conn)
 }
 
@@ -2497,18 +2517,6 @@ const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
 /// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
 /// fails immediately without consulting the busy handler.
 fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
-    #[cfg(test)]
-    if phase == "job patch" && PATCH_WRITER_WAIT.with(|sender| sender.borrow().is_some()) {
-        conn.busy_handler(Some(|attempt| {
-            PATCH_WRITER_WAIT.with(|sender| {
-                if let Some(sender) = sender.borrow_mut().take() {
-                    let _ = sender.send(());
-                }
-            });
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            attempt < 500
-        }))?;
-    }
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .with_context(|| format!("Failed to begin cron {phase} transaction"))
 }
