@@ -62,7 +62,9 @@ references have been checked again. A removed source document is deleted through
 Hindsight, including its derived memory links/observations. An in-flight retain is
 allowed to reach its terminal state before document deletion, avoiding the race
 where a cooperatively cancelled worker writes facts after deletion. The bank stays
-blocked during that reconciliation. Erasure does not fall back to SQLite recall.
+blocked during that reconciliation. Erasure does not fall back to SQLite recall. Same-frontier validated appends extend
+the receipt atomically, and background frontier checks use bounded indexed
+queries; ordinary turns do not rescan completed delivery history.
 
 The dashboard's Memories tab reports the selected backend and delivery health.
 This example uses synthetic queue values and no private memory content:

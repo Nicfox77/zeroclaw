@@ -257,7 +257,12 @@ async fn deliver(
     // Stable source identity, not generated text: a redaction policy change
     // cannot accidentally allocate another operation after uncertain acceptance.
     let operation = ledger.operation(&bank, document, &delivery.id)?;
-    ledger.delivery_state(&delivery.id, "processing", Some(&operation), None)?;
+    let revision = source.revision(stream).await?;
+    anyhow::ensure!(
+        revision == source_revision,
+        "hindsight_source_changed_during_delivery"
+    );
+    ledger.attach_validated_source(&delivery.id, &operation, &revision)?;
     if delivery.operation.is_some() {
         match backend.client.operation(&bank, &operation).await {
             Ok(op) => {
@@ -299,14 +304,13 @@ async fn deliver(
             Err(error) => return Err(error.into()),
         }
     }
+    backend.prepare_bank(&bank).await?;
     let revision = source.revision(stream).await?;
     anyhow::ensure!(
         revision == source_revision,
         "hindsight_source_changed_during_delivery"
     );
-    ledger.checked_revision(&delivery.id, &revision)?;
     backend.policy()?;
-    backend.prepare_bank(&bank).await?;
     backend.client.retain(&bank, &items, &operation).await?;
     ledger.update(&operation, "processing")?;
     // Acceptance is deliberately not completion. The next tick reconciles it.
@@ -433,6 +437,7 @@ async fn resume_notes(
                             .await?;
                     }
                     backend.prepare_bank(&bank).await?;
+                    backend.policy()?;
                     backend
                         .client
                         .retain(&bank, &items, &note.operation)
