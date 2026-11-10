@@ -2,6 +2,8 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+pub(crate) mod prefill;
+
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
@@ -4710,6 +4712,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let mut result = self.parse_native_response(choice.into_message());
         result.usage = usage;
         Ok(result)
+    }
+
+    async fn prefill_prompt(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        inactivity_secs: u64,
+    ) -> anyhow::Result<()> {
+        self.prefill_llamacpp(request, model, temperature, inactivity_secs)
+            .await
     }
 
     async fn chat(

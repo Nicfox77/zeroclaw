@@ -25,6 +25,15 @@ pub struct ResolvedSummaryDeck {
 /// Host composition resolves live config and constructs inference capabilities.
 /// The kernel retains this resolver, never a configuration or permission copy.
 pub trait SummaryDeckRuntime: Send + Sync {
+    /// Resolve current host policy and perform a prompt-only local cache
+    /// operation. The intent is derived at use time from canonical context
+    /// and the last admitted main request, never a cached live tool policy.
+    fn prefill_context(
+        &self,
+        _intent: zeroclaw_api::session_events::capture::ProviderDispatchIntent,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
     /// A live routing decision, not a cached grant or stored policy snapshot.
     fn main_session(&self) -> anyhow::Result<Option<SessionId>> {
         Ok(None)
@@ -603,7 +612,225 @@ impl EngineSession {
                 .await?;
             return Err(error);
         }
+        self.schedule_cache_warmup();
         Ok(())
+    }
+
+    fn schedule_cache_warmup(&self) {
+        let Some(runtime) = self.summary_deck.clone() else {
+            return;
+        };
+        let session = self.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let result = session.prefill_current_context(runtime).await;
+            if result.is_err() {
+                // A committed summary remains valid even if an ephemeral cache
+                // operation fails. Never include prompt content or credentials.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(serde_json::json!({"error_key":"summary_cache_warm_failed"})),
+                    "summary_cache_warm_failed"
+                );
+            }
+        });
+    }
+
+    pub(super) async fn prefill_current_context(
+        &self,
+        runtime: Arc<dyn SummaryDeckRuntime>,
+    ) -> anyhow::Result<()> {
+        // Reuse the foreground lane: finish an active turn before touching its
+        // slot; a later arriving turn waits for this admitted prefill. No DB
+        // transaction or commit lock is held over network inference.
+        if !runtime
+            .resolve()?
+            .is_some_and(|p| p.config.enabled && p.config.warm_cache)
+        {
+            return Ok(());
+        }
+        let lane = self.owner.foreground_lock(&self.stream);
+        let _permit = lane.lock().await;
+        if !runtime
+            .resolve()?
+            .is_some_and(|p| p.config.enabled && p.config.warm_cache)
+        {
+            return Ok(());
+        }
+        self.authority
+            .authorize_context(&self.stream, &self.branch)?;
+        let projection = self.latest_context().await?;
+        let projection_id = projection.event_id.clone();
+        let selection = self.summary_route().await?;
+        let expected_selection = selection.clone();
+        let snapshot = self
+            .read_context_snapshot(projection)
+            .await?
+            .ok_or_else(|| anyhow::Error::msg("cache_warm_context_missing"))?;
+        let binding = self.authority.maintenance_binding()?;
+        let session = self.clone();
+        let intent = self
+            .owner
+            .blocking(move || {
+                session
+                    .cache_prefill_intent(snapshot, binding, selection)
+                    .map_err(SessionError::Operation)
+            })
+            .await?;
+        if let Some(intent) = intent {
+            self.authority
+                .authorize_context(&self.stream, &self.branch)?;
+            if self.latest_context().await?.event_id != projection_id {
+                return Ok(());
+            }
+            let prefill = runtime.prefill_context(intent);
+            tokio::pin!(prefill);
+            let mut changes = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    result = &mut prefill => { result?; break; }
+                    _ = changes.tick() => {
+                        self.authority.authorize_context(&self.stream,&self.branch)?;
+                        anyhow::ensure!(self.summary_route().await? == expected_selection
+                            && self.latest_context().await?.event_id == projection_id,
+                            "cache_warm_context_changed");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_prefill_intent(
+        &self,
+        snapshot: ContextSnapshot,
+        binding: PayloadRecord,
+        selection: Option<(String, String)>,
+    ) -> anyhow::Result<Option<zeroclaw_api::session_events::capture::ProviderDispatchIntent>> {
+        self.authority
+            .authorize_context(&self.stream, &self.branch)?;
+        let current: serde_json::Value = serde_json::from_slice(&binding.body)?;
+        let mut through = self.owner.store.head(&self.stream)?.sequence;
+        // Indexed canonical request lookups; never scan token/progress
+        // events or materialize the permanent conversation transcript.
+        for _ in 0..32 {
+            let Some(event) = self.owner.store.read_latest_event_before(
+                &self.stream,
+                &self.branch,
+                None,
+                &EventKind::ProviderRequestPrepared,
+                through,
+            )?
+            else {
+                break;
+            };
+            through = event.sequence.saturating_sub(1);
+            let EventData::ProviderRequestPrepared {
+                request_ref,
+                route_attribution_ref,
+                purpose: ProviderPurpose::Main,
+                ..
+            } = &event.body.data
+            else {
+                continue;
+            };
+            let Some(turn) = &event.turn_id else {
+                return Ok(None);
+            };
+            let Some(started) = self.owner.store.read_latest_event(
+                &self.stream,
+                &self.branch,
+                Some(turn),
+                &EventKind::TurnStarted,
+            )?
+            else {
+                return Ok(None);
+            };
+            let EventData::TurnStarted {
+                execution_binding_ref,
+                ..
+            } = &started.body.data
+            else {
+                return Ok(None);
+            };
+            let previous: serde_json::Value = serde_json::from_slice(
+                &present(self.owner.store.as_ref(), execution_binding_ref)?.body,
+            )?;
+            // Historical tool definitions are request facts, not current
+            // grants. Reuse them only in the same live authority epoch.
+            if !current.get("config_revision").is_some_and(|revision| {
+                revision
+                    .get("epoch")
+                    .is_some_and(serde_json::Value::is_string)
+                    && revision
+                        .get("sequence")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some()
+            }) || current.get("config_revision") != previous.get("config_revision")
+                || current.get("auth_policy_revision") != previous.get("auth_policy_revision")
+            {
+                return Ok(None);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&present(self.owner.store.as_ref(), request_ref)?.body)?;
+            let route: serde_json::Value = serde_json::from_slice(
+                &present(self.owner.store.as_ref(), route_attribution_ref)?.body,
+            )?;
+            let tools_ref: StoredPayloadRef = serde_json::from_value(request["tools_ref"].clone())?;
+            let tools: Option<serde_json::Value> =
+                serde_json::from_slice(&present(self.owner.store.as_ref(), &tools_ref)?.body)?;
+            let mut messages: Vec<_> = snapshot
+                .messages
+                .iter()
+                .flat_map(ConversationMessage::chat_messages)
+                .collect();
+            // Transcript projections can omit runtime-owned system prompts.
+            // Resolve that exact prefix from the admitted main request,
+            // under the same authority revision, instead of inventing a
+            // second system/tool prompt builder here.
+            if !messages
+                .first()
+                .is_some_and(|message| message.role == "system")
+            {
+                let messages_ref: StoredPayloadRef =
+                    serde_json::from_value(request["messages_ref"].clone())?;
+                let prior: Vec<ChatMessage> = serde_json::from_slice(
+                    &present(self.owner.store.as_ref(), &messages_ref)?.body,
+                )?;
+                let mut header: Vec<_> = prior
+                    .into_iter()
+                    .take_while(|message| message.role == "system")
+                    .collect();
+                header.extend(messages);
+                messages = header;
+            }
+            let intent = zeroclaw_api::session_events::capture::ProviderDispatchIntent {
+                requested_route: None,
+                previous_attempt_event_id: None,
+                provider_ref: route
+                    .pointer("/actual_dispatch/provider_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::Error::msg("cache_warm_route_missing"))?
+                    .to_owned(),
+                model: route
+                    .pointer("/actual_dispatch/model")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::Error::msg("cache_warm_model_missing"))?
+                    .to_owned(),
+                messages,
+                tools,
+                temperature: serde_json::from_value(request["temperature"].clone())?,
+                thinking: serde_json::from_value(request["thinking"].clone())?,
+                tool_round_policy: serde_json::from_value(request["tool_round_policy"].clone())?,
+            };
+            if selection.as_ref().is_some_and(|(provider, model)| {
+                *provider != intent.provider_ref || *model != intent.model
+            }) {
+                return Ok(None);
+            }
+            return Ok(Some(intent));
+        }
+        Ok(None)
     }
 
     async fn publish_summary_card(

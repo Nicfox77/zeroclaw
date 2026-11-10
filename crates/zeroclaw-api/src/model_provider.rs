@@ -1452,6 +1452,20 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Evaluate a prompt into a local provider's resident KV cache without
+    /// publishing assistant output or executing tools. Unsupported by default.
+    /// A provider may sample at most one discarded token to complete prefill.
+    /// This is a physical cache operation, not a conversation/provider response.
+    async fn prefill_prompt(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+        _inactivity_secs: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("provider_prompt_prefill_unsupported")
+    }
+
     /// Chat with tool definitions for native function calling support.
     /// See `simple_chat` for the `temperature` contract.
     async fn chat_with_tools(
@@ -1669,6 +1683,18 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         self.as_ref().warmup().await
+    }
+
+    async fn prefill_prompt(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        inactivity_secs: u64,
+    ) -> anyhow::Result<()> {
+        self.as_ref()
+            .prefill_prompt(request, model, temperature, inactivity_secs)
+            .await
     }
 
     async fn chat_with_tools(

@@ -10,6 +10,9 @@ use zeroclaw_macros::Configurable;
 pub struct SummaryDeckConfig {
     /// Summarize completed turns in the background. Requires native session persistence.
     pub enabled: bool,
+    /// Prefill a loopback llama.cpp primary model after summary publication,
+    /// while the session is idle. New turns wait for an admitted prefill. Default: false.
+    pub warm_cache: bool,
     /// Fraction of the available history budget reserved for summaries (0 < value < 1).
     pub summary_share: f64,
     /// Start summarization at this fraction of the recent-history allocation.
@@ -29,6 +32,7 @@ impl Default for SummaryDeckConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            warm_cache: false,
             summary_share: 0.15,
             trigger_ratio: 0.8,
             max_summary_tokens: 1_000,
@@ -71,6 +75,7 @@ mod tests {
     fn summary_deck_defaults_and_invalid_budgets() {
         let policy = SummaryDeckConfig::default();
         assert!(!policy.enabled);
+        assert!(!policy.warm_cache);
         assert!(policy.validate().is_ok());
         for share in [0.0, 1.0, -0.1, f64::NAN, f64::INFINITY] {
             assert!(

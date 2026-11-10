@@ -95,6 +95,8 @@ Enable it on the runtime profile used by your agent:
 enabled = true
 summary_share = 0.15
 trigger_ratio = 0.8
+# Optional: prefill a dedicated loopback llama.cpp primary after publication.
+warm_cache = false
 max_summary_tokens = 1000
 timeout_secs = 600
 # Optional configured model-provider alias; otherwise inherit summary_provider,
@@ -177,6 +179,52 @@ Summaries incur additional model calls. Their provider attempts are captured
 in session history and ordinary completed/failed attempt usage is recorded
 against the agent and session in the existing cost ledger. The foreground
 response's context meter still describes that response, not background usage.
+
+### Warming a local model after summary publication
+
+Set `summary_deck.warm_cache = true` to opt into background prompt-cache warming
+for a dedicated, single-slot (`--parallel 1`) loopback llama.cpp primary provider
+using Chat Completions. Other provider families, a different session model
+override, and previous fallback routes are skipped. This is independent of the
+provider used to generate summaries.
+
+After a card is committed, warming waits for the session's active turn to finish,
+then takes its existing foreground lane. A later arriving turn waits for the
+prefill to finish and can append to its warmed prefix. The warmer reads the latest
+committed context and resolves the system prefix and tool definitions from the
+last admitted main request in the same live authority/config epoch. It does not
+maintain another editable prompt, tool registry or conversation history. If no
+such request exists yet, that warmup is skipped; a future publication can retry.
+Configuration, model-selection, context and authority changes cancel or skip
+warming. No SQLite transaction is held over inference.
+
+The ordinary provider request builder supplies the wire format. A bounded
+one-token request fills the resident KV cache; its generated token is discarded,
+never becomes an assistant message and never executes a tool. Some llama.cpp
+builds sample one token even when zero are requested, so zero-token semantics
+are not assumed. Actual prompt-processing progress renews the summary policy's
+`timeout_secs` inactivity allowance; empty frames and keepalives do not. A failed
+warmup releases the lane without invalidating an already committed summary.
+
+Warming stops before the first image-bearing turn rather than independently
+loading media paths or remote images. That text prefix remains reusable;
+foreground multimodal preparation still authorizes and processes images normally.
+
+For the primary profile, `provider_extra = { cache_prompt = true, id_slot = 0 }`
+can explicitly select the resident slot. llama.cpp's default
+`--sleep-idle-seconds -1` disables idle unloading. `--cache-ram 0` disables the
+additional CPU prompt-cache pool, not the live slot's KV cache. No dummy chat
+keepalives are needed: they could evict useful context. The cache stays resident
+while the server remains running and another request does not replace its prefix.
+A restart, model reload, changing system/tool prompts or another client can still
+invalidate it; this does not add disk snapshots or guarantee cache residency
+across processes. Separate sessions and other API clients do not share the
+session's foreground lock.
+
+Diagnostics record `llamacpp_cache_warm_started`,
+`llamacpp_cache_warm_completed` (prompt/cache/processed token counts and duration),
+and `summary_cache_warm_failed`, without prompt content. Warming is ephemeral and
+does not replay on restart. Disable `warm_cache` and reload to cancel active work.
 
 Turning the policy off stops new automatic summaries and retains the currently
 committed working context. Original history remains readable. Roll back the
