@@ -1852,6 +1852,7 @@ async fn run_tool_call_loop_body<'a>(
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
+    let preparation_started = Instant::now();
     turn_state.sync_pending();
 
     // Session-owned maintenance is shared by Web, channel and Agent callers.
@@ -1872,6 +1873,7 @@ async fn run_tool_call_loop_body<'a>(
             .collect();
         turn_state.crumb_present = prepared.history_has_trim_breadcrumb.unwrap_or(false);
     }
+    let context_ready = Instant::now();
 
     let ingress_policy_cfg = IngressPolicy::default();
 
@@ -1923,6 +1925,7 @@ async fn run_tool_call_loop_body<'a>(
         }
     }
 
+    let mut memory_recall_ms = None;
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -1937,6 +1940,7 @@ async fn run_tool_call_loop_body<'a>(
         {
             let scopes: Vec<Option<&str>> =
                 turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
+            let recall_started = Instant::now();
             let context = crate::agent::memory_inject::recall_memory_context(
                 turn_memory.handle,
                 observer,
@@ -1953,6 +1957,7 @@ async fn run_tool_call_loop_body<'a>(
                 turn_state.history,
             )
             .await;
+            memory_recall_ms = Some(recall_started.elapsed().as_millis());
             if !context.entries.is_empty() {
                 // Keep the canonical current-turn delta and its request view in
                 // sync. Historical messages and earlier recall snapshots are unchanged.
@@ -2242,6 +2247,7 @@ async fn run_tool_call_loop_body<'a>(
             }
         }
 
+        let request_preparation_started = Instant::now();
         preflight_history_maintenance(turn_state.history);
 
         // Check if model switch was requested via model_switch tool before
@@ -2610,6 +2616,7 @@ async fn run_tool_call_loop_body<'a>(
         // rebuilt post-hook request re-measured below is authoritative. A
         // floor is fatal only when the rebuilt request exceeds model capacity.
         // A newest turn above the proactive target can still be dispatched.
+        let trim_started = Instant::now();
         let mut trim_result = capture_oversized_dispatch_trim(
             turn_state.history,
             &mut turn_state.crumb_present,
@@ -2617,6 +2624,7 @@ async fn run_tool_call_loop_body<'a>(
             trim_budget,
         )
         .await?;
+        let mut dispatch_trim_ms = trim_started.elapsed().as_millis();
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
             || turn_state.crumb_present != crumb_before;
@@ -2714,6 +2722,7 @@ async fn run_tool_call_loop_body<'a>(
                 // heuristic that decided the previous round stopped early.
                 let before_len = turn_state.history.len();
                 let before_crumb = turn_state.crumb_present;
+                let trim_started = Instant::now();
                 trim_result = capture_oversized_dispatch_trim(
                     turn_state.history,
                     &mut turn_state.crumb_present,
@@ -2721,6 +2730,7 @@ async fn run_tool_call_loop_body<'a>(
                     trim_budget,
                 )
                 .await?;
+                dispatch_trim_ms += trim_started.elapsed().as_millis();
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
                 dropped_turns += usize::from(trim_result.dropped_messages > 0);
@@ -2912,6 +2922,7 @@ async fn run_tool_call_loop_body<'a>(
         } else {
             None
         };
+        let announcement_started = Instant::now();
         let llm_started_at = announce_llm_request(
             &ctx,
             &provider_request_messages,
@@ -2922,6 +2933,24 @@ async fn run_tool_call_loop_body<'a>(
             iteration,
         )
         .await;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_attrs(serde_json::json!({
+                    "trace_id": turn_id,
+                    "iteration": iteration + 1,
+                    "context_prepare_ms": (iteration == 0)
+                        .then(|| context_ready.duration_since(preparation_started).as_millis()),
+                    "memory_recall_ms": (iteration == 0).then_some(memory_recall_ms).flatten(),
+                    "before_first_request_ms": (iteration == 0)
+                        .then(|| announcement_started.duration_since(preparation_started).as_millis()),
+                    "request_prepare_ms": announcement_started.duration_since(request_preparation_started).as_millis(),
+                    "dispatch_trim_ms": dispatch_trim_ms,
+                    "announcement_ms": announcement_started.elapsed().as_millis(),
+                })),
+            "llm_request_preparation_timing"
+        );
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
         let base_provider_supports_native_tools = model_provider
             .capabilities_for_model(dispatch_model)
