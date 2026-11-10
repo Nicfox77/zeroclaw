@@ -55,6 +55,7 @@ websocket_url = "ws://127.0.0.1:5225"
 bridge_command = ["node", "/absolute/path/to/contrib/simplex/bridge.mjs"]
 calls_enabled = true
 message_arrival = "steer"
+max_attachment_bytes = 1073741824 # 1 GiB; optional, this is the default
 
 [peer_groups.simplex_owner]
 channel = "simplex.personal"
@@ -81,12 +82,21 @@ reload the daemon after changing the bridge executable or CLI endpoint.
 ## Incoming files and images
 
 Direct attachments from authorized contacts are downloaded through the official
-CLI, with a 5 MiB limit per file. The bridge checks advertised and received sizes,
-transfer identity, and the private destination before releasing bytes. Unauthorized
+CLI, with a configurable limit of 1 GiB per file by default. The bridge checks advertised and received sizes,
+transfer identity, and the private destination before handing off a local path. Unauthorized
 contacts cannot initiate downloads. Filenames cannot contain path separators or
 control characters. Files are stored with private permissions in the owning
 agent's workspace under `simplex_files/`; these durable files remain until the
 operator removes them. Captions and image-only messages are supported.
+
+`max_attachment_bytes` accepts 1 byte through 5 GiB. SimpleX's own app, CLI,
+relay and account-tier limits still apply. Documents, archives and large files
+stay on disk: only a small path reference crosses the bridge, and native code
+streams a bounded copy into the owning workspace. It checks the live limit again
+at completion. The bridge deletes its temporary copy after native acknowledgement;
+a failed or stalled transfer is cleaned up after 30 minutes without progress.
+Voice notes keep their separate transcription limits. Archives are transferred
+intact; receiving a ZIP does not automatically extract or execute its contents.
 
 SimpleX must also permit files for that contact. Keep the profile-wide file
 preference closed when pairing a bot. Use the private CLI API to inspect the

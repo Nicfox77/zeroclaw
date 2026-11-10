@@ -54,7 +54,7 @@ export class VoiceNotes {
     this.creating++;
     let dir;
     try {
-      dir = await mkdtemp(join(tmpdir(), 'zeroclaw-simplex-voice-'));
+      dir = await mkdtemp(join(properties.attachmentDir ?? tmpdir(), 'zeroclaw-simplex-voice-'));
       await chmod(dir, 0o700);
       if (this.closed) throw Error('simplex_voice_closed');
       const record = {dir, ...properties}; this.artifacts.add(record); return record;
@@ -68,13 +68,14 @@ export class VoiceNotes {
     this.artifacts.delete(record);
   }
   expire(record) {
+    clearTimeout(record.timer);
     record.timer = setTimeout(async () => {
       if (!this.artifacts.has(record)) return;
       if (record.fileId) await this.rpc(`/fcancel ${record.fileId}`).catch(() => {});
       if (!this.artifacts.has(record)) return;
       await this.remove(record);
       await this.emit({type: failureType(record), contact: record.contact, outgoing: record.direction === 'send'});
-    }, this.ttl);
+    }, record.mediaType ? 1800000 : this.ttl);
     record.timer.unref();
   }
   async invitation(item) {
@@ -122,9 +123,12 @@ export class VoiceNotes {
     if (!positive(Number(contact)) || !positive(Number(id)) || !positive(fileId)
       || !filenameValid(filename)
       || (mediaType ? !['image', 'file', 'video'].includes(mediaType) : (!extensions.has(ext) || !positive(maxDuration)))
+      || (mediaType && (!positive(message.max_bytes) || message.max_bytes > 5 * 1024 ** 3
+        || typeof message.attachment_dir !== 'string'))
       || this.receiving.has(fileId)) throw Error('simplex_invalid_voice_invitation');
     const record = await this.artifact({direction: 'receive', contact, id, fileId, maxDuration, mediaType,
-      filename, text: typeof message.text === 'string' ? message.text : ''});
+      filename, text: typeof message.text === 'string' ? message.text : '',
+      ...(mediaType ? {attachmentDir: message.attachment_dir, maxBytes: message.max_bytes} : {})});
     record.path = join(record.dir, mediaType ? 'attachment' : `input${ext}`);
     this.expire(record);
     try {
@@ -134,7 +138,19 @@ export class VoiceNotes {
     } catch (error) {await this.remove(record); throw error;}
   }
   async event(resp) {
-    if (resp.type === 'chatItemUpdated') {
+    if (resp.type === 'rcvFileProgressXFTP') {
+      const record = this.receiving.get(resp.rcvFileTransfer?.fileId);
+      if (record?.mediaType) {
+        if (resp.totalSize > record.maxBytes || resp.receivedSize > record.maxBytes) {
+          await this.rpc(`/fcancel ${record.fileId}`).catch(() => {});
+          await this.remove(record);
+          await this.emit({type: failureType(record), contact: record.contact, outgoing: false});
+        } else if (positive(resp.receivedSize) && resp.receivedSize > (record.progress ?? 0)) {
+          record.progress = resp.receivedSize;
+          this.expire(record);
+        }
+      }
+    } else if (resp.type === 'chatItemUpdated') {
       const item = resp.chatItem, file = item?.chatItem?.file;
       const record = this.receiving.get(file?.fileId);
       const current = identity(item);
@@ -159,7 +175,14 @@ export class VoiceNotes {
         let audio;
         try {
           const stat = await handle.stat();
-          if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_AUDIO) throw Error('simplex_voice_size_limit');
+          if (!stat.isFile() || stat.size <= 0 || stat.size > (record.maxBytes ?? MAX_AUDIO)) throw Error('simplex_voice_size_limit');
+          if (record.mediaType) {
+            record.ready = true;
+            this.expire(record);
+            await this.emit({type: 'attachment', contact: record.contact, id: record.id,
+              path: record.path, bytes: stat.size, filename: record.filename, media_type: record.mediaType, text: record.text});
+            return;
+          }
           const buffer = Buffer.alloc(stat.size + 1);
           let offset = 0;
           while (offset < buffer.length) {
@@ -170,18 +193,14 @@ export class VoiceNotes {
           if (offset !== stat.size) throw Error('simplex_transfer_size_changed');
           audio = buffer.subarray(0, offset);
         } finally {await handle.close();}
-        if (record.mediaType) {
-          await this.emit({type: 'attachment', contact: record.contact, id: record.id,
-            data: audio.toString('base64'), filename: record.filename, media_type: record.mediaType, text: record.text});
-        } else {
-          const seconds = await duration(record.path);
-          if (seconds > record.maxDuration) throw Error('simplex_voice_duration_limit');
-          await this.emit({type: 'voice_note', contact: record.contact, id: record.id,
-            audio: audio.toString('base64'), filename: `voice${extname(record.path)}`, duration: seconds});
-        }
+        const seconds = await duration(record.path);
+        if (seconds > record.maxDuration) throw Error('simplex_voice_duration_limit');
+        await this.emit({type: 'voice_note', contact: record.contact, id: record.id,
+          audio: audio.toString('base64'), filename: `voice${extname(record.path)}`, duration: seconds});
       } catch {
+        record.ready = false;
         await this.emit({type: failureType(record), contact: record.contact, outgoing: record.direction === 'send'});
-      } finally {await this.remove(record);}
+      } finally {if (!record.ready) await this.remove(record);}
     } else if (['rcvFileError', 'rcvFileSndCancelled'].includes(resp.type)) {
       const fileId = resp.rcvFileTransfer?.fileId ?? resp.chatItem?.chatItem?.file?.fileId;
       const record = this.receiving.get(fileId);
@@ -198,6 +217,11 @@ export class VoiceNotes {
       if (resp.type === 'sndFileError' || resp.type === 'sndFileCancelled')
         await this.emit({type: 'voice_transfer_failed', contact: record.contact, outgoing: record.direction === 'send'});
     }
+  }
+  async release(message) {
+    const record = [...this.artifacts].find(r => r.direction === 'receive' && r.ready
+      && r.contact === message.contact && r.id === message.message_id);
+    if (record) await this.remove(record);
   }
   async send(contact, text, encoded) {
     let record;
