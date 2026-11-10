@@ -148,6 +148,29 @@ pub fn environment(config: &Config) -> anyhow::Result<BTreeMap<String, String>> 
             &mut env,
         )?;
     }
+    // Validate the effective settings regardless of whether their canonical
+    // input is the typed config, a credential reference, or a protected file.
+    for (key, value) in &env {
+        anyhow::ensure!(
+            !value.contains(['\n', '\r', '\0']),
+            "hindsight_invalid_environment_value"
+        );
+        if key.ends_with("_PROVIDER") || key.ends_with("_MODEL") {
+            anyhow::ensure!(
+                !value.trim().is_empty(),
+                "hindsight_generative_llm_required"
+            );
+        }
+        if key.ends_with("_BASE_URL") {
+            zeroclaw_config::hindsight::validate_url(value)?;
+        }
+        if key.ends_with("_API_KEY") {
+            anyhow::ensure!(
+                !value.starts_with("enc2:") && !value.starts_with("enc:"),
+                "hindsight_secret_not_unlocked"
+            );
+        }
+    }
     let url = zeroclaw_config::hindsight::validate_url(&h.api_url)?;
     for (key, value) in [
         (
@@ -685,6 +708,20 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("environment_key_not_allowed")
+        );
+        std::fs::write(config.memory.hindsight.runtime.env_file.as_ref().unwrap(),"HINDSIGHT_API_LLM_PROVIDER=openai\nHINDSIGHT_API_LLM_MODEL=fixture\nHINDSIGHT_API_LLM_BASE_URL=http://example.com\n").unwrap();
+        assert!(
+            environment(&config).is_err(),
+            "protected files cannot bypass endpoint validation"
+        );
+        std::fs::write(
+            config.memory.hindsight.runtime.env_file.as_ref().unwrap(),
+            "HINDSIGHT_API_LLM_PROVIDER=openai\nHINDSIGHT_API_LLM_MODEL=\n",
+        )
+        .unwrap();
+        assert!(
+            environment(&config).is_err(),
+            "protected files cannot select an empty model"
         );
     }
     #[test]
