@@ -88,6 +88,7 @@ impl Ledger {
             )?;
         }
         schema.execute_batch("CREATE INDEX IF NOT EXISTS delivery_active ON deliveries(status,next_attempt,sequence);
+            CREATE TABLE IF NOT EXISTS erasure_refreshes(delivery TEXT NOT NULL,model TEXT NOT NULL,operation TEXT NOT NULL,PRIMARY KEY(delivery,model));
             CREATE INDEX IF NOT EXISTS delivery_stream ON deliveries(stream,sequence);
             CREATE INDEX IF NOT EXISTS delivery_operation ON deliveries(operation,checked_revision,status);
             CREATE INDEX IF NOT EXISTS operation_bank ON operations(bank_id,operation_id);
@@ -99,6 +100,33 @@ impl Ledger {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+    /// Created receipts for upstream full-refresh operations during erasure;
+    /// definitions and memory content remain solely in Hindsight.
+    pub fn erasure_refresh(&self, delivery: &str, model: &str) -> anyhow::Result<Option<String>> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        Ok(c.query_row(
+            "SELECT operation FROM erasure_refreshes WHERE delivery=?1 AND model=?2",
+            params![delivery, model],
+            |r| r.get(0),
+        )
+        .optional()?)
+    }
+    pub fn record_erasure_refresh(
+        &self,
+        delivery: &str,
+        model: &str,
+        operation: &str,
+    ) -> anyhow::Result<()> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        c.execute("INSERT INTO erasure_refreshes(delivery,model,operation) VALUES(?1,?2,?3) ON CONFLICT(delivery,model) DO UPDATE SET operation=excluded.operation", params![delivery,model,operation])?;
+        Ok(())
     }
     /// Observed delivery/transport facts only; no prompt, result, or credential text.
     pub fn observe(
