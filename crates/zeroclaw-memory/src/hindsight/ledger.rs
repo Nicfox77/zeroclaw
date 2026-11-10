@@ -39,6 +39,15 @@ pub struct Note {
     pub items: Vec<super::client::Item>,
 }
 
+// Each indexed frontier contributes at most 64 rows. Ordinary ticks do not
+// scan completed delivery history to discover that the frontier is unchanged.
+const SOURCE_RECHECK_SQL: &str = "
+SELECT * FROM (SELECT identity,stream,terminal,operation,status FROM deliveries WHERE stream=?1 AND operation IS NOT NULL AND status!='erased' AND checked_revision IS NULL LIMIT 64)
+UNION SELECT * FROM (SELECT identity,stream,terminal,operation,status FROM deliveries WHERE stream=?1 AND operation IS NOT NULL AND status!='erased' AND checked_revision<?2 LIMIT 64)
+UNION SELECT * FROM (SELECT identity,stream,terminal,operation,status FROM deliveries WHERE stream=?1 AND operation IS NOT NULL AND status!='erased' AND checked_revision>?2 LIMIT 64)
+UNION SELECT * FROM (SELECT identity,stream,terminal,operation,status FROM deliveries WHERE stream=?1 AND status='erasing' LIMIT 64)
+LIMIT 64";
+
 pub struct Ledger {
     connection: Mutex<Connection>,
 }
@@ -83,6 +92,8 @@ impl Ledger {
             CREATE INDEX IF NOT EXISTS delivery_operation ON deliveries(operation,checked_revision,status);
             CREATE INDEX IF NOT EXISTS operation_bank ON operations(bank_id,operation_id);
             CREATE INDEX IF NOT EXISTS operation_document ON operations(bank_id,document_id);
+            CREATE INDEX IF NOT EXISTS delivery_source_revision ON deliveries(stream,checked_revision) WHERE operation IS NOT NULL AND status!='erased';
+            CREATE INDEX IF NOT EXISTS delivery_erasing ON deliveries(stream) WHERE status='erasing';
             CREATE INDEX IF NOT EXISTS operation_completed ON operations(status,updated_at);")?;
         schema.commit()?;
         Ok(Self {
@@ -326,7 +337,7 @@ impl Ledger {
             .connection
             .lock()
             .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
-        let mut q=c.prepare("SELECT identity,stream,terminal,operation,status FROM deliveries WHERE stream=?1 AND status!='erased' AND (checked_revision IS NULL OR checked_revision!=?2 OR status='erasing') ORDER BY sequence LIMIT 64")?;
+        let mut q = c.prepare(SOURCE_RECHECK_SQL)?;
         Ok(q.query_map(params![stream, revision], |r| {
             Ok(Delivery {
                 id: r.get(0)?,
@@ -337,6 +348,33 @@ impl Ledger {
             })
         })?
         .collect::<Result<_, _>>()?)
+    }
+    /// Extends a same-frontier validation receipt with this newly checked
+    /// source. The reference and proof are committed before HTTP submission.
+    pub fn attach_validated_source(
+        &self,
+        id: &str,
+        operation: &str,
+        revision: &str,
+    ) -> anyhow::Result<()> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let bank: String = tx.query_row(
+            "SELECT bank_id FROM operations WHERE operation_id=?1",
+            [operation],
+            |r| r.get(0),
+        )?;
+        let changed=tx.execute("UPDATE deliveries SET status='processing',operation=?1,checked_revision=?2,error_key=NULL,next_attempt=unixepoch()+1 WHERE identity=?3 AND status NOT IN ('erasing','erased') AND (operation IS NULL OR operation=?1)",params![operation,revision,id])?;
+        anyhow::ensure!(changed == 1, "hindsight_delivery_source_changed");
+        tx.execute(
+            "DELETE FROM source_audits WHERE bank_id=?1 AND revision!=?2",
+            params![bank, revision],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn checked_revision(&self, id: &str, revision: &str) -> anyhow::Result<()> {
         let c = self
@@ -900,6 +938,70 @@ mod recovery_tests {
         assert_eq!(ledger.pending_notes(false).unwrap().len(), 1);
         assert_eq!(ledger.delivery_counts().unwrap()["pending"], 2);
         assert!(!ledger.advance(&stream, 2, Some("another-turn"), 2).unwrap());
+    }
+    #[test]
+    fn validated_append_extends_the_receipt_and_unchanged_frontier_uses_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(directory.path()).unwrap();
+        ledger
+            .register_stream("fixture", "owner", "session", "branch", 0)
+            .unwrap();
+        let stream = ledger.streams().unwrap().remove(0);
+        ledger.advance(&stream, 1, Some("turn"), 2).unwrap();
+        let delivery = ledger.pending(1, true).unwrap().remove(0);
+        let operation = ledger.operation("bank", "document", "turn").unwrap();
+        ledger.record_source_audit("bank", "frontier").unwrap();
+        ledger
+            .attach_validated_source(&delivery.id, &operation, "frontier")
+            .unwrap();
+        assert!(ledger.source_audited("bank", "frontier").unwrap());
+        assert!(
+            ledger
+                .revision_candidates(&stream.id, "frontier")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ledger
+                .revision_candidates(&stream.id, "another-frontier")
+                .unwrap()
+                .len(),
+            1
+        );
+        {
+            let c = ledger.connection.lock().unwrap();
+            let mut query = c
+                .prepare(&format!("EXPLAIN QUERY PLAN {SOURCE_RECHECK_SQL}"))
+                .unwrap();
+            let plan = query
+                .query_map(params![stream.id, "frontier"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("delivery_source_revision")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step == "SCAN deliveries"),
+                "{plan:?}"
+            );
+        }
+        ledger
+            .delivery_state(&delivery.id, "erasing", None, None)
+            .unwrap();
+        assert!(
+            ledger
+                .attach_validated_source(&delivery.id, &operation, "frontier")
+                .is_err()
+        );
+        assert_eq!(
+            ledger.revision_candidates(&stream.id, "frontier").unwrap()[0].status,
+            "erasing"
+        );
     }
     #[test]
     fn new_source_attachment_and_erasure_invalidate_audit_receipts() {

@@ -420,6 +420,7 @@ impl HindsightMemory {
             .ok_or_else(|| anyhow::Error::msg("hindsight_note_delivery_missing"))?;
         self.policy()?;
         self.prepare_bank(&bank).await?;
+        self.bank(scope)?;
         self.client.retain(&bank, &note.items, &operation).await?;
         self.ledger.update(&operation, "processing")?;
         let deadline = tokio::time::Instant::now()
