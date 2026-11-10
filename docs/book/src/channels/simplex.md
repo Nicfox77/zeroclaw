@@ -1,6 +1,6 @@
 # SimpleX
 
-The optional `channel-simplex` adapter supports direct text, voice notes, and incoming
+The optional `channel-simplex` adapter supports direct text, incoming files and images, voice notes, and incoming
 encrypted audio calls from the SimpleX Android app. It uses the official
 SimpleX CLI for local identities, encrypted messaging, and call signaling. A
 separate Node.js/Chromium helper supplies virtual audio using SimpleX's
@@ -77,6 +77,32 @@ accepted; wildcard grants do not authorize this adapter. Existing `ignore`
 rules still override grants. Authorization, agent ownership, speech activation,
 and speech-provider selection resolve from live config at use time. Restart or
 reload the daemon after changing the bridge executable or CLI endpoint.
+
+## Incoming files and images
+
+Direct attachments from authorized contacts are downloaded through the official
+CLI, with a 5 MiB limit per file. The bridge checks advertised and received sizes,
+transfer identity, and the private destination before releasing bytes. Unauthorized
+contacts cannot initiate downloads. Filenames cannot contain path separators or
+control characters. Files are stored with private permissions in the owning
+agent's workspace under `simplex_files/`; these durable files remain until the
+operator removes them. Captions and image-only messages are supported.
+
+SimpleX must also permit files for that contact. Keep the profile-wide file
+preference closed when pairing a bot. Use the private CLI API to inspect the
+contact's preferences, merge the file override into any existing overrides, then
+apply them with `/_set prefs @<contactId> <preferences-json>`. For a contact with
+no other overrides, the preferences JSON is `{"files":{"allow":"yes"}}`.
+This controls the phone's attachment UI; it does not replace ZeroClaw's peer grants.
+
+Supported images are detected from their bytes and enter the shared native
+multimodal pipeline, rather than being replaced with an OCR description. The
+selected provider must support images. A text-only model needs a configured
+`multimodal.vision_model_provider` fallback. The fallback can receive subsequent
+turns while images remain in active context, as well as the initial image turn.
+Other attachments become local document references available to the agent's file
+and document tools; this does not add automatic parsing of every document format
+or execute uploaded files. Attachment transfer errors produce a retry notice.
 
 ## Live text replies
 
@@ -223,7 +249,7 @@ outbound hooks are active, speech waits for their final decision. Already spoken
 audio cannot be withdrawn; a rewrite of spoken content stops that speech worker
 instead of replaying it. Text replies are also delivered to the SimpleX chat.
 
-Group chats, generic file attachments, and agent-initiated calls are not handled.
+Group chats and agent-initiated calls are not handled.
 Android screen-off, Bluetooth routing, TURN reachability, and battery restrictions
 must be verified on the actual phone.
 
@@ -258,7 +284,7 @@ Run `npm test` in `contrib/simplex` (ffmpeg and ffprobe are required for note te
 `SIMPLEX_RTC_TEST=1 npm test` additionally checks encrypted audio in both directions
 through public TURN and rejects mismatched encryption keys. `SIMPLEX_CLI_TEST=1 npm test` additionally
 creates two temporary CLI profiles and verifies live message creation, edits,
-finalization, parsed formatting, and encrypted voice-note transfers
+finalization, parsed formatting, encrypted file/image transfers, and voice-note transfers
 in both directions through public relays; `SIMPLEX_CLI_PATH` selects the CLI binary.
 `SIMPLEX_DAEMON_TEST=1 node --test live-daemon.test.mjs` drives an isolated real
 daemon and helper with mock model and SimpleX WebSocket endpoints. Build the
