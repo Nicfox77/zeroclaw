@@ -125,6 +125,9 @@ the corresponding fraction of the whole-turn limit. Estimates use roughly
 four UTF-8 bytes per token, including structured tool arguments and reasoning;
 provider capacity enforcement remains authoritative. Source chunks, generated
 responses and the retained deck use the same byte-based fallback.
+Summary prompts state the corresponding UTF-8 byte ceiling and target 80% of it,
+rather than asking the model to guess a tokenizer-independent token count.
+The hard output check still rejects oversized cards without discarding sources.
 
 One background job per session branch freezes an older range of completed
 turns, preserving the two newest turns and their complete tool exchanges.
