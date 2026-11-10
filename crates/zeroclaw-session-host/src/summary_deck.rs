@@ -14,6 +14,60 @@ pub(super) struct Runtime {
 }
 
 impl SummaryDeckRuntime for Runtime {
+    fn prefill_context(
+        &self,
+        intent: zeroclaw_api::session_events::capture::ProviderDispatchIntent,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<()>> {
+        let live = self.config.clone();
+        let agent = self.agent.clone();
+        Box::pin(async move {
+            let (config, revision, timeout) = {
+                let config = live.read();
+                let Some(profile) = config.runtime_profile_for_agent(&agent) else {
+                    return Ok(());
+                };
+                if !profile.summary_deck.enabled || !profile.summary_deck.warm_cache {
+                    return Ok(());
+                }
+                let Some(resolved) = config.resolved_agent_config(&agent) else {
+                    return Ok(());
+                };
+                if !resolved.enabled {
+                    return Ok(());
+                }
+                let Some((family, alias, entry)) = config.resolved_model_provider_for_agent(&agent)
+                else {
+                    return Ok(());
+                };
+                // Only the configured local primary is warmed. A remembered
+                // cloud fallback, model override or old route is not authority.
+                if family != "llamacpp"
+                    || intent.provider_ref != format!("{family}.{alias}")
+                    || entry.model.as_deref() != Some(intent.model.as_str())
+                {
+                    return Ok(());
+                }
+                (
+                    config.as_ref().clone(),
+                    config.revision(),
+                    profile.summary_deck.timeout_secs,
+                )
+            };
+            let warm =
+                zeroclaw_providers::factory::prefill_llamacpp_context(&config, &intent, timeout);
+            tokio::pin!(warm);
+            let mut changed = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    result = &mut warm => return result,
+                    _ = changed.tick() => {
+                        anyhow::ensure!(live.revision() == revision, "cache_warm_config_changed");
+                    }
+                }
+            }
+        })
+    }
+
     fn main_session(&self) -> anyhow::Result<Option<SessionId>> {
         let config = self.config.read();
         let Some(agent) = config.agent(&self.agent) else {
@@ -256,6 +310,115 @@ async fn consume_summary(
 mod tests {
     use super::*;
     use futures_util::stream;
+
+    fn warming_fixture(
+        url: &str,
+    ) -> (
+        zeroclaw_config::live::LiveConfig,
+        Runtime,
+        zeroclaw_api::session_events::capture::ProviderDispatchIntent,
+    ) {
+        let mut config = config_fixture();
+        config.agents.get_mut("fixture").unwrap().model_provider = "llamacpp.fixture".into();
+        let deck = &mut config
+            .runtime_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .summary_deck;
+        deck.enabled = true;
+        deck.warm_cache = true;
+        config.providers.models.llamacpp.insert(
+            "fixture".into(),
+            zeroclaw_config::schema::LlamacppModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some(url.into()),
+                    model: Some("prefill-fixture".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let runtime = Runtime {
+            config: live.handle(),
+            agent: "fixture".into(),
+            session: SessionId::new(),
+        };
+        let intent = zeroclaw_api::session_events::capture::ProviderDispatchIntent {
+            requested_route: None,
+            previous_attempt_event_id: None,
+            provider_ref: "llamacpp.fixture".into(),
+            model: "prefill-fixture".into(),
+            messages: vec![
+                zeroclaw_api::model_provider::ChatMessage::system("Stable fixture prefix"),
+                zeroclaw_api::model_provider::ChatMessage::user("Fixture"),
+            ],
+            tools: None,
+            temperature: None,
+            thinking: None,
+            tool_round_policy: zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        };
+        (live, runtime, intent)
+    }
+
+    #[tokio::test]
+    async fn warming_is_opt_in_and_never_uses_a_previous_or_unconfigured_route() {
+        let (live, runtime, mut intent) = warming_fixture("http://127.0.0.1:1/v1");
+        intent.model = "previous-model".into();
+        runtime.prefill_context(intent.clone()).await.unwrap();
+        intent.model = "prefill-fixture".into();
+        intent.provider_ref = "openai.previous".into();
+        runtime.prefill_context(intent.clone()).await.unwrap();
+        intent.provider_ref = "llamacpp.fixture".into();
+        let mut config = live.snapshot();
+        config
+            .runtime_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .summary_deck
+            .warm_cache = false;
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        runtime.prefill_context(intent).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_live_config_change_cancels_inflight_prefill_and_closes_its_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (send, started) = tokio::sync::oneshot::channel();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"prompt_progress\":{\"processed\":1}}\n\n").await.unwrap();
+            send.send(()).unwrap();
+            while socket.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+        let (live, runtime, intent) = warming_fixture(&format!("http://{address}"));
+        let task = ::zeroclaw_spawn::spawn!(runtime.prefill_context(intent));
+        started.await.unwrap();
+        let config = live.snapshot();
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("cache_warm_config_changed"));
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("cancellation must close the pending response socket")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated CPU llama.cpp server via ZEROCLAW_PREFILL_TEST_URL"]
+    async fn real_llamacpp_warms_through_live_host_policy_and_the_native_factory() {
+        let endpoint =
+            std::env::var("ZEROCLAW_PREFILL_TEST_URL").expect("isolated fixture endpoint");
+        let (_, runtime, intent) = warming_fixture(&endpoint);
+        runtime.prefill_context(intent).await.unwrap();
+    }
     use std::time::Duration;
     use zeroclaw_api::model_provider::StreamChunk;
 
