@@ -13,10 +13,18 @@ async fn crash_with_text(
     let mut execution = Box::pin(port.execute(
         input(),
         Box::pin(async move {
+            let mut user = ChatMessage::user("Keep this request.");
+            user.recalled_memory = Some(zeroclaw_api::model_provider::RecalledMemoryContext {
+                entries: vec![zeroclaw_api::model_provider::RecalledMemoryEntry {
+                    key: "fixture-memory".into(),
+                    content: "An existing historical recall snapshot.".into(),
+                    stored_on: None,
+                }],
+            });
             write
                 .replace_context(
                     ContextSnapshot {
-                        messages: vec![ChatMessage::user("Keep this request.").into_conversation()],
+                        messages: vec![user.into_conversation()],
                         history_has_trim_breadcrumb: Some(true),
                     },
                     "fixture_input",
@@ -188,6 +196,15 @@ async fn crash_recovery_preserves_visible_partial_once_across_reopen_and_next_tu
             let chats = restored.chat_projection();
             assert_eq!(chats.len(), 2);
             assert_eq!(chats[0].content, "Keep this request.");
+            assert_eq!(
+                chats[0]
+                    .recalled_memory
+                    .as_ref()
+                    .expect("inherited recall")
+                    .entries[0]
+                    .key,
+                "fixture-memory"
+            );
             assert_eq!(chats[1].role, "assistant");
             assert!(
                 chats[1]
