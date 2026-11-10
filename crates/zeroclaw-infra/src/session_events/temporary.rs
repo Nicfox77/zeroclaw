@@ -10,6 +10,10 @@ static PROCESS: std::sync::LazyLock<EventId> = std::sync::LazyLock::new(EventId:
 static LEASES: std::sync::LazyLock<Mutex<BTreeMap<std::path::PathBuf, std::fs::File>>> =
     std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+// Lifetime metadata is sparse. Do not materialize provider progress/history
+// merely to discover sessions that might have a temporary lifetime.
+pub(super) const CANDIDATE_QUERY: &str = "SELECT event_json FROM session_events WHERE json_extract(event_json,'$.kind')='session_metadata_changed' ORDER BY session_id, sequence";
+
 pub(super) fn candidates(
     data_dir: &Path,
     backend: installation::NativeBackend,
@@ -19,9 +23,7 @@ pub(super) fn candidates(
             let store = SqliteEventStore::open(data_dir)?;
             let raw_events = {
                 let connection = store.conn.lock();
-                let mut statement = connection
-                    .prepare("SELECT event_json FROM session_events ORDER BY session_id, sequence")
-                    .map_err(map_sqlite)?;
+                let mut statement = connection.prepare(CANDIDATE_QUERY).map_err(map_sqlite)?;
                 statement
                     .query_map([], |row| row.get::<_, Vec<u8>>(0))
                     .map_err(map_sqlite)?

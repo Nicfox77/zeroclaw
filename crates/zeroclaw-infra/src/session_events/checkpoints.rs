@@ -3,6 +3,10 @@ use super::*;
 use zeroclaw_api::session_events::{ProjectionCheckpoint, canonical_json};
 
 pub(super) fn ensure_schema(conn: &Connection) -> Result<(), AppendError> {
+    // Opening an existing store checks for unfinished physical cleanup. Keep
+    // that probe proportional to redacted rows, not the complete payload archive.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS session_redacted_payloads ON event_payloads(payload_id) WHERE body IS NULL;").map_err(map_sqlite)?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS session_metadata_events ON session_events(session_id,sequence) WHERE json_extract(event_json,'$.kind')='session_metadata_changed';").map_err(map_sqlite)?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS session_canonical_revision(singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL);
         INSERT OR IGNORE INTO session_canonical_revision VALUES(1,0);
         CREATE TABLE IF NOT EXISTS session_projection_checkpoints(
