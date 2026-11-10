@@ -125,6 +125,12 @@ tab; change process/provider settings through ZeroClaw and reload its daemon.
 Explicit mental models declared in ZeroClaw remain configuration-managed; create
 additional UI-owned models outside those declared IDs.
 
+If Hindsight's own UI/manager should own process-wide provider settings as well,
+choose `mode = "external"` and let that manager supervise the API. Automatic
+retention, recall, reflection, and ZeroClaw bank authorization still operate.
+Avoid having ZeroClaw and the Control Center both supervise or rewrite the same
+managed profile. Managed mode remains the recommended initial setup here.
+
 First-person extraction guidance is already enabled. `IDENTITY.md` and `USER.md`
 are not automatically copied into Hindsight missions. A future identity bridge
 must resolve the current canonical files, screen and bound the selected text,
