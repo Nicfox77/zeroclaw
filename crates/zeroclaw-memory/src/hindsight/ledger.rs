@@ -191,7 +191,7 @@ impl Ledger {
             )?;
             if !exists {
                 let count: usize = tx.query_row(
-                    "SELECT (SELECT count(*) FROM deliveries WHERE status IN ('pending','processing','failed','erasing'))+(SELECT count(*) FROM notes)",
+                    "SELECT (SELECT count(*) FROM deliveries WHERE status IN ('pending','processing','failed','erasing','retry_requested'))+(SELECT count(*) FROM notes)",
                     [],
                     |r| r.get(0),
                 )?;
@@ -216,7 +216,7 @@ impl Ledger {
             .connection
             .lock()
             .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
-        let mut q = c.prepare("SELECT identity,stream,terminal,operation,status FROM deliveries WHERE (status IN ('pending','processing') OR (status='failed' AND ?1)) AND next_attempt<=unixepoch() ORDER BY sequence,identity LIMIT ?2")?;
+        let mut q = c.prepare("SELECT identity,stream,terminal,operation,status FROM deliveries WHERE (status IN ('pending','processing','retry_requested') OR (status='failed' AND ?1)) AND next_attempt<=unixepoch() ORDER BY rowid LIMIT ?2")?;
         Ok(q.query_map(params![retry_failed, limit], |r| {
             Ok(Delivery {
                 id: r.get(0)?,
@@ -300,7 +300,7 @@ impl Ledger {
             )?;
             if !exists {
                 let count: usize = tx.query_row(
-                    "SELECT (SELECT count(*) FROM deliveries WHERE status IN ('pending','processing','failed','erasing'))+(SELECT count(*) FROM notes)",
+                    "SELECT (SELECT count(*) FROM deliveries WHERE status IN ('pending','processing','failed','erasing','retry_requested'))+(SELECT count(*) FROM notes)",
                     [],
                     |r| r.get(0),
                 )?;
@@ -442,7 +442,7 @@ impl Ledger {
             |r| r.get(0),
         )?;
         if !exists {
-            let count:usize=tx.query_row("SELECT (SELECT count(*) FROM notes)+(SELECT count(*) FROM deliveries WHERE status IN ('pending','processing','failed','erasing'))",[],|r|r.get(0))?;
+            let count:usize=tx.query_row("SELECT (SELECT count(*) FROM notes)+(SELECT count(*) FROM deliveries WHERE status IN ('pending','processing','failed','erasing','retry_requested'))",[],|r|r.get(0))?;
             anyhow::ensure!(count < capacity, "hindsight_delivery_queue_full");
             tx.execute(
                 "INSERT INTO notes(operation,agent,scope,items) VALUES(?1,?2,?3,?4)",
@@ -545,20 +545,25 @@ impl Ledger {
         Ok(())
     }
     pub fn retry_pending(&self) -> anyhow::Result<usize> {
-        let c = self
+        let mut c = self
             .connection
             .lock()
             .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
-        let notes = c.execute("UPDATE notes SET next_attempt=0", [])?;
-        c.execute("UPDATE operations SET status='pending' WHERE operation_id IN (SELECT operation FROM notes)",[])?;
-        Ok(notes+c.execute("UPDATE deliveries SET status='pending',next_attempt=0,error_key=NULL WHERE status IN ('pending','processing','failed')",[])?)
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let notes = tx.execute("UPDATE notes SET next_attempt=0", [])?;
+        // This creates an explicit operator retry intent, distinct from the
+        // live policy governing automatic retries of failed operations.
+        tx.execute("UPDATE operations SET status='retry_requested' WHERE operation_id IN (SELECT operation FROM notes)",[])?;
+        let deliveries=tx.execute("UPDATE deliveries SET status='retry_requested',next_attempt=0,error_key=NULL WHERE status IN ('pending','processing','failed','retry_requested')",[])?;
+        tx.commit()?;
+        Ok(notes + deliveries)
     }
     pub fn delivery_counts(&self) -> anyhow::Result<std::collections::BTreeMap<String, usize>> {
         let c = self
             .connection
             .lock()
             .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
-        let mut q = c.prepare("SELECT status,count(*) FROM (SELECT status FROM deliveries UNION ALL SELECT o.status FROM notes n JOIN operations o ON n.operation=o.operation_id) GROUP BY status")?;
+        let mut q = c.prepare("SELECT CASE WHEN status='retry_requested' THEN 'pending' ELSE status END,count(*) FROM (SELECT status FROM deliveries UNION ALL SELECT o.status FROM notes n JOIN operations o ON n.operation=o.operation_id) GROUP BY CASE WHEN status='retry_requested' THEN 'pending' ELSE status END")?;
         Ok(q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?)
     }
@@ -859,6 +864,42 @@ mod recovery_tests {
                 .queue_note("bank", "fixture", &scope, &[item], 8)
                 .unwrap()
         );
+    }
+    #[test]
+    fn explicit_retry_is_deliverable_when_automatic_failed_retries_are_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(directory.path()).unwrap();
+        ledger
+            .register_stream("fixture", "owner", "session", "branch", 0)
+            .unwrap();
+        let stream = ledger.streams().unwrap().remove(0);
+        ledger.advance(&stream, 1, Some("turn"), 2).unwrap();
+        let delivery = ledger.pending(1, true).unwrap().remove(0);
+        ledger
+            .delivery_state(&delivery.id, "failed", None, Some("fixture_failure"))
+            .unwrap();
+        let scope = PrincipalScope::new("owner").with_agent(Some("fixture".into()));
+        let item = super::super::client::Item {
+            content: "fixture note".into(),
+            document_id: "note".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            context: "explicit note".into(),
+            metadata: Default::default(),
+        };
+        let operation = ledger
+            .queue_note("bank", "fixture", &scope, &[item], 2)
+            .unwrap();
+        ledger.update(&operation, "failed").unwrap();
+        assert!(ledger.pending(8, false).unwrap().is_empty());
+        assert!(ledger.pending_notes(false).unwrap().is_empty());
+        assert_eq!(ledger.retry_pending().unwrap(), 2);
+        assert_eq!(
+            ledger.pending(8, false).unwrap()[0].status,
+            "retry_requested"
+        );
+        assert_eq!(ledger.pending_notes(false).unwrap().len(), 1);
+        assert_eq!(ledger.delivery_counts().unwrap()["pending"], 2);
+        assert!(!ledger.advance(&stream, 2, Some("another-turn"), 2).unwrap());
     }
     #[test]
     fn new_source_attachment_and_erasure_invalidate_audit_receipts() {

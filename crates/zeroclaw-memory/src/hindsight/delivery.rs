@@ -96,44 +96,7 @@ pub async fn tick(live: &LiveConfigHandle, source: &dyn TranscriptSource) -> any
             }
         }
     }
-    for job in ledger.backfills()? {
-        let Some(stream) = streams.iter().find(|s| s.id == job.stream) else {
-            continue;
-        };
-        let mut reader = stream.clone();
-        reader.cursor = job.cursor;
-        let events = match source.next(&reader).await {
-            Ok(events) => events,
-            Err(_) => {
-                ledger.observe(
-                    "transcript_read",
-                    Some("hindsight_transcript_unavailable"),
-                    0,
-                )?;
-                continue;
-            }
-        };
-        for event in events
-            .into_iter()
-            .take_while(|event| event.sequence <= job.through)
-        {
-            let eligible = job.since.is_none_or(|s| event.occurred_at >= s)
-                && job.until.is_none_or(|u| event.occurred_at <= u);
-            if !ledger.advance_backfill(
-                &job,
-                stream,
-                event.sequence,
-                if eligible {
-                    event.committed_turn.as_deref()
-                } else {
-                    None
-                },
-                capacity,
-            )? {
-                break;
-            }
-        }
-    }
+    enqueue_backfills(&ledger, source, &streams, capacity).await?;
     for delivery in ledger.pending(16, retry)? {
         let stream = streams
             .iter()
@@ -150,6 +113,99 @@ pub async fn tick(live: &LiveConfigHandle, source: &dyn TranscriptSource) -> any
     }
     Ok(())
 }
+/// Merge canonical event-page frontiers rather than sorting a copied archive.
+/// Refill a depleted source before emitting another source's newer event.
+async fn enqueue_backfills(
+    ledger: &Ledger,
+    source: &dyn TranscriptSource,
+    streams: &[Stream],
+    capacity: usize,
+) -> anyhow::Result<()> {
+    let mut views: Vec<_> = ledger
+        .backfills()?
+        .into_iter()
+        .filter_map(|job| {
+            streams
+                .iter()
+                .find(|stream| stream.id == job.stream)
+                .map(|stream| {
+                    (
+                        job,
+                        stream.clone(),
+                        std::collections::VecDeque::<SourceEvent>::new(),
+                    )
+                })
+        })
+        .collect();
+    for _ in 0..256 {
+        for index in (0..views.len()).rev() {
+            let (job, stream, events) = &mut views[index];
+            if job.cursor >= job.through {
+                views.remove(index);
+                continue;
+            }
+            if events.is_empty() {
+                let mut reader = stream.clone();
+                reader.cursor = job.cursor;
+                match source.next(&reader).await {
+                    Ok(page) => events.extend(
+                        page.into_iter()
+                            .take_while(|event| event.sequence <= job.through),
+                    ),
+                    Err(_) => {
+                        ledger.observe(
+                            "transcript_read",
+                            Some("hindsight_transcript_unavailable"),
+                            0,
+                        )?;
+                        return Ok(());
+                    }
+                }
+                if events.is_empty() {
+                    // Without this source's frontier, a newer source cannot
+                    // safely overtake it. Preserve the durable import intent.
+                    ledger.observe("transcript_read", Some("hindsight_backfill_source_gap"), 0)?;
+                    return Ok(());
+                }
+            }
+        }
+        let Some(index) = views
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, _, events))| {
+                events
+                    .front()
+                    .map(|event| (index, event.occurred_at, event.sequence))
+            })
+            .min_by_key(|(_, time, sequence)| (*time, *sequence))
+            .map(|(index, _, _)| index)
+        else {
+            break;
+        };
+        let (job, stream, events) = &mut views[index];
+        let event = events
+            .pop_front()
+            .ok_or_else(|| anyhow::Error::msg("hindsight_backfill_frontier_missing"))?;
+        let eligible = job.since.is_none_or(|since| event.occurred_at >= since)
+            && job.until.is_none_or(|until| event.occurred_at <= until);
+        if !ledger.advance_backfill(
+            job,
+            stream,
+            event.sequence,
+            if eligible {
+                event.committed_turn.as_deref()
+            } else {
+                None
+            },
+            capacity,
+        )? {
+            break;
+        }
+        job.cursor = event.sequence;
+    }
+    Ok(())
+}
+
 async fn deliver(
     live: &LiveConfigHandle,
     source: &dyn TranscriptSource,
@@ -212,7 +268,11 @@ async fn deliver(
                         return Ok(());
                     }
                     "failed" | "cancelled" => {
-                        backend.policy()?;
+                        anyhow::ensure!(
+                            backend.policy()?.retry_failed_retains
+                                || delivery.status == "retry_requested",
+                            "hindsight_retain_failed_manual_retry_required"
+                        );
                         backend
                             .client
                             .request(
@@ -301,7 +361,9 @@ async fn resume_notes(
 ) -> anyhow::Result<()> {
     for note in ledger.pending_notes(retry_failed)? {
         let result = async {
-            if ledger.status(&note.operation)?.as_deref() == Some("completed") {
+            let local_status = ledger.status(&note.operation)?;
+            let retry_requested = local_status.as_deref() == Some("retry_requested");
+            if local_status.as_deref() == Some("completed") {
                 ledger.complete_note(&note.operation)?;
                 return Ok(());
             }
@@ -324,7 +386,10 @@ async fn resume_notes(
                     match operation.status.as_str() {
                         "completed" => ledger.complete_note(&note.operation)?,
                         "failed" | "cancelled" => {
-                            backend.policy()?;
+                            anyhow::ensure!(
+                                backend.policy()?.retry_failed_retains || retry_requested,
+                                "hindsight_retain_failed_manual_retry_required"
+                            );
                             backend
                                 .client
                                 .request(
@@ -386,4 +451,80 @@ async fn resume_notes(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct CanonicalPages;
+    #[async_trait::async_trait]
+    impl TranscriptSource for CanonicalPages {
+        async fn revision(&self, _stream: &Stream) -> anyhow::Result<String> {
+            Ok("fixture-frontier".into())
+        }
+        async fn load(
+            &self,
+            _stream: &Stream,
+            _terminal: &str,
+        ) -> anyhow::Result<Option<Vec<Item>>> {
+            anyhow::bail!("fixture_only_exercises_ingestion_order")
+        }
+        async fn next(&self, stream: &Stream) -> anyhow::Result<Vec<SourceEvent>> {
+            let sequence = stream.cursor + 1;
+            if sequence > 2 {
+                return Ok(vec![]);
+            }
+            Ok(vec![SourceEvent {
+                sequence,
+                occurred_at: if stream.session == "a" { 1000 } else { 2000 }
+                    + (sequence as i64 - 1) * 2000,
+                committed_turn: Some(format!("{}:{sequence}", stream.session)),
+            }])
+        }
+    }
+    #[tokio::test]
+    async fn chronological_cross_session_replay_refills_pages_and_resumes_after_backpressure() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(directory.path()).unwrap();
+        for session in ["a", "b"] {
+            ledger
+                .register_stream("fixture", "owner", session, "branch", 2)
+                .unwrap();
+        }
+        let streams = ledger.streams().unwrap();
+        for stream in &streams {
+            ledger.backfill(&stream.id, 2, None, None).unwrap();
+        }
+        enqueue_backfills(&ledger, &CanonicalPages, &streams, 2)
+            .await
+            .unwrap();
+        let first = ledger.pending(8, true).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|item| item.terminal.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a:1", "b:1"]
+        );
+        for item in first {
+            ledger
+                .delivery_state(&item.id, "completed", None, None)
+                .unwrap();
+        }
+        drop(ledger);
+        let ledger = Ledger::open(directory.path()).unwrap();
+        enqueue_backfills(&ledger, &CanonicalPages, &ledger.streams().unwrap(), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger
+                .pending(8, true)
+                .unwrap()
+                .iter()
+                .map(|item| item.terminal.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a:2", "b:2"]
+        );
+        assert!(ledger.backfills().unwrap().is_empty());
+    }
 }
