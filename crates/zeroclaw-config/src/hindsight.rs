@@ -406,6 +406,24 @@ pub fn channel_principal(
 mod tests {
     use super::*;
     #[test]
+    fn boxed_settings_preserve_schema_properties_and_secret_metadata() {
+        let mut config = crate::schema::Config::default();
+        config
+            .set_prop("memory.hindsight.auto_recall", "false")
+            .unwrap();
+        assert!(!config.memory.hindsight.auto_recall);
+        assert_eq!(
+            config.get_prop("memory.hindsight.auto_recall").unwrap(),
+            "false"
+        );
+        assert!(crate::schema::Config::prop_is_secret(
+            "memory.hindsight.llm.api_key"
+        ));
+        let text = toml::to_string(&config).unwrap();
+        let restored: crate::schema::Config = toml::from_str(&text).unwrap();
+        assert!(!restored.memory.hindsight.auto_recall);
+    }
+    #[test]
     fn defaults_and_boundary_validation() {
         let mut c = HindsightConfig::default();
         c.validate().unwrap();

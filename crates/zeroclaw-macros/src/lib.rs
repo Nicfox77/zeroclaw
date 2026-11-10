@@ -1736,7 +1736,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 nested_collect.push(quote! {
                     fields.extend(self.#field_ident.secret_fields());
                 });
-                let plain_field_ty = &field.ty;
+                // Box changes ownership layout, not the nested configuration
+                // namespace. Instance delegation uses normal deref coercions.
+                let plain_field_ty = extract_type_arg("Box", 0, &field.ty).unwrap_or(&field.ty);
                 secret_terminal_recurse.push(quote! {
                     out.extend(<#plain_field_ty>::secret_field_terminals());
                 });
@@ -1759,7 +1761,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     self.#field_ident.restore_secrets_from(&current.#field_ident);
                 });
 
-                let field_ty = &field.ty;
+                let field_ty = plain_field_ty;
                 if is_serde_flatten {
                     nested_prop_fields.push(quote! {
                         {
@@ -1962,7 +1964,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // create_map_key for non-Option nested fields. This is how
                 // the root Config picks up `providers.models` (declared on
                 // ProvidersConfig, not on Config).
-                let field_ty = &field.ty;
+                let field_ty = plain_field_ty;
                 map_key_recurse.push(quote! {
                     out.extend(<#field_ty>::map_key_sections());
                 });

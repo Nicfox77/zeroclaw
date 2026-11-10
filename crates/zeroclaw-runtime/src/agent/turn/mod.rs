@@ -1718,7 +1718,14 @@ async fn run_tool_call_loop_inner<'a>(
     if idle.is_some() {
         p.cancellation_token = Some(cancel.clone());
     }
-    let engine = run_tool_call_loop_body(p, initial_ingress, seed_reported_usage, repetition_guard);
+    // Keep the concrete tool-loop state out of the activity wrapper's nested
+    // future frames, including debug builds on the default thread stack.
+    let engine = Box::pin(run_tool_call_loop_body(
+        p,
+        initial_ingress,
+        seed_reported_usage,
+        repetition_guard,
+    ));
     zeroclaw_kernel::turn_activity::run(idle, &cancel, engine)
         .await
         .map_err(|error| {
