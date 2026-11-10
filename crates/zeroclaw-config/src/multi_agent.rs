@@ -82,6 +82,8 @@ impl MemoryGrant {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryBackendKind {
+    /// Hindsight HTTP memory, isolated by agent and principal.
+    Hindsight,
     /// No memory backend. Recall returns empty; stores are no-ops.
     None,
     /// Embedded SQLite (`crates/zeroclaw-memory/src/sqlite.rs`). Default for

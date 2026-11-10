@@ -2453,7 +2453,8 @@ async fn run_quickstart_cli(
                     | MemoryChoice::Postgres
                     | MemoryChoice::Qdrant
                     | MemoryChoice::Lucid
-                    | MemoryChoice::None => (),
+                    | MemoryChoice::None
+                    | MemoryChoice::Hindsight => (),
                 };
                 let labels: Vec<String> = kinds
                     .iter()
@@ -8805,8 +8806,32 @@ enum DoctorCommands {
 
 #[derive(Subcommand, Debug)]
 enum MemoryCommands {
+    /// Show backend availability and durable delivery diagnostics.
+    Status,
+    /// Check the configured memory service.
+    Health,
+    /// Write the protected Hindsight daemon profile after explicit provisioning.
+    Setup,
+    /// Retry and reconcile unfinished Hindsight deliveries.
+    RetryPending,
+    /// Schedule a resumable import from canonical native conversation events.
+    Backfill {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+    },
+
     /// List memory entries with optional filters
     List {
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(long)]
         category: Option<String>,
         #[arg(long)]
@@ -8818,12 +8843,16 @@ enum MemoryCommands {
     },
     /// Get a specific memory entry by key
     Get {
+        #[arg(long)]
+        agent: Option<String>,
         key: String,
     },
     /// Show memory backend statistics and health
     Stats,
     /// Clear memories by category, by key, or clear all
     Clear {
+        #[arg(long)]
+        agent: Option<String>,
         /// Delete a single entry by key (supports prefix match)
         #[arg(long)]
         key: Option<String>,

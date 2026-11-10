@@ -118,6 +118,14 @@ export interface DiagResult {
   message: string;
 }
 
+export interface MemoryBackendStatus {
+  backend: string;
+  available?: boolean;
+  api_available?: boolean;
+  configuration_applied?: boolean | null;
+  deliveries?: Record<string, number>;
+}
+
 export interface MemoryEntry {
   id: string;
   key: string;

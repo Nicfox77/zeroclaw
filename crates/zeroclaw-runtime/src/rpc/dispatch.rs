@@ -3102,6 +3102,19 @@ impl RpcDispatcher {
         method: Method,
     ) -> Result<Option<zeroclaw_api::memory_traits::PrincipalScope>, JsonRpcError> {
         let owner = self.owner_principal_id();
+        if self.ctx.config.read().memory.backend == "hindsight" {
+            if requested.is_some_and(|plane| plane != "private") {
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    "hindsight_shared_memory_plane_unsupported",
+                ));
+            }
+            return Ok(Some(zeroclaw_api::memory_traits::PrincipalScope::new(
+                owner.unwrap_or_else(|| {
+                    zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR.into()
+                }),
+            )));
+        }
         match requested {
             None | Some("private") => {
                 Ok(owner.map(zeroclaw_api::memory_traits::PrincipalScope::new))
@@ -11684,6 +11697,25 @@ impl RpcDispatcher {
         requested_agent: Option<&str>,
         private_plane: bool,
     ) -> Result<(Arc<dyn zeroclaw_api::memory_traits::Memory>, Option<String>), JsonRpcError> {
+        if self.ctx.config.read().memory.backend == "hindsight" {
+            let alias = requested_agent
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| rpc_err(INVALID_PARAMS, "hindsight_agent_selection_required"))?;
+            self.selector_agent(method, alias)?;
+            let config = self.ctx.config.read().clone();
+            let key = config
+                .resolved_model_provider_for_agent(alias)
+                .and_then(|(_, _, p)| p.api_key.clone());
+            let memory = zeroclaw_memory::create_memory_for_agent_live(
+                &self.ctx.config,
+                alias,
+                key.as_deref(),
+            )
+            .await
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "hindsight_memory_unavailable"))?;
+            return Ok((memory, Some(alias.into())));
+        }
         let memory = self
             .ctx
             .memory

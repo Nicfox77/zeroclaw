@@ -193,6 +193,31 @@ impl PermissionResolver for ChannelAuthority {
     }
 }
 impl EngineSessionAuthority for ChannelAuthority {
+    fn memory_principal(&self, _actor: &EventActor) -> Option<String> {
+        self.current().ok()?;
+        let config = self.ctx.live_config.read();
+        let sender = self
+            .message
+            .platform_sender_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.message.sender);
+        let linked = zeroclaw_config::main_session::channel_session(
+            &config,
+            self.ctx.agent_alias.as_str(),
+            &self.message,
+        )
+        .is_some();
+        zeroclaw_config::hindsight::channel_principal(
+            &config,
+            self.ctx.agent_alias.as_str(),
+            &self.message.channel,
+            self.message.channel_alias.as_deref()?,
+            sender,
+            linked,
+        )
+        .ok()
+    }
     fn execution_binding(&self, input: &EngineTurnInput) -> Result<PayloadRecord, SessionError> {
         if input.agent_alias.as_deref() != Some(self.agent.as_str())
             || (self.child && input.ingress.origin != zeroclaw_api::ingress::TurnOrigin::SubTurn)

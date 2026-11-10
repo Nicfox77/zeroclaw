@@ -1,3 +1,4 @@
+import type { MemoryBackendStatus } from "../types/api";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -44,6 +45,7 @@ import {
   getSessionMessages,
   deleteSession,
   getMemory,
+  getMemoryStatus,
   storeMemory,
   deleteMemory,
   getMapKeys,
@@ -2213,7 +2215,25 @@ function isMemorySort(v: string): v is MemorySort {
   return MEMORY_SORT_OPTIONS.some((o) => o.value === v);
 }
 
+function MemoryServiceStatus({ status }: { status: MemoryBackendStatus | null }) {
+  if (!status) return null;
+  const available = (status.api_available ?? status.available ?? false) && status.configuration_applied !== false;
+  const queue = status.deliveries ?? {};
+  const pending = (queue.pending ?? 0) + (queue.processing ?? 0) + (queue.erasing ?? 0);
+  return (
+    <div className="text-xs flex gap-3 flex-wrap" role="status">
+      <span>{t("dashboard.mem.backend")}: {status.backend}</span>
+      <span>{t(available ? "dashboard.mem.available" : "dashboard.mem.unavailable")}</span>
+      {status.backend === "hindsight" && <>
+        <span>{t("dashboard.mem.pending")}: {pending}</span>
+        <span>{t("dashboard.mem.failed")}: {queue.failed ?? 0}</span>
+      </>}
+    </div>
+  );
+}
+
 function MemoriesTab() {
+  const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -2268,6 +2288,8 @@ function MemoriesTab() {
 
   const reload = useCallback(() => {
     setLoading(true);
+    setError(null);
+    getMemoryStatus().then(setMemoryStatus).catch(() => setMemoryStatus(null));
     getMemory(
       debouncedQuery.trim() || undefined,
       categoryFilter || undefined,
@@ -2387,6 +2409,8 @@ function MemoriesTab() {
 
   if (error) {
     return (
+      <div className="space-y-3">
+      <MemoryServiceStatus status={memoryStatus} />
       <div
         className="rounded-2xl border p-4"
         style={{
@@ -2397,11 +2421,13 @@ function MemoriesTab() {
       >
         {error}
       </div>
+      </div>
     );
   }
 
   return (
     <div className="card p-5 animate-slide-in-up space-y-4">
+      <MemoryServiceStatus status={memoryStatus} />
       <div className="flex items-center gap-2 flex-wrap">
         <Brain className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
         <h2

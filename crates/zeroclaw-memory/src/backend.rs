@@ -1,5 +1,6 @@
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MemoryBackendKind {
+    Hindsight,
     Sqlite,
     Lucid,
     Postgres,
@@ -101,6 +102,7 @@ pub fn default_memory_backend_key() -> &'static str {
 
 pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
     match backend {
+        "hindsight" => MemoryBackendKind::Hindsight,
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
@@ -113,6 +115,14 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
 
 pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     match classify_memory_backend(backend) {
+        MemoryBackendKind::Hindsight => MemoryBackendProfile {
+            key: "hindsight",
+            label: "Hindsight",
+            auto_save_default: true,
+            uses_sqlite_hygiene: false,
+            sqlite_based: false,
+            optional_dependency: false,
+        },
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
