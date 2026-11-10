@@ -19,7 +19,6 @@ use zeroclaw_config::live::LiveConfigHandle;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
-const MAX_ATTACHMENT: usize = 5 * 1024 * 1024;
 
 fn attachment_filename(name: &str) -> bool {
     !name.is_empty()
@@ -34,17 +33,40 @@ fn persist_attachment(
     workspace: &std::path::Path,
     scope: &str,
     filename: String,
-    data: Vec<u8>,
+    inbox: &std::path::Path,
+    source: &std::path::Path,
+    limit: u64,
 ) -> Result<MediaAttachment> {
-    use std::io::Write;
+    use std::io::{Read, Seek};
     ensure!(
         attachment_filename(&filename),
         "simplex_invalid_attachment_filename"
     );
+    // The listener creates this private inbox; the bridge may hand off only
+    // regular files in its immediate transfer directories, never arbitrary paths.
+    let parent = source.parent().context("simplex_attachment_path_invalid")?;
     ensure!(
-        !data.is_empty() && data.len() <= MAX_ATTACHMENT,
+        source.file_name().is_some_and(|name| name == "attachment")
+            && parent.parent() == Some(inbox)
+            && std::fs::symlink_metadata(parent)?.file_type().is_dir(),
+        "simplex_attachment_path_invalid"
+    );
+    let mut input_options = std::fs::OpenOptions::new();
+    input_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        input_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut input = input_options.open(source)?;
+    let metadata = input.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= limit,
         "simplex_attachment_size_limit"
     );
+    let mut header = [0u8; 32];
+    let header_size = input.read(&mut header)?;
+    input.rewind()?;
     std::fs::create_dir_all(workspace)?;
     let workspace = std::fs::canonicalize(workspace)?;
     let base = workspace.join("simplex_files");
@@ -74,9 +96,13 @@ fn persist_attachment(
         options.mode(0o600);
     }
     let mut file = options.open(&path)?;
-    file.write_all(&data)?;
+    let copied = std::io::copy(&mut input.take(limit + 1), &mut file)?;
+    ensure!(
+        copied == metadata.len() && copied <= limit,
+        "simplex_attachment_size_changed"
+    );
     file.sync_all()?;
-    let mime = zeroclaw_api::media::image_mime_from_magic(&data);
+    let mime = zeroclaw_api::media::image_mime_from_magic(&header[..header_size]);
     let kind = if mime.is_some() {
         AttachmentKind::Image
     } else {
@@ -84,7 +110,7 @@ fn persist_attachment(
     };
     let attachment = MediaAttachment {
         file_name: filename,
-        data,
+        data: Vec::new(),
         mime_type: Some(mime.unwrap_or("application/octet-stream").into()),
         reference: Some(AttachmentReference {
             kind,
@@ -122,6 +148,9 @@ struct Inner {
     config: LiveConfigHandle,
     writer: Mutex<Option<mpsc::Sender<Value>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    /// Owns the private filesystem handoff capability for this listener. Neither
+    /// attachment policy nor a second copy of transfer metadata lives here.
+    attachment_inbox: Mutex<Option<tempfile::TempDir>>,
     drafts: Mutex<HashMap<String, VoiceDraft>>,
     recognition: Mutex<HashMap<String, CallRecognition>>,
     /// Creates the unfinished spoken turn from completed STT chunks. It is
@@ -158,6 +187,7 @@ impl SimplexChannel {
                 config,
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
+                attachment_inbox: Mutex::new(None),
                 drafts: Mutex::new(HashMap::new()),
                 recognition: Mutex::new(HashMap::new()),
                 transcripts: Mutex::new(HashMap::new()),
@@ -238,6 +268,10 @@ impl SimplexChannel {
             .bridge_command
             .split_first()
             .context("simplex_bridge_command_missing")?;
+        let inbox = tempfile::Builder::new()
+            .prefix("zeroclaw-simplex-inbox-")
+            .tempdir()?;
+        *self.inner.attachment_inbox.lock() = Some(inbox);
         let mut child = tokio::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -736,9 +770,24 @@ impl SimplexChannel {
             if !self.allowed(contact, false) {
                 return Ok(());
             }
-            if !event["bytes"]
-                .as_u64()
-                .is_some_and(|n| n > 0 && n <= MAX_ATTACHMENT as u64)
+            let limit = self
+                .inner
+                .config
+                .read()
+                .channels
+                .simplex
+                .get(&self.inner.alias)
+                .context("simplex_alias_missing")?
+                .attachment_limit();
+            let inbox = self
+                .inner
+                .attachment_inbox
+                .lock()
+                .as_ref()
+                .context("simplex_attachment_inbox_missing")?
+                .path()
+                .to_path_buf();
+            if !event["bytes"].as_u64().is_some_and(|n| n > 0 && n <= limit)
                 || !event["filename"].as_str().is_some_and(attachment_filename)
                 || !matches!(
                     event["media_type"].as_str(),
@@ -750,7 +799,8 @@ impl SimplexChannel {
             return self
                 .request(json!({"type":"receive_file", "contact":contact,
                 "message_id":event["id"], "file_id":event["file_id"], "filename":event["filename"],
-                "media_type":event["media_type"], "text":event["text"]}))
+                "media_type":event["media_type"], "text":event["text"],
+                "attachment_dir":inbox, "max_bytes":limit}))
                 .await;
         }
         if kind == "attachment" {
@@ -765,14 +815,28 @@ impl SimplexChannel {
                 attachment_filename(&filename),
                 "simplex_invalid_attachment_filename"
             );
-            let encoded = event["data"]
-                .as_str()
-                .context("simplex_attachment_data_missing")?;
-            ensure!(
-                encoded.len() <= MAX_ATTACHMENT.div_ceil(3) * 4,
-                "simplex_attachment_size_limit"
+            let source = std::path::PathBuf::from(
+                event["path"]
+                    .as_str()
+                    .context("simplex_attachment_path_missing")?,
             );
-            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+            let inbox = self
+                .inner
+                .attachment_inbox
+                .lock()
+                .as_ref()
+                .context("simplex_attachment_inbox_missing")?
+                .path()
+                .to_path_buf();
+            let limit = self
+                .inner
+                .config
+                .read()
+                .channels
+                .simplex
+                .get(&self.inner.alias)
+                .context("simplex_alias_missing")?
+                .attachment_limit();
             let workspace = {
                 let config = self.inner.config.read();
                 let owner = config
@@ -782,10 +846,16 @@ impl SimplexChannel {
             };
             let scope = format!("{}/{}/{}", self.inner.alias, contact, event["id"]);
             let destination = workspace.clone();
-            let attachment = tokio::task::spawn_blocking(move || {
-                persist_attachment(&destination, &scope, filename, bytes)
+            let received = tokio::task::spawn_blocking(move || {
+                persist_attachment(&destination, &scope, filename, &inbox, &source, limit)
             })
-            .await??;
+            .await;
+            // The bridge retains its private temporary file until native copy
+            // completion. Release it even when validation/copy failed.
+            self.request(json!({"type":"release_file", "contact":contact,
+                "message_id":event["id"]}))
+                .await?;
+            let attachment = received??;
             let still_owned = {
                 let config = self.inner.config.read();
                 config
@@ -1176,6 +1246,7 @@ impl Channel for SimplexChannel {
         {
             child.kill().await?;
         }
+        self.inner.attachment_inbox.lock().take();
         result
     }
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -1777,7 +1848,36 @@ mod tests {
             },
         );
         let live = LiveConfig::new(config);
-        (SimplexChannel::new("personal".into(), live.handle()), live)
+        let channel = SimplexChannel::new("personal".into(), live.handle());
+        *channel.inner.attachment_inbox.lock() = Some(tempfile::tempdir().unwrap());
+        (channel, live)
+    }
+
+    fn incoming_file(channel: &SimplexChannel, data: &[u8]) -> std::path::PathBuf {
+        let inbox = channel.inner.attachment_inbox.lock();
+        let directory = tempfile::tempdir_in(inbox.as_ref().unwrap().path()).unwrap();
+        let path = directory.path().join("attachment");
+        std::fs::write(&path, data).unwrap();
+        let _ = directory.keep();
+        path
+    }
+
+    fn acknowledge_file_release(channel: &SimplexChannel) {
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let responder = channel.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let value = requests.recv().await.unwrap();
+            assert_eq!(value["type"], "release_file");
+            responder
+                .inner
+                .pending
+                .lock()
+                .remove(value["id"].as_str().unwrap())
+                .unwrap()
+                .send(json!({"ok":true}))
+                .unwrap();
+        });
     }
 
     #[tokio::test]
@@ -1796,11 +1896,13 @@ mod tests {
         ))
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
+        let source = incoming_file(&channel, &png.into_inner());
+        acknowledge_file_release(&channel);
         let (tx, mut rx) = mpsc::channel(1);
         channel
             .event(
                 json!({"type":"attachment", "contact":"17", "id":"42", "filename":"photo.png",
-            "data":base64::engine::general_purpose::STANDARD.encode(png.into_inner()), "text":""}),
+            "path":source, "text":""}),
                 &tx,
             )
             .await
@@ -1860,7 +1962,7 @@ mod tests {
             "file_id":7, "filename":"design.txt", "bytes":100, "media_type":"file", "text":"Caption"});
         channel.event(event.clone(), &tx).await.unwrap();
         event["contact"] = json!("17");
-        event["bytes"] = json!(MAX_ATTACHMENT + 1);
+        event["bytes"] = json!(1024u64 * 1024 * 1024 + 1);
         channel.event(event.clone(), &tx).await.unwrap();
         event["bytes"] = json!(100);
         channel.event(event, &tx).await.unwrap();
@@ -1878,8 +1980,16 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         channel.event(json!({"type":"attachment", "contact":"18", "id":"42", "filename":"../secret", "data":"invalid"}), &tx).await.unwrap();
         assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
-        channel.event(json!({"type":"attachment", "contact":"17", "id":"42", "filename":"design.txt",
-            "data":base64::engine::general_purpose::STANDARD.encode(b"Project notes"), "text":"Review this"}), &tx).await.unwrap();
+        let source = incoming_file(&channel, b"Project notes");
+        acknowledge_file_release(&channel);
+        channel
+            .event(
+                json!({"type":"attachment", "contact":"17", "id":"42", "filename":"design.txt",
+            "path":source, "text":"Review this"}),
+                &tx,
+            )
+            .await
+            .unwrap();
         let message = rx.recv().await.unwrap();
         assert_eq!(message.content, "Review this");
         let reference = message.attachments[0].reference.as_ref().unwrap();
@@ -1901,21 +2011,105 @@ mod tests {
     }
 
     #[test]
-    fn attachment_storage_rejects_traversal_and_symlinked_roots() {
+    fn large_attachments_are_copied_without_buffering_and_limits_are_rechecked() {
+        use std::io::{Read, Seek};
+        let (channel, _) = fixture();
         let root = tempfile::tempdir().unwrap();
-        for name in ["../secret", "bad/name", "bad\\name", "..", "bad\nname"] {
+        let source = incoming_file(&channel, b"header");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        let inbox = channel.inner.attachment_inbox.lock();
+        let inbox = inbox.as_ref().unwrap().path();
+        assert!(
+            persist_attachment(
+                root.path(),
+                "scope",
+                "large.zip".into(),
+                inbox,
+                &source,
+                1024
+            )
+            .is_err()
+        );
+        let attachment = persist_attachment(
+            root.path(),
+            "scope",
+            "large.zip".into(),
+            inbox,
+            &source,
+            1024 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(attachment.data.is_empty());
+        let path = attachment.reference.unwrap().target;
+        let mut saved = std::fs::File::open(path).unwrap();
+        assert_eq!(saved.metadata().unwrap().len(), 64 * 1024 * 1024);
+        let mut header = [0; 6];
+        saved.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"header");
+        saved.seek(std::io::SeekFrom::End(-1)).unwrap();
+        let mut tail = [1];
+        saved.read_exact(&mut tail).unwrap();
+        assert_eq!(tail, [0]);
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&source).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", &source).unwrap();
             assert!(
-                persist_attachment(root.path(), "scope", name.into(), b"bytes".to_vec()).is_err()
+                persist_attachment(
+                    root.path(),
+                    "scope",
+                    "file.txt".into(),
+                    inbox,
+                    &source,
+                    1024 * 1024
+                )
+                .is_err()
             );
         }
-        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn attachment_storage_rejects_traversal_and_symlinked_roots() {
+        let (channel, _) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let source = incoming_file(&channel, b"bytes");
+        let inbox = channel.inner.attachment_inbox.lock();
+        let inbox = inbox.as_ref().unwrap().path();
+        for name in ["../secret", "bad/name", "bad\\name", "..", "bad\nname"] {
+            assert!(
+                persist_attachment(root.path(), "scope", name.into(), inbox, &source, 1024)
+                    .is_err()
+            );
+        }
+        assert!(
+            persist_attachment(
+                root.path(),
+                "scope",
+                "file.txt".into(),
+                root.path(),
+                &source,
+                1024
+            )
+            .is_err()
+        );
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(outside.path(), root.path().join("simplex_files")).unwrap();
             assert!(
-                persist_attachment(root.path(), "scope", "file.txt".into(), b"bytes".to_vec())
-                    .is_err()
+                persist_attachment(
+                    root.path(),
+                    "scope",
+                    "file.txt".into(),
+                    inbox,
+                    &source,
+                    1024
+                )
+                .is_err()
             );
             assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
         }
