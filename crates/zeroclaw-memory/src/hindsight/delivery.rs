@@ -62,12 +62,17 @@ pub async fn tick(live: &LiveConfigHandle, source: &dyn TranscriptSource) -> any
             }
         }
     }
+    resume_rebuilds(live, &ledger).await?;
     if !auto_retain {
         return Ok(());
     }
     // A bounded page per registered stream. Capacity leaves the durable cursor
     // behind the transcript rather than dropping turns or blocking chat.
     for stream in &streams {
+        // Historical sources must be enqueued before a newer live turn.
+        if ledger.stream_backfilling(&stream.id)? {
+            continue;
+        }
         if !live.read().agent(&stream.agent).is_some_and(|a| {
             a.enabled
                 && a.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight
@@ -104,13 +109,19 @@ pub async fn tick(live: &LiveConfigHandle, source: &dyn TranscriptSource) -> any
             .ok_or_else(|| anyhow::Error::msg("hindsight_delivery_source_missing"))?;
         if let Err(error) = deliver(live, source, &ledger, stream, &delivery).await {
             // Persist a stable diagnostic key, never arbitrary upstream text or content.
-            let key = error
-                .downcast_ref::<super::client::Error>()
-                .map(|e| format!("hindsight_{:?}", e.kind))
-                .unwrap_or_else(|| "hindsight_delivery_failed".into());
+            let key = if error.to_string() == "hindsight_document_format_requires_explicit_reimport"
+            {
+                "hindsight_document_format_requires_explicit_reimport".into()
+            } else {
+                error
+                    .downcast_ref::<super::client::Error>()
+                    .map(|e| format!("hindsight_{:?}", e.kind))
+                    .unwrap_or_else(|| "hindsight_delivery_failed".into())
+            };
             ledger.delivery_state(&delivery.id, "failed", None, Some(&key))?;
         }
     }
+    resume_rebuilds(live, &ledger).await?;
     Ok(())
 }
 /// Merge canonical event-page frontiers rather than sorting a copied archive.
@@ -224,7 +235,12 @@ async fn deliver(
     let bank = backend.bank_unchecked(&scope)?;
     let source_revision = source.revision(stream).await?;
     let Some(mut items) = source.load(stream, &delivery.terminal).await? else {
-        ledger.delivery_state(&delivery.id, "erased", None, None)?;
+        if delivery.operation.is_some() {
+            ledger.delivery_state(&delivery.id, "erasing", None, None)?;
+            erase(live, ledger, delivery).await?;
+        } else {
+            ledger.delivery_state(&delivery.id, "erased", None, None)?;
+        }
         return Ok(());
     };
     if items.is_empty() {
@@ -241,6 +257,13 @@ async fn deliver(
             &super::eligible_content(&item.content),
             None,
         )?;
+        if item.update_mode.as_deref() == Some("append") {
+            let _: Vec<serde_json::Value> = serde_json::from_str(&item.content)?;
+            anyhow::ensure!(
+                !ledger.has_legacy_sources(&stream.id)?,
+                "hindsight_document_format_requires_explicit_reimport"
+            );
+        }
         scanner
             .enforce_policy(
                 &item.document_id,
@@ -256,7 +279,21 @@ async fn deliver(
     );
     // Stable source identity, not generated text: a redaction policy change
     // cannot accidentally allocate another operation after uncertain acceptance.
-    let operation = ledger.operation(&bank, document, &delivery.id)?;
+    let operation = if let Some(operation) = &delivery.operation {
+        let (recorded_bank, recorded_document) = ledger.operation_source(operation)?;
+        anyhow::ensure!(
+            recorded_bank == bank && recorded_document == *document,
+            "hindsight_document_format_requires_explicit_reimport"
+        );
+        operation.clone()
+    } else {
+        let digest = if items[0].update_mode.as_deref() == Some("append") {
+            format!("{}:{}", delivery.id, ledger.generation(&stream.id)?)
+        } else {
+            delivery.id.clone()
+        };
+        ledger.operation(&bank, document, &digest)?
+    };
     let revision = source.revision(stream).await?;
     anyhow::ensure!(
         revision == source_revision,
@@ -333,6 +370,10 @@ async fn erase(
     );
     let client = super::client::Client::new(&config.memory.hindsight)?;
     let (bank, document) = ledger.operation_source(operation)?;
+    if document.starts_with("zeroclaw:conversation:") {
+        ledger.begin_rebuild(&delivery.stream, &bank, &document)?;
+        return Ok(());
+    }
     match client.operation(&bank, operation).await {
         Ok(operation) if matches!(operation.status.as_str(), "pending" | "processing") => {
             return Ok(());
@@ -358,6 +399,86 @@ async fn erase(
         return Ok(());
     }
     ledger.delivery_state(&delivery.id, "erased", None, None)?;
+    Ok(())
+}
+
+/// A turn inside a growing document cannot be removed by deleting its former
+/// per-turn document. Drain writers, delete the conversation, then replay valid
+/// canonical references in order under a fresh generation. Retrieval stays fenced
+/// through replay and mental-model refresh, including across process restarts.
+async fn resume_rebuilds(live: &LiveConfigHandle, ledger: &Ledger) -> anyhow::Result<()> {
+    for rebuild in ledger.rebuilds()? {
+        let config = live.read().clone();
+        anyhow::ensure!(
+            config.memory.backend == "hindsight",
+            "hindsight_backend_revoked"
+        );
+        let client = super::client::Client::new(&config.memory.hindsight)?;
+        let result = async {
+            match rebuild.phase.as_str() {
+                "draining" => {
+                    let pending = ledger.draining_operations(&rebuild.stream)?;
+                    for operation in &pending {
+                        let status = match client.operation(&rebuild.bank, operation).await {
+                            Ok(operation) => operation.status,
+                            // An uncertain submission may still be accepted.
+                            // Absence is not proof of cancellation: keep the bank
+                            // fenced until the writer has a known terminal state.
+                            Err(error) => return Err(error.into()),
+                        };
+                        ledger.update(operation, &status)?;
+                    }
+                    if !pending.is_empty() {
+                        return Ok(());
+                    }
+                    match client
+                        .request(
+                            reqwest::Method::DELETE,
+                            &[
+                                "v1",
+                                "default",
+                                "banks",
+                                &rebuild.bank,
+                                "documents",
+                                &rebuild.document,
+                            ],
+                            None,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(error) if error.status == Some(404) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    ledger.replay_rebuild(&rebuild)?;
+                }
+                "replaying" if ledger.replay_complete(&rebuild.stream)? => {
+                    ledger.rebuild_phase(&rebuild, "refreshing")?;
+                }
+                "refreshing" => {
+                    if refresh_erased_models(&client, ledger, &rebuild.generation, &rebuild.bank)
+                        .await?
+                    {
+                        ledger.rebuild_phase(&rebuild, "completed")?;
+                    }
+                }
+                "replaying" => {}
+                _ => anyhow::bail!("hindsight_invalid_rebuild_phase"),
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if result.is_err() {
+            ledger.observe(
+                "conversation_rebuild",
+                Some("hindsight_conversation_erasure_rebuild_pending"),
+                0,
+            )?;
+        } else if !ledger.rebuild_pending(&rebuild.bank)? {
+            ledger.observe("conversation_rebuild", None, 0)?;
+        }
+    }
     Ok(())
 }
 
