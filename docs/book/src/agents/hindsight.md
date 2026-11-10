@@ -397,8 +397,8 @@ Known limitations requiring further work or operator handling:
   above; the CLI does not invent an unsupported Hindsight API.
 - Per-agent alias renaming and bulk principal/namespace purge are not implemented
   for Hindsight; unsupported operations fail explicitly.
-- Global cross-session backfill ordering and full restart/fault-injection coverage
-  need additional validation; ordering within a source stream is durable.
+- Backfill merges source event-time frontiers across sessions and resumes after
+  backpressure. Full restart/fault-injection coverage still needs expansion.
 - CPU decision serving and decision-reranked recall are verified. A three-query
   fixture measured ordinary recall at 32–90 ms and decision recall at roughly
   1.5 seconds. This is a latency smoke test, not a retrieval-quality evaluation;
