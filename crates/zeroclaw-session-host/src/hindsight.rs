@@ -63,7 +63,9 @@ pub(super) fn start(config: LiveConfigHandle, stores: Arc<EventStorePool>) -> Wo
     Worker(task.abort_handle())
 }
 
-pub(super) fn register(
+/// Register the starting cursor of an admitted native conversation. Delivery
+/// still revalidates its canonical owner and the actor of every source turn.
+pub fn register(
     config: &LiveConfigHandle,
     store: &dyn SessionEventStore,
     agent: &str,

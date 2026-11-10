@@ -297,6 +297,7 @@ pub async fn open_cli_session(
         let page=store.read_page(&stream,&EventCursor::beginning(stream.clone()),None,4)?;
         anyhow::ensure!(matches!(page.events.first().map(|event|&event.body.data),Some(EventData::SessionStarted {owning_agent,..}) if owning_agent==&alias),"CLI persisted owning agent differs");
         anyhow::ensure!(store.read_latest_event(&stream, &branch, None, &EventKind::ContextProjectionCreated)?.is_some(),"CLI initial context missing");
+        zeroclaw_session_host::register_hindsight_capture(&capability.config_handle(),store.as_ref(),&alias,PrincipalId::SHARED_OPERATOR,&stream,&branch)?;
         Ok(CliSession {owner:Arc::new(SessionCoordinator::new(store).with_search(Arc::new(zeroclaw_infra::session_events::search::FullTextSearch))),authority:Arc::new(CliAuthority {capability,alias,stream,origin:zeroclaw_api::ingress::TurnOrigin::Interactive,parent_alias:None}),branch})
     }).await??;
     // The exclusive path lease is retained by the store itself. Acquisition
