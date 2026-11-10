@@ -218,6 +218,7 @@ impl HindsightMemory {
             lower.zip(upper).is_none_or(|(l, u)| l < u),
             "hindsight_invalid_temporal_range"
         );
+        let query = eligible_content(query);
         let config = self.policy()?;
         let bank = self.bank(scope)?;
         self.prepare_bank(&bank).await?;
@@ -226,7 +227,7 @@ impl HindsightMemory {
             .client
             .recall(
                 &bank,
-                query,
+                &query,
                 &config.recall_budget,
                 config.recall_max_tokens,
                 config.prefer_observations,
@@ -261,6 +262,7 @@ impl HindsightMemory {
         scope: &PrincipalScope,
         query: &str,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let query = eligible_content(query);
         let config = self.policy()?;
         let bank = self.bank(scope)?;
         self.prepare_bank(&bank).await?;
@@ -270,7 +272,7 @@ impl HindsightMemory {
             .client
             .reflect(
                 &bank,
-                query,
+                &query,
                 &config.reflect_budget,
                 config.recall_max_tokens,
             )
@@ -852,6 +854,97 @@ mod tests {
                 .is_err()
         );
         assert!(!directory.path().join("memory/brain.db").exists());
+    }
+    #[tokio::test]
+    async fn recall_and_reflection_never_forward_credentials_to_the_memory_service() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = requests.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let header = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                let length = header
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                recorded.lock().unwrap().push(
+                    String::from_utf8(bytes[header_end..header_end + length].to_vec()).unwrap(),
+                );
+                let body = if header.starts_with("PUT ") {
+                    "{}"
+                } else if header.lines().next().unwrap().contains("/reflect ") {
+                    r#"{"text":"No stored evidence.","based_on":{}}"#
+                } else {
+                    r#"{"results":[]}"#
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        };
+        config.memory.backend = "hindsight".into();
+        config.memory.hindsight.mode = zeroclaw_config::hindsight::RuntimeMode::External;
+        config.memory.hindsight.api_url = format!("http://{address}");
+        config.agents.insert(
+            "fixture".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                memory: zeroclaw_config::multi_agent::AgentMemoryConfig {
+                    backend: zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight,
+                },
+                ..Default::default()
+            },
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let memory = HindsightMemory::new(
+            &config.memory.hindsight,
+            directory.path(),
+            Some("fixture"),
+            Some(live.handle()),
+        )
+        .unwrap();
+        let scope = PrincipalScope::new("owner").with_agent(Some("fixture".into()));
+        let credential = format!("sk-{}", "x".repeat(40));
+        let query = format!("Recall the project; api_key={credential}");
+        memory
+            .recall_for_principal(&scope, &query, 5, None, None, None)
+            .await
+            .unwrap();
+        memory.reflect_for_principal(&scope, &query).await.unwrap();
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests.iter().all(|body| !body.contains(&credential)));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|body| body.contains("project"))
+                .count(),
+            2
+        );
     }
     #[test]
     fn existing_handle_rechecks_agent_and_backend_revocation() {
