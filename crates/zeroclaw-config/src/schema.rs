@@ -301,6 +301,12 @@ pub struct Config {
     #[group = "Operations"]
     pub conversational_ai: ConversationalAiConfig,
 
+    /// Display metadata for the implicit installation operator. Grants no access.
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub operator: crate::speakers::OperatorConfig,
+
     /// Managed cybersecurity service configuration (`[security_ops]`).
     #[serde(default)]
     #[nested]
@@ -4214,6 +4220,11 @@ impl<'de> Deserialize<'de> for DelegateTargetConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate_agent"]
 pub struct AliasedAgentConfig {
+    /// Explicit speaker label; falls back to selected AIEOS names, then alias.
+    /// Display metadata only: never an authorization or bank identity.
+    #[tab(General)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
     /// Opt-in personal conversation shared by explicitly linked connections.
     #[serde(default)]
     #[nested]
@@ -4418,6 +4429,7 @@ pub struct AliasedAgentConfig {
 impl Default for AliasedAgentConfig {
     fn default() -> Self {
         Self {
+            display_name: String::new(),
             main_session: crate::main_session::MainSessionConfig::default(),
             enabled: true,
             channels: Vec::new(),
@@ -21489,6 +21501,7 @@ impl Default for Config {
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
             conversational_ai: ConversationalAiConfig::default(),
+            operator: crate::speakers::OperatorConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -24420,6 +24433,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.validate_hindsight_memory()?;
+        crate::speakers::validate(self)?;
         if let Some(seconds) = self.pacing.turn_idle_timeout_secs {
             anyhow::ensure!(
                 seconds > 0
@@ -34339,6 +34353,7 @@ auto_save = true
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
             conversational_ai: ConversationalAiConfig::default(),
+            operator: crate::speakers::OperatorConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig {
@@ -35880,6 +35895,7 @@ default_temperature = 0.7
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
             conversational_ai: ConversationalAiConfig::default(),
+            operator: crate::speakers::OperatorConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),

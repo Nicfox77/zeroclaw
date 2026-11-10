@@ -40,6 +40,7 @@ pub mod sections;
 pub mod setup;
 pub mod simplex;
 pub mod skill_bundles;
+pub mod speakers;
 pub mod summary_deck;
 pub mod traits;
 pub mod typed_value;
