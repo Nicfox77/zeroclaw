@@ -191,6 +191,61 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
+    async fn recall_context(
+        &self,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session,
+            Some("automatic_context"),
+        );
+        self.inner
+            .recall_context(query, question, limit, session)
+            .await
+    }
+    async fn recall_context_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session,
+            Some(&Self::scope_detail(scope)),
+        );
+        self.inner
+            .recall_context_for_principal(scope, query, question, limit, session)
+            .await
+    }
+    async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(AuditOp::Recall, None, None, None, Some("hindsight_reflect"));
+        self.inner.reflect(query).await
+    }
+    async fn reflect_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            None,
+            Some(&Self::scope_detail(scope)),
+        );
+        self.inner.reflect_for_principal(scope, query).await
+    }
     async fn store(
         &self,
         key: &str,

@@ -115,6 +115,58 @@ pub fn build_session_model_provider(
     })
 }
 
+/// A local cache operation on the configured physical llama.cpp profile. This
+/// deliberately has no routing, fallback, retries, published response or tool
+/// execution. Ordinary construction still owns every request-shape option.
+pub async fn prefill_llamacpp_context(
+    config: &zeroclaw_config::schema::Config,
+    intent: &zeroclaw_api::session_events::capture::ProviderDispatchIntent,
+    inactivity_secs: u64,
+) -> Result<()> {
+    let (family, alias) = intent
+        .provider_ref
+        .split_once('.')
+        .ok_or_else(|| anyhow::Error::msg("cache_warm_invalid_provider"))?;
+    anyhow::ensure!(family == "llamacpp", "cache_warm_requires_llamacpp");
+    let entry = config
+        .providers
+        .models
+        .llamacpp
+        .get(alias)
+        .ok_or_else(|| anyhow::Error::msg("cache_warm_provider_missing"))?;
+    anyhow::ensure!(
+        entry.base.wire_api != Some(zeroclaw_config::schema::WireApi::Responses),
+        "cache_warm_requires_chat_completions"
+    );
+    crate::compatible::prefill::local_endpoint(
+        entry.base.uri.as_deref().unwrap_or(LLAMACPP_DEFAULT_URL),
+    )?;
+    let options = crate::provider_runtime_options_for_alias(config, family, alias);
+    let provider = entry.create_provider(
+        alias,
+        entry.base.api_key.as_deref(),
+        entry.base.uri.as_deref(),
+        &options,
+    )?;
+    let tools: Option<Vec<zeroclaw_api::tool::ToolSpec>> = intent
+        .tools
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()?;
+    provider
+        .prefill_prompt(
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &intent.messages,
+                tools: tools.as_deref(),
+                thinking: intent.thinking,
+            },
+            &intent.model,
+            intent.temperature,
+            inactivity_secs,
+        )
+        .await
+}
+
 /// Rebuild a selected route using live profile and route credentials. Bare
 /// family requests preserve the legacy current-agent profile fallback.
 pub fn build_switched_model_provider(

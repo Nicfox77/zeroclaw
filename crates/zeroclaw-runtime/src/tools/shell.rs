@@ -337,6 +337,9 @@ impl Tool for ShellTool {
         }
 
         let timeout_secs = self.timeout_secs;
+        let _activity_wait = zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.bounded_wait(Duration::from_secs(timeout_secs)));
+
         // A process group alone still inherits the daemon's controlling terminal.
         // A new session detaches it and gives ChildGroupGuard the same child-owned PGID.
         #[cfg(unix)]

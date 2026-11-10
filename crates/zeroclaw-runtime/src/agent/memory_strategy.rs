@@ -43,7 +43,16 @@ impl MemoryStrategy for DefaultMemoryStrategy {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<()> {
-        zeroclaw_memory::consolidation::consolidate_turn(
+        if matches!(
+            self.memory.role(),
+            zeroclaw_api::attribution::Role::Memory(
+                zeroclaw_api::attribution::MemoryKind::Hindsight
+            )
+        ) {
+            return Ok(());
+        }
+        let orientation = zeroclaw_infra::memory_orientation::load(&self.workspace_dir)?;
+        zeroclaw_memory::consolidation::consolidate_turn_with_orientation(
             provider,
             model,
             temperature,
@@ -51,11 +60,20 @@ impl MemoryStrategy for DefaultMemoryStrategy {
             &self.memory_config,
             user_message,
             assistant_response,
+            &orientation,
         )
         .await
     }
 
     async fn run_governance(&self) -> anyhow::Result<()> {
+        if matches!(
+            self.memory.role(),
+            zeroclaw_api::attribution::Role::Memory(
+                zeroclaw_api::attribution::MemoryKind::Hindsight
+            )
+        ) {
+            return Ok(());
+        }
         // Delegate to the existing hygiene routine.
         // Phase 1: `hygiene::run_if_due` returns `Result<()>`.
         // A structured report will be wired in a follow-up when hygiene

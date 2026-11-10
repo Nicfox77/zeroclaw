@@ -10,15 +10,21 @@ use zeroclaw_macros::Configurable;
 pub struct SummaryDeckConfig {
     /// Summarize completed turns in the background. Requires native session persistence.
     pub enabled: bool,
+    /// Prefill a loopback llama.cpp primary model after summary publication,
+    /// while the session is idle. New turns wait for an admitted prefill. Default: false.
+    pub warm_cache: bool,
     /// Fraction of the available history budget reserved for summaries (0 < value < 1).
     pub summary_share: f64,
     /// Start summarization at this fraction of the recent-history allocation.
     pub trigger_ratio: f64,
     /// Maximum estimated tokens in one generated summary; provenance headers also count against the deck allocation.
     pub max_summary_tokens: usize,
-    /// Bound each background inference attempt, in seconds.
+    /// Maximum seconds without model progress during background inference.
+    /// Nonempty text/reasoning refreshes this allowance; prefill has no progress
+    /// until the provider emits output. Also bounds waiting to publish a card.
     pub timeout_secs: u64,
-    /// Optional configured model-provider reference; empty uses the session's current route.
+    /// Optional deck-specific model-provider reference. Empty inherits the
+    /// agent/compression summary provider, then the session's current route.
     pub provider: ModelProviderRef,
 }
 
@@ -26,10 +32,11 @@ impl Default for SummaryDeckConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            warm_cache: false,
             summary_share: 0.15,
             trigger_ratio: 0.8,
             max_summary_tokens: 1_000,
-            timeout_secs: 60,
+            timeout_secs: 600,
             provider: ModelProviderRef::default(),
         }
     }
@@ -50,8 +57,11 @@ impl SummaryDeckConfig {
             "summary_deck.max_summary_tokens must be at least 64"
         );
         anyhow::ensure!(
-            self.timeout_secs > 0 && self.timeout_secs <= 600,
-            "summary_deck.timeout_secs must be between 1 and 600"
+            self.timeout_secs > 0
+                && std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(self.timeout_secs))
+                    .is_some(),
+            "summary_deck.timeout_secs must be positive and representable"
         );
         Ok(())
     }
@@ -65,6 +75,7 @@ mod tests {
     fn summary_deck_defaults_and_invalid_budgets() {
         let policy = SummaryDeckConfig::default();
         assert!(!policy.enabled);
+        assert!(!policy.warm_cache);
         assert!(policy.validate().is_ok());
         for share in [0.0, 1.0, -0.1, f64::NAN, f64::INFINITY] {
             assert!(
@@ -97,6 +108,22 @@ mod tests {
         assert!(
             SummaryDeckConfig {
                 timeout_secs: 0,
+                ..policy.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SummaryDeckConfig {
+                timeout_secs: 1800,
+                ..policy.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            SummaryDeckConfig {
+                timeout_secs: u64::MAX,
                 ..policy
             }
             .validate()

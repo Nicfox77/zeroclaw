@@ -573,6 +573,12 @@ pub struct DeliveryIntent {
 /// Maintenance of the provider-facing working context.
 #[async_trait::async_trait]
 pub trait SessionContextPort: Send + Sync {
+    /// Resolve private-memory ownership through current admitted session authority.
+    /// This is never inferred from user text, a session id, or historical events.
+    fn memory_principal(&self) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Admit input that updates context without starting an engine or effect,
     /// such as an observed group message. Retry preserves the original message.
     async fn record_context_input(

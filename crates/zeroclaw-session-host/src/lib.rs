@@ -20,7 +20,10 @@ use zeroclaw_kernel::session::{
     SessionCoordinator,
     engine::{EngineSession, EngineSessionAuthority, EngineSessionSource},
 };
+mod hindsight;
 mod seed;
+pub use hindsight::register as register_hindsight_capture;
+pub use hindsight::schedule_backfill as schedule_hindsight_backfill;
 mod summary_cost;
 mod summary_deck;
 
@@ -60,13 +63,23 @@ pub struct NativeSessionHub {
     // escaped observations retain ownership after the host begins draining.
     owners: Arc<tokio::sync::Mutex<SessionOwners>>,
     stores: Arc<EventStorePool>,
+    delivery: Arc<std::sync::Mutex<Option<hindsight::Worker>>>,
 }
 impl NativeSessionHub {
     pub fn new(config: LiveConfigHandle) -> Self {
+        let stores = Arc::new(EventStorePool::default());
+        let worker = if config.read().memory.backend == "hindsight"
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            Some(hindsight::start(config.clone(), stores.clone()))
+        } else {
+            None
+        };
         Self {
             config,
             owners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            stores: Arc::new(EventStorePool::default()),
+            stores,
+            delivery: Arc::new(std::sync::Mutex::new(worker)),
         }
     }
     async fn prepare(&self) -> anyhow::Result<(std::path::PathBuf, NativeBackend)> {
@@ -118,6 +131,15 @@ impl NativeSessionHub {
         initial: ContextSnapshot,
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
         let (directory, backend) = self.prepare().await?;
+        if self.config.read().memory.backend == "hindsight" {
+            let mut worker = self
+                .delivery
+                .lock()
+                .map_err(|_| anyhow::Error::msg("hindsight_worker_lock_poisoned"))?;
+            if worker.is_none() {
+                *worker = Some(hindsight::start(self.config.clone(), self.stores.clone()));
+            }
+        }
         let owner_key = (directory.clone(), session_id.clone());
         let slot = self
             .owners
@@ -147,6 +169,10 @@ impl NativeSessionHub {
                     && !record.deleted,
                 "native owning agent differs"
             );
+            if let Some(principal) = authority.memory_principal(&subject) {
+                let store = self.stores.open_session(&directory, &session_id, None)?;
+                hindsight::register(&self.config, &store, &alias, &principal, &stream, &branch)?;
+            }
             return Ok(Arc::new(
                 EngineSession::with_actor(owner, stream.clone(), branch, subject, authority)
                     .with_summary_deck(Arc::new(summary_deck::Runtime {
@@ -218,6 +244,16 @@ impl NativeSessionHub {
                 Ok(store)
             })
             .await??;
+        if let Some(principal) = authority.memory_principal(&subject) {
+            hindsight::register(
+                &self.config,
+                store.as_ref(),
+                &deck_agent,
+                &principal,
+                &stream,
+                &branch,
+            )?;
+        }
         let owner = Arc::new(SessionCoordinator::new(store).with_search(Arc::new(
             zeroclaw_infra::session_events::search::FullTextSearch,
         )));

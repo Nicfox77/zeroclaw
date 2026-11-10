@@ -148,24 +148,31 @@ async fn recall_references_observe_erasure_and_never_resurrect_the_user_source()
             .iter()
             .find(|item| item.recalled_memory.is_some())
             .expect("annotation");
-        let ContextMessageSource::Content { content_ref, .. } = &annotated.source else {
-            panic!("original source")
-        };
-        let PayloadRead::Present(content) = port
-            .owner
-            .store
-            .read_payload(&content_ref.payload_id)
-            .expect("content")
-        else {
-            panic!("content")
-        };
-        let content: ContentPayload = serde_json::from_slice(&content.body).expect("content");
-        let RecordedContentPart::Text { text_ref } = content.parts[0].clone() else {
-            panic!("text")
+        // Context-only admission can retain the original in a conversation
+        // snapshot. Native turns can instead reference a recorded content leaf.
+        // Erase the actual canonical source in either representation.
+        let source_ref = match &annotated.source {
+            ContextMessageSource::Content { content_ref, .. } => {
+                let PayloadRead::Present(content) = port
+                    .owner
+                    .store
+                    .read_payload(&content_ref.payload_id)
+                    .expect("content")
+                else {
+                    panic!("content")
+                };
+                let content: ContentPayload =
+                    serde_json::from_slice(&content.body).expect("content");
+                let RecordedContentPart::Text { text_ref } = content.parts[0].clone() else {
+                    panic!("text")
+                };
+                text_ref
+            }
+            ContextMessageSource::Conversation { payload_ref, .. } => payload_ref.clone(),
         };
         for (index, target) in [
             annotated.recalled_memory.clone().expect("recall reference"),
-            text_ref,
+            source_ref,
         ]
         .into_iter()
         .enumerate()
@@ -542,6 +549,230 @@ impl SummaryDeckRuntime for Runtime {
             })
         }))
     }
+}
+
+struct WarmingAuthority {
+    base: Arc<Authority>,
+    revision: AtomicUsize,
+}
+impl SessionAccessPolicy for WarmingAuthority {
+    fn authorize(
+        &self,
+        principal: &PrincipalId,
+        stream: &SessionId,
+        access: SessionAccess,
+    ) -> Result<(), SessionError> {
+        SessionAccessPolicy::authorize(self.base.as_ref(), principal, stream, access)
+    }
+}
+impl PermissionResolver for WarmingAuthority {
+    fn authorize(&self, intent: &EffectIntent) -> Result<(), SessionError> {
+        PermissionResolver::authorize(self.base.as_ref(), intent)
+    }
+    fn authorize_context(&self, stream: &SessionId, branch: &BranchId) -> Result<(), SessionError> {
+        self.base.authorize_context(stream, branch)
+    }
+}
+impl EngineSessionAuthority for WarmingAuthority {
+    fn execution_binding(&self, _: &EngineTurnInput) -> Result<PayloadRecord, SessionError> {
+        self.maintenance_binding()
+    }
+    fn maintenance_binding(&self) -> Result<PayloadRecord, SessionError> {
+        Ok(PayloadRecord::json("session.execution-binding/v1",&serde_json::json!({
+            "config_revision":{"epoch":"warming-fixture","sequence":self.revision.load(Ordering::SeqCst)}
+        })).map_err(AppendError::from)?)
+    }
+    fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
+        Some(error.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct WarmingRuntime {
+    summary: Runtime,
+    observed: Arc<std::sync::Mutex<Vec<ProviderDispatchIntent>>>,
+    finish: Arc<tokio::sync::Semaphore>,
+}
+impl SummaryDeckRuntime for WarmingRuntime {
+    fn resolve(&self) -> anyhow::Result<Option<ResolvedSummaryDeck>> {
+        let mut policy = self.summary.resolve()?;
+        if let Some(p) = policy.as_mut() {
+            p.config.warm_cache = true;
+        }
+        Ok(policy)
+    }
+    fn executor(&self) -> anyhow::Result<ContextSummaryExecutor<'static>> {
+        self.summary.executor()
+    }
+    fn prefill_context(
+        &self,
+        intent: ProviderDispatchIntent,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<()>> {
+        let this = self.clone();
+        Box::pin(async move {
+            this.observed.lock().unwrap().push(intent);
+            this.finish.acquire_owned().await?.forget();
+            Ok(())
+        })
+    }
+}
+
+async fn warming_fixture(
+    directory: &std::path::Path,
+    backend: &str,
+) -> (EngineSession, Arc<WarmingAuthority>, Arc<WarmingRuntime>) {
+    let (original, base) = session(directory, backend);
+    let authority = Arc::new(WarmingAuthority {
+        base,
+        revision: AtomicUsize::new(0),
+    });
+    let runtime = Arc::new(WarmingRuntime {
+        summary: {
+            let mut summary = Runtime::new();
+            summary.gate = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+            summary
+        },
+        observed: Default::default(),
+        finish: Arc::new(tokio::sync::Semaphore::new(0)),
+    });
+    let port = EngineSession::new(
+        original.owner.clone(),
+        original.stream.clone(),
+        original.branch.clone(),
+        PrincipalId::shared_operator(),
+        authority.clone(),
+    );
+    port.execute(input(),Box::pin(async {
+        let observation = current_provider_admission().unwrap().admit(ProviderDispatchIntent {
+            requested_route:None,previous_attempt_event_id:None,provider_ref:"llamacpp.fixture".into(),model:"fixture".into(),
+            messages:vec![ChatMessage::system("Exact runtime system and tool guidance"),ChatMessage::user("Question")],
+            tools:Some(serde_json::json!([{"name":"lookup","description":"fixture","parameters":{"type":"object"}}])),
+            temperature:Some(0.2),thinking:None,tool_round_policy:zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        }).await?;
+        let response = PayloadRecord::json("session.response/v1",&ProviderResponsePayload {
+            blocks:vec![],completion:ContentCompletion::Complete,finish_evidence_ref:None,usage_ref:None,reasoning_absence:Some("not_returned".into())
+        })?;
+        observation.observe(EventData::ProviderAttemptCompleted{response_ref:StoredPayloadRef::from(&response),served_attribution_ref:None,last_progress_event_id:None},vec![response]).await?;
+        Ok("Answer".into())
+    })).await.unwrap();
+    (port, authority, runtime)
+}
+
+#[tokio::test]
+async fn published_summary_warms_exact_prefix_and_serializes_later_foreground_turns() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (port, _, runtime) = warming_fixture(directory.path(), backend).await;
+        let port = port.with_summary_deck(runtime.clone());
+        for n in 0..6 {
+            add_turn(&port, n).await.unwrap();
+        }
+        let snapshot = port
+            .read_context_snapshot(port.latest_context().await.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate an already active foreground turn. Summary publication can
+        // complete, but warming must not touch that turn's model slot.
+        let lane = port.owner.foreground_lock(&port.stream);
+        let active = lane.clone().lock_owned().await;
+        port.prepare_context(snapshot).await.unwrap();
+        assert!(
+            port.owner
+                .summary_deck_jobs
+                .lock()
+                .unwrap()
+                .contains_key(&port.branch)
+        );
+        runtime.summary.gate.as_ref().unwrap().add_permits(1);
+        wait_job(&port).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(runtime.observed.lock().unwrap().is_empty());
+        let head = port.owner.head(&port.stream).unwrap();
+        drop(active);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while runtime.observed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication must schedule warming");
+        {
+            let seen = runtime.observed.lock().unwrap();
+            let request = &seen[0];
+            assert_eq!(request.messages[0].role, "system");
+            assert_eq!(
+                request.messages[0].content,
+                "Exact runtime system and tool guidance"
+            );
+            assert_eq!(request.tools.as_ref().unwrap()[0]["name"], "lookup");
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|m| m.content.contains("Historical summary deck"))
+            );
+            assert_eq!(request.provider_ref, "llamacpp.fixture");
+        }
+        assert!(
+            lane.try_lock().is_err(),
+            "new turns must wait for an admitted prefill"
+        );
+        runtime.finish.add_permits(1);
+        let _next = tokio::time::timeout(std::time::Duration::from_secs(3), lane.lock())
+            .await
+            .unwrap();
+        assert_eq!(
+            port.owner.head(&port.stream).unwrap(),
+            head,
+            "warming must not append assistant messages or provider responses"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cache_warming_rechecks_authority_and_configuration_before_reusing_request_facts() {
+    let directory = tempfile::tempdir().unwrap();
+    let (port, authority, runtime) = warming_fixture(directory.path(), "sqlite").await;
+    authority.revision.store(1, Ordering::SeqCst);
+    port.prefill_current_context(runtime.clone()).await.unwrap();
+    assert!(
+        runtime.observed.lock().unwrap().is_empty(),
+        "old request headers are not live policy"
+    );
+    authority.revision.store(0, Ordering::SeqCst);
+    authority.base.0.store(false, Ordering::SeqCst);
+    assert!(port.prefill_current_context(runtime.clone()).await.is_err());
+    assert!(runtime.observed.lock().unwrap().is_empty());
+    authority.base.0.store(true, Ordering::SeqCst);
+    runtime.summary.enabled.store(false, Ordering::SeqCst);
+    port.prefill_current_context(runtime.clone()).await.unwrap();
+    assert!(runtime.observed.lock().unwrap().is_empty());
+    runtime.summary.enabled.store(true, Ordering::SeqCst);
+    let pending_port = port.clone();
+    let pending_runtime = runtime.clone();
+    let pending = ::zeroclaw_spawn::spawn!(async move {
+        pending_port.prefill_current_context(pending_runtime).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while runtime.observed.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("warmup entered");
+    authority.base.0.store(false, Ordering::SeqCst);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        port.owner.foreground_lock(&port.stream).try_lock().is_ok(),
+        "revocation releases the foreground lane"
+    );
 }
 
 async fn wait_job(port: &EngineSession) -> anyhow::Result<()> {

@@ -17,6 +17,8 @@ pub struct SimplexConfig {
     pub bridge_command: Vec<String>,
     /// Accept encrypted audio calls from explicitly authorized contacts. Default: false.
     pub calls_enabled: bool,
+    /// Maximum incoming attachment bytes. Default: 1 GiB. SimpleX relay limits also apply.
+    pub max_attachment_bytes: Option<u64>,
     /// Supersede an earlier turn when this contact sends a new message.
     pub interrupt_on_new_message: bool,
     /// Explicit message arrival mode: queue, interrupt, or steer. When absent,
@@ -26,10 +28,18 @@ pub struct SimplexConfig {
 }
 
 impl SimplexConfig {
+    pub fn attachment_limit(&self) -> u64 {
+        self.max_attachment_bytes.unwrap_or(1024 * 1024 * 1024)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.enabled {
             return Ok(());
         }
+        anyhow::ensure!(
+            (1..=5 * 1024 * 1024 * 1024).contains(&self.attachment_limit()),
+            "simplex_invalid_attachment_limit"
+        );
         let url = url::Url::parse(&self.websocket_url)?;
         anyhow::ensure!(
             url.scheme() == "ws"
@@ -60,6 +70,28 @@ impl crate::traits::ChannelConfig for SimplexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachment_limit_defaults_to_one_gib_and_validates_overrides() {
+        let mut config = SimplexConfig {
+            enabled: true,
+            websocket_url: "ws://127.0.0.1:5225".into(),
+            bridge_command: vec!["fixture".into()],
+            ..Default::default()
+        };
+        assert_eq!(config.attachment_limit(), 1024 * 1024 * 1024);
+        for invalid in [0, 5 * 1024 * 1024 * 1024 + 1] {
+            config.max_attachment_bytes = Some(invalid);
+            assert!(config.validate().is_err());
+        }
+        config.max_attachment_bytes = Some(2 * 1024 * 1024 * 1024);
+        assert!(config.validate().is_ok());
+        let parsed: SimplexConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            parsed.attachment_limit(),
+            SimplexConfig::default().attachment_limit()
+        );
+    }
+
     #[test]
     fn transport_is_closed_by_default_and_refuses_remote_unauthenticated_apis() {
         let mut config = SimplexConfig::default();

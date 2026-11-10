@@ -18,6 +18,7 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+pub mod hindsight;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -160,6 +161,7 @@ where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
 {
     match classify_memory_backend(backend_name) {
+        MemoryBackendKind::Hindsight => anyhow::bail!("hindsight_requires_config_aware_factory"),
         MemoryBackendKind::Sqlite => {
             wrap_scanned_and_audit(sqlite_builder()?, policy, workspace_dir, audit_enabled)
         }
@@ -521,6 +523,20 @@ pub fn create_memory_from_config(
     config: &Config,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    config.validate_hindsight_memory()?;
+    if backend_kind_from_dotted(&config.memory.backend) == "hindsight" {
+        return wrap_scanned_and_audit(
+            hindsight::HindsightMemory::new(
+                &config.memory.hindsight,
+                &config.data_dir,
+                None,
+                None,
+            )?,
+            &config.memory.policy,
+            &config.data_dir,
+            config.memory.audit_enabled,
+        );
+    }
     create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
@@ -566,6 +582,11 @@ pub fn create_memory_with_storage_and_routes(
     api_key: Option<&str>,
     providers: Option<&ModelProviders>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    if classify_memory_backend(&backend_kind_from_dotted(&config.backend))
+        == MemoryBackendKind::Hindsight
+    {
+        anyhow::bail!("hindsight_requires_live_config_aware_factory");
+    }
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
@@ -931,7 +952,12 @@ fn spawn_auto_reindex(mem: &SqliteMemory) {
 }
 
 pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
+    config.validate_hindsight_memory()?;
     let backend = backend_kind_from_dotted(&config.memory.backend);
+    anyhow::ensure!(
+        classify_memory_backend(&backend) != MemoryBackendKind::Hindsight,
+        "hindsight_import_requires_transcript_backfill"
+    );
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         anyhow::bail!(
             "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
@@ -1022,11 +1048,21 @@ pub async fn create_memory_for_agent(
     api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Memory>> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as ConfigBackend;
+    config.validate_hindsight_memory()?;
     let agent_cfg = config
         .agents
         .get(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     let backend_kind = agent_cfg.memory.backend;
+    if config.memory.backend.trim() == "hindsight"
+        || matches!(backend_kind, ConfigBackend::Hindsight)
+    {
+        config.validate_hindsight_memory()?;
+        if backend_kind == ConfigBackend::None {
+            return Ok(Arc::new(NoneMemory::new("none")));
+        }
+        anyhow::bail!("hindsight_live_policy_required");
+    }
 
     // Config::validate rejects duplicate source grants, but boot deliberately
     // remains validation-resilient so operators can repair malformed config
@@ -1186,6 +1222,42 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
             None
         }
     }
+}
+
+/// Resolve memory against the caller's canonical live authority. Hindsight's
+/// connection is fixed, but grants and processing policy are read on every use.
+pub async fn create_memory_for_agent_live(
+    live: &zeroclaw_config::live::LiveConfigHandle,
+    alias: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Arc<dyn Memory>> {
+    // Keep the canonical snapshot off nested agent/gateway future stacks.
+    // Policy decisions in the returned backend still resolve the live handle.
+    let config = Box::new(live.read().clone());
+    config.validate_hindsight_memory()?;
+    if config.memory.backend.trim() != "hindsight" {
+        return Box::pin(create_memory_for_agent(&config, alias, api_key)).await;
+    }
+    config.validate_hindsight_memory()?;
+    let agent = config
+        .agent(alias)
+        .ok_or_else(|| anyhow::Error::msg("hindsight_unknown_agent"))?;
+    if agent.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::None {
+        return Ok(Arc::new(NoneMemory::new("none")));
+    }
+    let backend = hindsight::HindsightMemory::new(
+        &config.memory.hindsight,
+        &config.data_dir,
+        Some(alias),
+        Some(live.clone()),
+    )?;
+    // Deliberately omit the local retrieval/reranking pipeline and agent UUID
+    // allocation in SQLite memory. Scanning and audit still enclose this backend.
+    Ok(Arc::from(wrap_audit(
+        ScannedMemory::with_live_policy(backend, live.clone()),
+        &config.data_dir,
+        config.memory.audit_enabled,
+    )?))
 }
 
 #[cfg(test)]

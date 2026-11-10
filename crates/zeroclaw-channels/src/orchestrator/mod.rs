@@ -10726,8 +10726,15 @@ async fn process_channel_message_body_inner(
                 attempt_allowlist.clone(),
                 tool_loop,
             );
-            let timed_tool_loop =
-                tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
+            let timed_tool_loop = async {
+                if ctx.pacing.turn_idle_timeout_secs.is_some() {
+                    // The shared engine owns inactivity supervision for every
+                    // transport; a channel wall clock must not cancel progress.
+                    Ok(tool_loop.await)
+                } else {
+                    tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop).await
+                }
+            };
 
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
@@ -17442,8 +17449,8 @@ pub async fn start_channels_with_history(
         }
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            &config,
+        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent_live(
+            &config_arc,
             agent_alias,
             provider_api_key.as_deref(),
         )

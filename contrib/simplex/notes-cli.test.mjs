@@ -110,6 +110,25 @@ try {
  const complete=await until(()=>events.find(e=>e.type==='voice_note'),'reverse_download_timeout');
  assert.equal(complete.contact,aid);assert.equal(complete.id,vi.id);
  assert.deepEqual(Buffer.from(complete.audio,'base64'),result.stdout);
+ // Real encrypted document and full-image transfers use the same authorized receiver.
+ const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+ for (const [kind,name,bytes] of [['file','fixture.bin',Buffer.alloc(8*1024*1024,37)],['image','fixture.png',png]]) {
+  const source=join(root,name);await writeFile(source,bytes);
+  const content={type:kind,text:`Fixture ${kind}`};
+  if(kind==='image')content.image='data:image/png;base64,'+png.toString('base64');
+  const response=await b.rpc(`/_send @${bid} json ${JSON.stringify([{fileSource:{filePath:source},msgContent:content}])}`);
+  assert.ok(!['chatCmdError','chatError'].includes(response.type),'attachment send rejected');
+  const wrapper=await until(()=>a.events.flatMap(e=>e.type==='newChatItems'?e.chatItems??[]:[])
+   .find(i=>i.chatItem?.content?.msgContent?.type===kind),`${kind}_invitation_timeout`);
+  await notes.invitation(wrapper);
+  const invitation=events.find(e=>e.type==='attachment_invitation' && e.media_type===kind);
+  assert.ok(invitation);
+  await notes.receive({...invitation,type:'receive_file',message_id:invitation.id,attachment_dir:root,max_bytes:1024**3});
+  const attachment=await until(()=>events.find(e=>e.type==='attachment' && e.id===invitation.id),`${kind}_download_timeout`);
+  assert.equal(attachment.filename,name);assert.equal(attachment.text,content.text);
+  assert.equal(attachment.data,undefined);assert.deepEqual(await readFile(attachment.path),bytes);
+  await notes.release({contact:attachment.contact,message_id:attachment.id});
+ }
  assert.ok(!a.error);
  assert.equal(notes.receiving.size,0);
 } finally {

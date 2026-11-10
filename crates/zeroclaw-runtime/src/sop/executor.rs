@@ -754,6 +754,7 @@ async fn headless_step_memory(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
     owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    live: Option<&zeroclaw_config::live::LiveConfigHandle>,
 ) -> anyhow::Result<Option<Arc<dyn zeroclaw_memory::Memory>>> {
     let Some(owner) = owner else {
         return Ok(None);
@@ -761,9 +762,15 @@ async fn headless_step_memory(
     let api_key = config
         .resolved_model_provider_for_agent(agent_alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    crate::agent::turn::step_agent_memory(config, agent_alias, api_key.as_deref(), Some(owner))
-        .await
-        .map(Some)
+    crate::agent::turn::step_agent_memory(
+        config,
+        agent_alias,
+        api_key.as_deref(),
+        Some(owner),
+        live,
+    )
+    .await
+    .map(Some)
 }
 
 /// Test-only: the owner of the memory override each headless step turn was
@@ -1071,6 +1078,10 @@ async fn drive_headless_run(
                             &effective_config,
                             &agent_alias,
                             run_owner.as_ref(),
+                            execution_capability
+                                .as_ref()
+                                .map(|capability| capability.config_handle())
+                                .as_ref(),
                         )
                         .await
                         {
@@ -1783,13 +1794,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = owned_run_config(&tmp);
         assert!(
-            headless_step_memory(&config, "stepper", None)
+            headless_step_memory(&config, "stepper", None, None)
                 .await
                 .unwrap()
                 .is_none()
         );
         let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
-        let memory = headless_step_memory(&config, "stepper", Some(&owner))
+        let memory = headless_step_memory(&config, "stepper", Some(&owner), None)
             .await
             .unwrap()
             .expect("an owned run's step gets the owner's memory");

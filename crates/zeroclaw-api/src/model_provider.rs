@@ -889,6 +889,55 @@ pub struct ProviderContentPosition {
 }
 
 impl StreamEvent {
+    /// Ephemeral semantic progress for an incremental tool-argument fragment.
+    /// Carries no argument text, is never replayed, and is not a keepalive.
+    pub fn tool_argument_progress(bytes: usize) -> Self {
+        Self::ProtocolMetadata(
+            serde_json::json!({"kind":"generation_progress","component":"tool_arguments","bytes":bytes}),
+        )
+    }
+
+    pub fn is_transient_progress(&self) -> bool {
+        matches!(self, Self::ProtocolMetadata(metadata) if metadata.as_object().is_some_and(|fields|
+            fields.len() == 3 && metadata["kind"] == "generation_progress"
+                && metadata["component"] == "tool_arguments" && metadata["bytes"].as_u64().is_some()))
+    }
+
+    pub fn has_generation_progress(&self) -> bool {
+        match self {
+            Self::TextDelta(chunk) => {
+                !chunk.delta.is_empty()
+                    || chunk
+                        .reasoning
+                        .as_deref()
+                        .is_some_and(|reasoning| !reasoning.is_empty())
+            }
+            Self::ThinkingDelta(text) | Self::ReasoningFinalized(text) => !text.is_empty(),
+            Self::ToolCall(_)
+            | Self::PreExecutedToolCall { .. }
+            | Self::PreExecutedToolResult { .. } => true,
+            Self::OutputBlock(ProviderOutputBlock::ProtocolMetadata { .. }) => false,
+            Self::OutputBlock(_) => true,
+            Self::ProtocolMetadata(metadata) if self.is_transient_progress() => {
+                metadata["bytes"].as_u64().is_some_and(|bytes| bytes > 0)
+            }
+            Self::ProtocolMetadata(metadata) if metadata["kind"] == "tool_arguments_delta" => {
+                metadata["delta"]
+                    .as_str()
+                    .is_some_and(|delta| !delta.is_empty())
+            }
+            Self::ProtocolMetadata(metadata)
+                if metadata["kind"] == "partial_content"
+                    && metadata["type_name"] == "input_json_delta" =>
+            {
+                metadata["activity"]["delta"]["partial_json"]
+                    .as_str()
+                    .is_some_and(|delta| !delta.is_empty())
+            }
+            _ => false,
+        }
+    }
+
     pub fn from_chunk(chunk: StreamChunk) -> Self {
         if chunk.is_final {
             Self::Final
@@ -1403,6 +1452,20 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Evaluate a prompt into a local provider's resident KV cache without
+    /// publishing assistant output or executing tools. Unsupported by default.
+    /// A provider may sample at most one discarded token to complete prefill.
+    /// This is a physical cache operation, not a conversation/provider response.
+    async fn prefill_prompt(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+        _inactivity_secs: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("provider_prompt_prefill_unsupported")
+    }
+
     /// Chat with tool definitions for native function calling support.
     /// See `simple_chat` for the `temperature` contract.
     async fn chat_with_tools(
@@ -1620,6 +1683,18 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         self.as_ref().warmup().await
+    }
+
+    async fn prefill_prompt(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        inactivity_secs: u64,
+    ) -> anyhow::Result<()> {
+        self.as_ref()
+            .prefill_prompt(request, model, temperature, inactivity_secs)
+            .await
     }
 
     async fn chat_with_tools(

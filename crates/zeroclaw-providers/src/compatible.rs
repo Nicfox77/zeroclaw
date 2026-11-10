@@ -2,6 +2,8 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+pub(crate) mod prefill;
+
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
@@ -2766,6 +2768,15 @@ fn sse_choice_content_events(
     let mut events = Vec::new();
     if let Some(calls) = &choice.delta.tool_calls {
         for call in calls {
+            let bytes = call
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.as_deref())
+                .or(call.arguments.as_deref())
+                .map_or(0, str::len);
+            if bytes > 0 {
+                events.push(StreamEvent::tool_argument_progress(bytes));
+            }
             if let Some(metadata) = crate::output::chat_tool_metadata(
                 call.id.as_deref(),
                 &call.extensions,
@@ -4701,6 +4712,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let mut result = self.parse_native_response(choice.into_message());
         result.usage = usage;
         Ok(result)
+    }
+
+    async fn prefill_prompt(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        inactivity_secs: u64,
+    ) -> anyhow::Result<()> {
+        self.prefill_llamacpp(request, model, temperature, inactivity_secs)
+            .await
     }
 
     async fn chat(

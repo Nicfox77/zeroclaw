@@ -7,6 +7,42 @@ use zeroclaw_kernel::session::execution::UserTurnCommand;
 use zeroclaw_kernel::session::query::{SessionAccess, SessionAccessPolicy};
 use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 
+#[tokio::test]
+async fn cli_admission_registers_hindsight_delivery_before_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = zeroclaw_config::schema::Config {
+        data_dir: dir.path().into(),
+        ..Default::default()
+    };
+    config.memory.backend = "hindsight".into();
+    config.memory.hindsight.mode = zeroclaw_config::hindsight::RuntimeMode::External;
+    config.memory.hindsight.api_url = "http://127.0.0.1:9".into();
+    let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+    agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight;
+    config.agents.insert("fixture".into(), agent);
+    let authority = zeroclaw_runtime::live_config_authority::LiveConfigAuthority::new(config);
+    let port = open_cli_session(
+        dir.path(),
+        "sqlite",
+        "fixture",
+        authority.execution_capability(),
+        None,
+    )
+    .await
+    .unwrap();
+    let ledger = zeroclaw_memory::hindsight::ledger::Ledger::open(dir.path()).unwrap();
+    let streams = ledger.streams().unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].agent, "fixture");
+    assert_eq!(
+        streams[0].principal,
+        zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR
+    );
+    assert!(streams[0].cursor > 0);
+    assert!(port.restore_context().await.unwrap().is_some());
+    assert!(!dir.path().join("memory/brain.db").exists());
+}
+
 struct Access;
 impl SessionAccessPolicy for Access {
     fn authorize(

@@ -1793,7 +1793,14 @@ impl Agent {
         let user_message = input.content.as_str();
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
-        if self.auto_save {
+        if self.auto_save
+            && !matches!(
+                self.memory.role(),
+                zeroclaw_api::attribution::Role::Memory(
+                    zeroclaw_api::attribution::MemoryKind::Hindsight
+                )
+            )
+        {
             let store_start = std::time::Instant::now();
             let store_result = self
                 .memory
@@ -2140,7 +2147,14 @@ impl Agent {
                 }
                 // Append the same structured user metadata through this round's
                 // messages instead of self.history/new_msgs.
-                if self.auto_save {
+                if self.auto_save
+                    && !matches!(
+                        self.memory.role(),
+                        zeroclaw_api::attribution::Role::Memory(
+                            zeroclaw_api::attribution::MemoryKind::Hindsight
+                        )
+                    )
+                {
                     let store_start = std::time::Instant::now();
                     let store_result = self
                         .memory
@@ -3043,7 +3057,9 @@ impl Agent {
                     );
                 }
             };
-        let memory: Arc<dyn Memory> = capabilities.agent_memory(config, agent_alias).await?;
+        let memory: Arc<dyn Memory> = capabilities
+            .agent_memory_with_policy(config, agent_alias, live_config.as_ref())
+            .await?;
 
         let tool_config = Arc::new(config.clone());
         let tool_request = crate::composition::ToolRequest {
@@ -3934,7 +3950,14 @@ impl Agent {
 
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
-        if self.auto_save {
+        if self.auto_save
+            && !matches!(
+                self.memory.role(),
+                zeroclaw_api::attribution::Role::Memory(
+                    zeroclaw_api::attribution::MemoryKind::Hindsight
+                )
+            )
+        {
             let store_start = std::time::Instant::now();
             let store_result = self
                 .memory

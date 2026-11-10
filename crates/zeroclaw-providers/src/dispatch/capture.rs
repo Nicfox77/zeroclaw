@@ -886,6 +886,11 @@ impl Recorder {
     }
 
     async fn event(&mut self, event: &StreamEvent) -> anyhow::Result<()> {
+        // Liveness has no replay payload and cannot consume the next semantic
+        // segment's native position or signed-reasoning projection.
+        if event.is_transient_progress() {
+            return Ok(());
+        }
         if let StreamEvent::ContentPosition(position) = event {
             anyhow::ensure!(
                 self.pending_position.is_none(),

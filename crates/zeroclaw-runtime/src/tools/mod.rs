@@ -19,6 +19,7 @@ pub mod delegate;
 mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
+pub mod hindsight;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
@@ -938,6 +939,41 @@ impl Memory for NativeMemoryBinding {
         self.selected().principal_scope()
     }
 
+    async fn recall_context(
+        &self,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation()
+            .recall_context(query, question, limit, session)
+            .await
+    }
+    async fn recall_context_for_principal(
+        &self,
+        scope: &zeroclaw_api::memory_traits::PrincipalScope,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation()
+            .recall_context_for_principal(scope, query, question, limit, session)
+            .await
+    }
+    async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation().reflect(query).await
+    }
+    async fn reflect_for_principal(
+        &self,
+        scope: &zeroclaw_api::memory_traits::PrincipalScope,
+        query: &str,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation()
+            .reflect_for_principal(scope, query)
+            .await
+    }
     async fn store(
         &self,
         key: &str,
@@ -1282,6 +1318,9 @@ impl Memory for NativeMemoryBinding {
 /// These kinds are stamped only by the actual fixed native constructors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NativeMemoryKind {
+    HindsightRetain,
+    HindsightRecall,
+    HindsightReflect,
     Store,
     Recall,
     Forget,
@@ -1345,6 +1384,21 @@ impl NativeMemoryOrigins {
             .as_ref()
             .map(|chain| chain.weak_policy_observations());
         let actual: Arc<dyn Tool> = match kind {
+            NativeMemoryKind::HindsightRetain => Arc::new(hindsight::HindsightTool::new(
+                memory,
+                security,
+                hindsight::Operation::Retain,
+            )),
+            NativeMemoryKind::HindsightRecall => Arc::new(hindsight::HindsightTool::new(
+                memory,
+                security,
+                hindsight::Operation::Recall,
+            )),
+            NativeMemoryKind::HindsightReflect => Arc::new(hindsight::HindsightTool::new(
+                memory,
+                security,
+                hindsight::Operation::Reflect,
+            )),
             NativeMemoryKind::Store => Arc::new(MemoryStoreTool::new(memory, security)),
             NativeMemoryKind::Recall => Arc::new(MemoryRecallTool::new(memory)),
             NativeMemoryKind::Forget => Arc::new(MemoryForgetTool::new(memory, security)),
@@ -1355,7 +1409,10 @@ impl NativeMemoryOrigins {
         // Neither an arbitrary same-named tool nor a read is reclassified.
         let actual = if matches!(
             kind,
-            NativeMemoryKind::Store | NativeMemoryKind::Forget | NativeMemoryKind::Purge
+            NativeMemoryKind::Store
+                | NativeMemoryKind::Forget
+                | NativeMemoryKind::Purge
+                | NativeMemoryKind::HindsightRetain
         ) && let Some(policies) = policies
         {
             policies.wrap_act_tool(actual)
@@ -2454,6 +2511,20 @@ fn all_tools_with_runtime_on_thread(
         "cron_runs",
         Arc::new(CronRunsTool::new(config.clone(), agent_alias))
     );
+    if config.memory.backend.trim() == "hindsight" {
+        register_tool!(
+            "hindsight_retain",
+            construct_memory(NativeMemoryKind::HindsightRetain)
+        );
+        register_tool!(
+            "hindsight_recall",
+            construct_memory(NativeMemoryKind::HindsightRecall)
+        );
+        register_tool!(
+            "hindsight_reflect",
+            construct_memory(NativeMemoryKind::HindsightReflect)
+        );
+    }
     register_tool!("memory_store", construct_memory(NativeMemoryKind::Store));
     register_tool!("memory_recall", construct_memory(NativeMemoryKind::Recall));
     register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));

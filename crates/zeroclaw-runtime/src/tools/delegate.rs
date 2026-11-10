@@ -1680,7 +1680,7 @@ impl DelegateTool {
         let memory = self
             .target_binding()
             .capabilities
-            .agent_memory(config, agent_name)
+            .agent_memory_with_policy(config, agent_name, self.live_config.as_ref())
             .await?;
         let scope = self.principal_scope.read().clone();
         Ok(Some(match scope {
@@ -3572,6 +3572,8 @@ impl DelegateTool {
             sink.set_timeout_budget(timeout_secs);
             sink.note_model_request();
         }
+        let _activity_wait = zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.bounded_wait(Duration::from_secs(timeout_secs)));
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             dispatcher.chat_with_history(&messages, &model, temperature),
@@ -4891,6 +4893,8 @@ impl DelegateTool {
                 });
             }
         };
+        let _activity_wait = zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.bounded_wait(timeout));
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -5925,6 +5929,8 @@ impl DelegateTool {
             ExecutionTreeBudget::current(),
             loop_runtime.max_execution_tree_iterations,
         );
+        let _activity_wait = zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.bounded_wait(Duration::from_secs(agentic_timeout_secs)));
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {

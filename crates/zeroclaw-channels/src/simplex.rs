@@ -14,10 +14,112 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::channel::{Channel, ChannelControl, ChannelMessage, ProgressEvent, SendMessage};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference, MediaAttachment};
 use zeroclaw_config::live::LiveConfigHandle;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
+
+fn attachment_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !matches!(name, "." | "..")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+}
+
+fn persist_attachment(
+    workspace: &std::path::Path,
+    scope: &str,
+    filename: String,
+    inbox: &std::path::Path,
+    source: &std::path::Path,
+    limit: u64,
+) -> Result<MediaAttachment> {
+    use std::io::{Read, Seek};
+    ensure!(
+        attachment_filename(&filename),
+        "simplex_invalid_attachment_filename"
+    );
+    // The listener creates this private inbox; the bridge may hand off only
+    // regular files in its immediate transfer directories, never arbitrary paths.
+    let parent = source.parent().context("simplex_attachment_path_invalid")?;
+    ensure!(
+        source.file_name().is_some_and(|name| name == "attachment")
+            && parent.parent() == Some(inbox)
+            && std::fs::symlink_metadata(parent)?.file_type().is_dir(),
+        "simplex_attachment_path_invalid"
+    );
+    let mut input_options = std::fs::OpenOptions::new();
+    input_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        input_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut input = input_options.open(source)?;
+    let metadata = input.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= limit,
+        "simplex_attachment_size_limit"
+    );
+    let mut header = [0u8; 32];
+    let header_size = input.read(&mut header)?;
+    input.rewind()?;
+    std::fs::create_dir_all(workspace)?;
+    let workspace = std::fs::canonicalize(workspace)?;
+    let base = workspace.join("simplex_files");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    ensure!(
+        std::fs::symlink_metadata(&base)?.file_type().is_dir(),
+        "simplex_attachment_directory_invalid"
+    );
+    let prefix = format!("{:x}-", Sha256::digest(scope.as_bytes()));
+    let directory = tempfile::Builder::new().prefix(&prefix).tempdir_in(&base)?;
+    let path = directory.path().join(&filename);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    let copied = std::io::copy(&mut input.take(limit + 1), &mut file)?;
+    ensure!(
+        copied == metadata.len() && copied <= limit,
+        "simplex_attachment_size_changed"
+    );
+    file.sync_all()?;
+    let mime = zeroclaw_api::media::image_mime_from_magic(&header[..header_size]);
+    let kind = if mime.is_some() {
+        AttachmentKind::Image
+    } else {
+        AttachmentKind::Document
+    };
+    let attachment = MediaAttachment {
+        file_name: filename,
+        data: Vec::new(),
+        mime_type: Some(mime.unwrap_or("application/octet-stream").into()),
+        reference: Some(AttachmentReference {
+            kind,
+            target: path.to_string_lossy().into_owned(),
+        }),
+    };
+    let _ = directory.keep();
+    Ok(attachment)
+}
 
 fn bridge_result(value: Value) -> Result<()> {
     if value["ok"] == true {
@@ -46,6 +148,9 @@ struct Inner {
     config: LiveConfigHandle,
     writer: Mutex<Option<mpsc::Sender<Value>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    /// Owns the private filesystem handoff capability for this listener. Neither
+    /// attachment policy nor a second copy of transfer metadata lives here.
+    attachment_inbox: Mutex<Option<tempfile::TempDir>>,
     drafts: Mutex<HashMap<String, VoiceDraft>>,
     recognition: Mutex<HashMap<String, CallRecognition>>,
     /// Creates the unfinished spoken turn from completed STT chunks. It is
@@ -82,6 +187,7 @@ impl SimplexChannel {
                 config,
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
+                attachment_inbox: Mutex::new(None),
                 drafts: Mutex::new(HashMap::new()),
                 recognition: Mutex::new(HashMap::new()),
                 transcripts: Mutex::new(HashMap::new()),
@@ -162,6 +268,10 @@ impl SimplexChannel {
             .bridge_command
             .split_first()
             .context("simplex_bridge_command_missing")?;
+        let inbox = tempfile::Builder::new()
+            .prefix("zeroclaw-simplex-inbox-")
+            .tempdir()?;
+        *self.inner.attachment_inbox.lock() = Some(inbox);
         let mut child = tokio::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -251,6 +361,15 @@ impl SimplexChannel {
         } else {
             "channel-simplex-voice-note-failed"
         });
+        self.request(json!({"type":"send", "contact":contact, "text":text}))
+            .await
+    }
+    async fn attachment_notice(&self, contact: &str) -> Result<()> {
+        if !self.allowed(contact, false) {
+            return Ok(());
+        }
+        let text =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-simplex-attachment-failed");
         self.request(json!({"type":"send", "contact":contact, "text":text}))
             .await
     }
@@ -458,7 +577,7 @@ impl SimplexChannel {
                             let message = json!({"contact":contact,"call_id":call,
                                 "scope":format!("{call}/{utterance}"),"id":format!("{call}/{utterance}")});
                             channel.dispatch_message(&message,
-                                event["text"].as_str().context("simplex_live_text_missing")?.to_string(), true, true, &tx).await?;
+                                event["text"].as_str().context("simplex_live_text_missing")?.to_string(), true, true, Vec::new(), &tx).await?;
                         }
                         _ => anyhow::bail!("simplex_live_recognition_failed"),
                     }
@@ -644,6 +763,124 @@ impl SimplexChannel {
                 .retain(|scope, _| !scope.starts_with(&prefix));
             return Ok(());
         }
+        if kind == "attachment_transfer_failed" {
+            return self.attachment_notice(contact).await;
+        }
+        if kind == "attachment_invitation" {
+            if !self.allowed(contact, false) {
+                return Ok(());
+            }
+            let limit = self
+                .inner
+                .config
+                .read()
+                .channels
+                .simplex
+                .get(&self.inner.alias)
+                .context("simplex_alias_missing")?
+                .attachment_limit();
+            let inbox = self
+                .inner
+                .attachment_inbox
+                .lock()
+                .as_ref()
+                .context("simplex_attachment_inbox_missing")?
+                .path()
+                .to_path_buf();
+            if !event["bytes"].as_u64().is_some_and(|n| n > 0 && n <= limit)
+                || !event["filename"].as_str().is_some_and(attachment_filename)
+                || !matches!(
+                    event["media_type"].as_str(),
+                    Some("image" | "file" | "video")
+                )
+            {
+                return self.attachment_notice(contact).await;
+            }
+            return self
+                .request(json!({"type":"receive_file", "contact":contact,
+                "message_id":event["id"], "file_id":event["file_id"], "filename":event["filename"],
+                "media_type":event["media_type"], "text":event["text"],
+                "attachment_dir":inbox, "max_bytes":limit}))
+                .await;
+        }
+        if kind == "attachment" {
+            if !self.allowed(contact, false) {
+                return Ok(());
+            }
+            let filename = event["filename"]
+                .as_str()
+                .context("simplex_attachment_filename_missing")?
+                .to_string();
+            ensure!(
+                attachment_filename(&filename),
+                "simplex_invalid_attachment_filename"
+            );
+            let source = std::path::PathBuf::from(
+                event["path"]
+                    .as_str()
+                    .context("simplex_attachment_path_missing")?,
+            );
+            let inbox = self
+                .inner
+                .attachment_inbox
+                .lock()
+                .as_ref()
+                .context("simplex_attachment_inbox_missing")?
+                .path()
+                .to_path_buf();
+            let limit = self
+                .inner
+                .config
+                .read()
+                .channels
+                .simplex
+                .get(&self.inner.alias)
+                .context("simplex_alias_missing")?
+                .attachment_limit();
+            let workspace = {
+                let config = self.inner.config.read();
+                let owner = config
+                    .agent_for_channel(&format!("simplex.{}", self.inner.alias))
+                    .context("simplex_unowned_channel")?;
+                config.agent_workspace_dir(owner)
+            };
+            let scope = format!("{}/{}/{}", self.inner.alias, contact, event["id"]);
+            let destination = workspace.clone();
+            let received = tokio::task::spawn_blocking(move || {
+                persist_attachment(&destination, &scope, filename, &inbox, &source, limit)
+            })
+            .await;
+            // The bridge retains its private temporary file until native copy
+            // completion. Release it even when validation/copy failed.
+            self.request(json!({"type":"release_file", "contact":contact,
+                "message_id":event["id"]}))
+                .await?;
+            let attachment = received??;
+            let still_owned = {
+                let config = self.inner.config.read();
+                config
+                    .agent_for_channel(&format!("simplex.{}", self.inner.alias))
+                    .is_some_and(|owner| config.agent_workspace_dir(owner) == workspace)
+            };
+            if !still_owned || !self.allowed(contact, false) {
+                if let Some(reference) = attachment.reference
+                    && let Some(parent) = std::path::Path::new(&reference.target).parent()
+                {
+                    tokio::fs::remove_dir_all(parent).await?;
+                }
+                return Ok(());
+            }
+            return self
+                .dispatch_message(
+                    &event,
+                    event["text"].as_str().unwrap_or("").to_string(),
+                    false,
+                    false,
+                    vec![attachment],
+                    tx,
+                )
+                .await;
+        }
         if kind == "voice_transfer_failed" {
             return self.voice_notice(contact, event["outgoing"] == true).await;
         }
@@ -779,7 +1016,8 @@ impl SimplexChannel {
         if text.trim().is_empty() {
             return Ok(());
         }
-        self.dispatch_message(&event, text, voice, call, tx).await
+        self.dispatch_message(&event, text, voice, call, Vec::new(), tx)
+            .await
     }
     async fn dispatch_message(
         &self,
@@ -787,12 +1025,13 @@ impl SimplexChannel {
         text: String,
         voice: bool,
         call: bool,
+        attachments: Vec<MediaAttachment>,
         tx: &mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
         let contact = event["contact"]
             .as_str()
             .context("simplex_contact_missing")?;
-        if !self.allowed(contact, call) || text.trim().is_empty() {
+        if !self.allowed(contact, call) || (text.trim().is_empty() && attachments.is_empty()) {
             return Ok(());
         }
         tx.send(ChannelMessage {
@@ -813,6 +1052,7 @@ impl SimplexChannel {
             interruption_scope_id: call
                 .then(|| event["call_id"].as_str().unwrap_or("").to_string()),
             voice_origin: voice,
+            attachments,
             explicitly_addressed: true,
             ..Default::default()
         })
@@ -968,13 +1208,15 @@ impl Channel for SimplexChannel {
                 .await?;
             while let Some(event) = reads.recv().await {
                 let note = matches!(event["type"].as_str(), Some("voice_note" | "voice_invitation"));
+                let attachment = matches!(event["type"].as_str(), Some("attachment" | "attachment_invitation"));
                 let contact = event["contact"].as_str().unwrap_or("").to_string();
                 if let Err(error) = channel.event(event, &tx).await {
                     if note { channel.voice_notice(&contact, false).await?; }
+                    if attachment { channel.attachment_notice(&contact).await?; }
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(json!({"error": if note { "simplex_voice_note_failed".to_string() } else { error.to_string() }})),
+                            .with_attrs(json!({"error": if note { "simplex_voice_note_failed".to_string() } else if attachment { "simplex_attachment_failed".to_string() } else { error.to_string() }})),
                         "SimpleX event processing failed"
                     );
                 }
@@ -1004,6 +1246,7 @@ impl Channel for SimplexChannel {
         {
             child.kill().await?;
         }
+        self.inner.attachment_inbox.lock().take();
         result
     }
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -1104,11 +1347,13 @@ impl Channel for SimplexChannel {
             if let Some(live) = &draft.text {
                 live.update(
                     &simplex_progress(match event {
-                        ProgressEvent::WaitingOnModel => "thinking",
+                        ProgressEvent::Reasoning => "thinking",
                         ProgressEvent::RunningTool
                         | ProgressEvent::CompactingContext
                         | ProgressEvent::FinalizingResponse => "working",
-                        ProgressEvent::Received | ProgressEvent::Planning => "processing",
+                        ProgressEvent::Received
+                        | ProgressEvent::Planning
+                        | ProgressEvent::WaitingOnModel => "processing",
                     }),
                     true,
                 );
@@ -1603,7 +1848,271 @@ mod tests {
             },
         );
         let live = LiveConfig::new(config);
-        (SimplexChannel::new("personal".into(), live.handle()), live)
+        let channel = SimplexChannel::new("personal".into(), live.handle());
+        *channel.inner.attachment_inbox.lock() = Some(tempfile::tempdir().unwrap());
+        (channel, live)
+    }
+
+    fn incoming_file(channel: &SimplexChannel, data: &[u8]) -> std::path::PathBuf {
+        let inbox = channel.inner.attachment_inbox.lock();
+        let directory = tempfile::tempdir_in(inbox.as_ref().unwrap().path()).unwrap();
+        let path = directory.path().join("attachment");
+        std::fs::write(&path, data).unwrap();
+        let _ = directory.keep();
+        path
+    }
+
+    fn acknowledge_file_release(channel: &SimplexChannel) {
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let responder = channel.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let value = requests.recv().await.unwrap();
+            assert_eq!(value["type"], "release_file");
+            responder
+                .inner
+                .pending
+                .lock()
+                .remove(value["id"].as_str().unwrap())
+                .unwrap()
+                .send(json!({"ok":true}))
+                .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn image_only_messages_reach_native_multimodal_preparation() {
+        let (channel, live) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let mut config = live.snapshot();
+        config.agents.get_mut("assistant").unwrap().workspace.path =
+            Some(root.path().to_path_buf());
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let source = incoming_file(&channel, &png.into_inner());
+        acknowledge_file_release(&channel);
+        let (tx, mut rx) = mpsc::channel(1);
+        channel
+            .event(
+                json!({"type":"attachment", "contact":"17", "id":"42", "filename":"photo.png",
+            "path":source, "text":""}),
+                &tx,
+            )
+            .await
+            .unwrap();
+        let message = rx.recv().await.unwrap();
+        assert!(message.content.is_empty());
+        assert!(!message.voice_origin);
+        assert_eq!(
+            message.attachments[0].reference.as_ref().unwrap().kind,
+            AttachmentKind::Image
+        );
+        let config = zeroclaw_config::schema::MediaPipelineConfig::default();
+        let prompt = crate::orchestrator::media_pipeline::MediaPipeline::new(&config, None, true)
+            .process_message(&message.content, &message.attachments)
+            .await;
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            &[prompt],
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(prepared.contains_images);
+        assert!(
+            prepared.messages[0].attachments[0]
+                .target
+                .starts_with("data:image/png;base64,")
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_admission_checks_authorization_and_size_before_download() {
+        let (channel, _) = fixture();
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let responder = channel.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            for expected in ["send", "receive_file"] {
+                let value = requests.recv().await.unwrap();
+                assert_eq!(value["type"], expected);
+                if expected == "receive_file" {
+                    assert_eq!(value["message_id"], "42");
+                    assert_eq!(value["file_id"], 7);
+                    assert_eq!(value["text"], "Caption");
+                }
+                responder
+                    .inner
+                    .pending
+                    .lock()
+                    .remove(value["id"].as_str().unwrap())
+                    .unwrap()
+                    .send(json!({"ok":true}))
+                    .unwrap();
+            }
+        });
+        let (tx, _rx) = mpsc::channel(4);
+        let mut event = json!({"type":"attachment_invitation", "contact":"18", "id":"42",
+            "file_id":7, "filename":"design.txt", "bytes":100, "media_type":"file", "text":"Caption"});
+        channel.event(event.clone(), &tx).await.unwrap();
+        event["contact"] = json!("17");
+        event["bytes"] = json!(1024u64 * 1024 * 1024 + 1);
+        channel.event(event.clone(), &tx).await.unwrap();
+        event["bytes"] = json!(100);
+        channel.event(event, &tx).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn documents_are_scoped_and_unauthorized_contacts_cannot_write_files() {
+        let (channel, live) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let mut config = live.snapshot();
+        config.agents.get_mut("assistant").unwrap().workspace.path =
+            Some(root.path().to_path_buf());
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        channel.event(json!({"type":"attachment", "contact":"18", "id":"42", "filename":"../secret", "data":"invalid"}), &tx).await.unwrap();
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+        let source = incoming_file(&channel, b"Project notes");
+        acknowledge_file_release(&channel);
+        channel
+            .event(
+                json!({"type":"attachment", "contact":"17", "id":"42", "filename":"design.txt",
+            "path":source, "text":"Review this"}),
+                &tx,
+            )
+            .await
+            .unwrap();
+        let message = rx.recv().await.unwrap();
+        assert_eq!(message.content, "Review this");
+        let reference = message.attachments[0].reference.as_ref().unwrap();
+        assert_eq!(reference.kind, AttachmentKind::Document);
+        assert!(std::path::Path::new(&reference.target).starts_with(root.path()));
+        assert_eq!(std::fs::read(&reference.target).unwrap(), b"Project notes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&reference.target)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn large_attachments_are_copied_without_buffering_and_limits_are_rechecked() {
+        use std::io::{Read, Seek};
+        let (channel, _) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let source = incoming_file(&channel, b"header");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        let inbox = channel.inner.attachment_inbox.lock();
+        let inbox = inbox.as_ref().unwrap().path();
+        assert!(
+            persist_attachment(
+                root.path(),
+                "scope",
+                "large.zip".into(),
+                inbox,
+                &source,
+                1024
+            )
+            .is_err()
+        );
+        let attachment = persist_attachment(
+            root.path(),
+            "scope",
+            "large.zip".into(),
+            inbox,
+            &source,
+            1024 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(attachment.data.is_empty());
+        let path = attachment.reference.unwrap().target;
+        let mut saved = std::fs::File::open(path).unwrap();
+        assert_eq!(saved.metadata().unwrap().len(), 64 * 1024 * 1024);
+        let mut header = [0; 6];
+        saved.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"header");
+        saved.seek(std::io::SeekFrom::End(-1)).unwrap();
+        let mut tail = [1];
+        saved.read_exact(&mut tail).unwrap();
+        assert_eq!(tail, [0]);
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&source).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", &source).unwrap();
+            assert!(
+                persist_attachment(
+                    root.path(),
+                    "scope",
+                    "file.txt".into(),
+                    inbox,
+                    &source,
+                    1024 * 1024
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_storage_rejects_traversal_and_symlinked_roots() {
+        let (channel, _) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let source = incoming_file(&channel, b"bytes");
+        let inbox = channel.inner.attachment_inbox.lock();
+        let inbox = inbox.as_ref().unwrap().path();
+        for name in ["../secret", "bad/name", "bad\\name", "..", "bad\nname"] {
+            assert!(
+                persist_attachment(root.path(), "scope", name.into(), inbox, &source, 1024)
+                    .is_err()
+            );
+        }
+        assert!(
+            persist_attachment(
+                root.path(),
+                "scope",
+                "file.txt".into(),
+                root.path(),
+                &source,
+                1024
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.path().join("simplex_files")).unwrap();
+            assert!(
+                persist_attachment(
+                    root.path(),
+                    "scope",
+                    "file.txt".into(),
+                    inbox,
+                    &source,
+                    1024
+                )
+                .is_err()
+            );
+            assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        }
     }
 
     #[test]
@@ -1654,6 +2163,41 @@ mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn live_text_waits_in_processing_until_reasoning_is_observed() {
+        let (channel, _) = fixture();
+        let (values, worker) = record_bridge(&channel);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17"))
+            .await
+            .unwrap()
+            .unwrap();
+        for (event, state) in [
+            (ProgressEvent::WaitingOnModel, "processing"),
+            (ProgressEvent::Reasoning, "thinking"),
+            (ProgressEvent::WaitingOnModel, "processing"),
+        ] {
+            channel
+                .update_draft_lifecycle("17", &id, event)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if values.lock().last().is_some_and(|value| {
+                        value["type"] == "live_status" && value["text"] == simplex_progress(state)
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        channel.cancel_draft("17", &id).await.unwrap();
+        worker.abort();
+    }
+
     #[tokio::test]
     async fn live_text_coalesces_updates_and_finalizes_without_a_duplicate_send() {
         let (channel, _) = fixture();

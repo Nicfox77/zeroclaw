@@ -155,7 +155,8 @@ async function command(message) {
       socket.on('close', fatal); socket.on('error', fatal);
       setImmediate(() => notes.recover().then(() => live.discover(emit)).catch(fatal));
     } else if (type === 'ping') await rpc('/u');
-    else if (type === 'receive_voice') await notes.receive(message);
+    else if (type === 'receive_voice' || type === 'receive_file') await notes.receive(message);
+    else if (type === 'release_file') await notes.release(message);
     else if (type === 'send') {
       const contact = contactId(Number(message.contact));
       if (message.voice) await notes.send(contact, message.text, message.voice);

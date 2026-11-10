@@ -95,9 +95,12 @@ Enable it on the runtime profile used by your agent:
 enabled = true
 summary_share = 0.15
 trigger_ratio = 0.8
+# Optional: prefill a dedicated loopback llama.cpp primary after publication.
+warm_cache = false
 max_summary_tokens = 1000
-timeout_secs = 60
-# Optional configured model-provider alias; otherwise use the session route.
+timeout_secs = 600
+# Optional configured model-provider alias; otherwise inherit summary_provider,
+# then context_compression.summary_provider, then the session route.
 # provider = "openai.summarizer"
 ```
 
@@ -105,6 +108,16 @@ The default is disabled. Existing `max_context_tokens` and
 `context_compact_ratio` remain the overall budget controls. An explicit zero
 token budget disables automatic deck maintenance as well. Keep
 `max_history_messages` at four or more when enabling the deck.
+
+`timeout_secs` is an inactivity allowance, not a total generation deadline.
+Summaries use streaming inference; nonempty text or reasoning refreshes the
+allowance, while transport keepalives and empty frames do not. Cold prefill is
+silent, so choose an allowance long enough for the slowest expected prefill
+(for example, `1800` for a local model). The default is 600 seconds. The same
+setting bounds waiting to publish a completed card while a foreground turn is
+busy. The deck's explicit `provider` takes precedence over the agent's
+`summary_provider`, then the runtime profile's compression summary provider;
+with none configured, the current session route is used.
 
 The implementation reserves 15% of the resolved input target for request
 overhead, then subtracts the current system messages. `summary_share` divides
@@ -114,6 +127,9 @@ the corresponding fraction of the whole-turn limit. Estimates use roughly
 four UTF-8 bytes per token, including structured tool arguments and reasoning;
 provider capacity enforcement remains authoritative. Source chunks, generated
 responses and the retained deck use the same byte-based fallback.
+Summary prompts state the corresponding UTF-8 byte ceiling and target 80% of it,
+rather than asking the model to guess a tokenizer-independent token count.
+The hard output check still rejects oversized cards without discarding sources.
 
 One background job per session branch freezes an older range of completed
 turns, preserving the two newest turns and their complete tool exchanges.
@@ -123,6 +139,25 @@ discarding their original messages. The generated summary is bounded and
 checked against its captured provider result before publication. The oldest
 cards leave the deck when its token allocation fills. Cards do not recursively
 fold the entire old deck into every new summary.
+
+New summaries are written from the conversational assistant's first-person
+perspective, preserving attribution: “I checked the logs” for its own actions,
+and “Alex asked me…” when the supplied context establishes the user's preferred
+name. Otherwise the summary says “the user.” Plans, tool observations and other
+agents' work must remain distinguishable from completed assistant actions.
+Existing cards and original messages are not rewritten.
+
+Background deck inference also receives current excerpts of the owning agent's
+`IDENTITY.md`, `USER.md` and `SOUL.md`, capped at 1024 UTF-8 bytes per file.
+These optional Markdown references guide names and voice, not claims about
+conversation events or instructions to execute. They are read again for each
+inference call; there is no second editable profile or live identity cache.
+Normal captured provider requests retain the supplied briefing for audit.
+Links outside
+the agent workspace are rejected. Tool instructions, config, and the wider
+memory store are not part of this briefing. AIEOS-only identity is not separately
+rendered into this Markdown briefing; names present in the source conversation
+remain available.
 
 Normal requests continue while inference runs. At the recent-context or turn
 limit, context preparation waits for the pending job. A failed, empty,
@@ -140,10 +175,73 @@ request can schedule fresh summarization. It does not replay a provider or
 tool effect. A completed deck survives restart without regenerating it.
 Live policy and read/effect permissions are rechecked before publication.
 
+When normal session recovery proves that an execution process was lost, an
+unfinished main-provider response with recorded visible text becomes an
+assistant message in the active context, followed by an explicit
+`[Interrupted: ...]` marker. The next turn can see what the assistant had
+partially said. The marker does not claim that planned actions completed or
+that every recorded fragment reached the user. Recovery does not replay tools,
+resume generation, or turn an unknown outcome into a successful completion.
+Reasoning, tool arguments and maintenance-model output are excluded. The
+recovered message references the original text payloads, retaining their
+erasure dependencies; repeated recovery does not add another copy. Existing
+summary cards and prior context references remain in place.
+
+SimpleX also finalizes orphaned live messages in its bounded recent-chat scan
+after native contact authorization. A live message older than an hour is still
+eligible, so a long turn does not leave a permanent live indicator after a
+restart. This display cleanup is separate from restoring model context.
+
 Summaries incur additional model calls. Their provider attempts are captured
 in session history and ordinary completed/failed attempt usage is recorded
 against the agent and session in the existing cost ledger. The foreground
 response's context meter still describes that response, not background usage.
+
+### Warming a local model after summary publication
+
+Set `summary_deck.warm_cache = true` to opt into background prompt-cache warming
+for a dedicated, single-slot (`--parallel 1`) loopback llama.cpp primary provider
+using Chat Completions. Other provider families, a different session model
+override, and previous fallback routes are skipped. This is independent of the
+provider used to generate summaries.
+
+After a card is committed, warming waits for the session's active turn to finish,
+then takes its existing foreground lane. A later arriving turn waits for the
+prefill to finish and can append to its warmed prefix. The warmer reads the latest
+committed context and resolves the system prefix and tool definitions from the
+last admitted main request in the same live authority/config epoch. It does not
+maintain another editable prompt, tool registry or conversation history. If no
+such request exists yet, that warmup is skipped; a future publication can retry.
+Configuration, model-selection, context and authority changes cancel or skip
+warming. No SQLite transaction is held over inference.
+
+The ordinary provider request builder supplies the wire format. A bounded
+one-token request fills the resident KV cache; its generated token is discarded,
+never becomes an assistant message and never executes a tool. Some llama.cpp
+builds sample one token even when zero are requested, so zero-token semantics
+are not assumed. Actual prompt-processing progress renews the summary policy's
+`timeout_secs` inactivity allowance; empty frames and keepalives do not. A failed
+warmup releases the lane without invalidating an already committed summary.
+
+Warming stops before the first image-bearing turn rather than independently
+loading media paths or remote images. That text prefix remains reusable;
+foreground multimodal preparation still authorizes and processes images normally.
+
+For the primary profile, `provider_extra = { cache_prompt = true, id_slot = 0 }`
+can explicitly select the resident slot. llama.cpp's default
+`--sleep-idle-seconds -1` disables idle unloading. `--cache-ram 0` disables the
+additional CPU prompt-cache pool, not the live slot's KV cache. No dummy chat
+keepalives are needed: they could evict useful context. The cache stays resident
+while the server remains running and another request does not replace its prefix.
+A restart, model reload, changing system/tool prompts or another client can still
+invalidate it; this does not add disk snapshots or guarantee cache residency
+across processes. Separate sessions and other API clients do not share the
+session's foreground lock.
+
+Diagnostics record `llamacpp_cache_warm_started`,
+`llamacpp_cache_warm_completed` (prompt/cache/processed token counts and duration),
+and `summary_cache_warm_failed`, without prompt content. Warming is ephemeral and
+does not replay on restart. Disable `warm_cache` and reload to cancel active work.
 
 Turning the policy off stops new automatic summaries and retains the currently
 committed working context. Original history remains readable. Roll back the

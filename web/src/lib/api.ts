@@ -6,6 +6,7 @@ import type {
   Integration,
   DiagResult,
   MemoryEntry,
+  MemoryBackendStatus,
   CostSummary,
   CliTool,
   HealthSnapshot,
@@ -2162,6 +2163,10 @@ export function runDoctor(): Promise<DiagResult[]> {
 // ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
+
+export function getMemoryStatus(): Promise<MemoryBackendStatus> {
+  return apiFetch<MemoryBackendStatus>("/api/memory/status");
+}
 
 export function getMemory(
   query?: string,

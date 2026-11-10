@@ -4,7 +4,7 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_kernel::session::query::{PayloadSelector, SessionAccess, SessionAccessPolicy};
 use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 
-struct Authority(AtomicBool);
+pub(super) struct Authority(pub(super) AtomicBool);
 
 #[tokio::test]
 async fn continuous_main_conversation_survives_expiry_and_rejects_close() {

@@ -10,9 +10,10 @@ pub(super) fn prepare(mut source: ContextSnapshot) -> (ContextSnapshot, Vec<Conv
         }).cloned().collect(),
         history_has_trim_breadcrumb: Some(true),
     };
-    source.messages.push(ConversationMessage::Chat(ChatMessage::user(
-        "Summarize the conversation for continuation. Preserve unresolved requests, decisions, tool outcomes and relevant file references. Return only the summary.",
-    )));
+    source.messages.push(ConversationMessage::Chat(ChatMessage::user(format!(
+        "Summarize the conversation for continuation. Preserve unresolved requests, decisions, tool outcomes and relevant file references. {} Return only the summary.",
+        zeroclaw_api::memory_traits::AGENT_MEMORY_PERSPECTIVE,
+    ))));
     (kept, source.messages)
 }
 

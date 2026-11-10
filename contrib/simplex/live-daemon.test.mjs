@@ -41,15 +41,33 @@ test('daemon receives SimpleX input and delivers live tool narration and final t
     const body=JSON.parse(raw);requests.push(body);
     const messages=body.messages??[],serialized=JSON.stringify(messages);
     const followup=serialized.includes('fixture followup');
-    if(followup){assert(serialized.includes('The **answer** is ready.'));}
+    if(followup){
+      assert(serialized.includes('The **answer** is ready.'));
+      assert(messages.some(m=>m.role==='assistant'&&m.tool_calls?.some(c=>c.function?.name==='memory_recall')),
+        'followup must retain the saved assistant tool call, not just its narration');
+      assert(messages.some(m=>m.role==='tool'),
+        'followup must retain the completed tool result after restoring the main session');
+    }
     assert(!serialized.includes('Processing…')&&!serialized.includes('Thinking…')&&!serialized.includes('Working…'),
       'transport status must not enter model history');
     const toolPhase=!followup&&!messages.some(m=>m.role==='tool');
+    const observedBeforePrefill=observed.length;
     await pause(1300);
+    if(toolPhase){
+      assert(!observed.some(i=>i.text==='Thinking…'),
+        'waiting for the first provider output must remain Processing, not Thinking');
+    }else{
+      assert(!observed.slice(observedBeforePrefill).some(i=>i.text==='Thinking…'),
+        'a request without reasoning must not introduce a Thinking status');
+    }
     assert(body.stream,'SimpleX must request provider streaming');
     res.writeHead(200,{'Content-Type':'text/event-stream'});
     const emit=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({choices:[{index:0,delta,finish_reason}]})+'\n\n');
-    emit({role:'assistant',reasoning_content:'PRIVATE_REASONING_FIXTURE'});
+    emit({role:'assistant'});
+    if(toolPhase){
+      emit({reasoning_content:'PRIVATE_REASONING_FIXTURE'});
+      await pause(750);
+    }
     const fragments=followup?['Continuity ','confirmed.']:toolPhase?['Checking ','now.']:['The **answer**',' is ready.'];
     for(const content of fragments){emit({content});await pause(650);}
     if(toolPhase){emit({tool_calls:[{index:0,id:'fixture-call',type:'function',function:{name:'memory_recall',arguments:'{"query":"fixture"}'}}]});emit({},'tool_calls');}
