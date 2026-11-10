@@ -166,7 +166,20 @@ impl MemorySource for ConfigMemory {
             .config
             .resolved_model_provider_for_agent(request.agent_alias)
             .and_then(|(_, _, entry)| entry.api_key.as_deref());
-        zeroclaw_memory::create_memory_for_agent(request.config, request.agent_alias, api_key).await
+        match request.live_config {
+            Some(live) => {
+                zeroclaw_memory::create_memory_for_agent_live(live, request.agent_alias, api_key)
+                    .await
+            }
+            None => {
+                zeroclaw_memory::create_memory_for_agent(
+                    request.config,
+                    request.agent_alias,
+                    api_key,
+                )
+                .await
+            }
+        }
     }
 }
 

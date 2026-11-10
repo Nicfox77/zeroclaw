@@ -19,6 +19,15 @@ pub trait EngineSessionAuthority: SessionAccessPolicy + PermissionResolver {
     fn session_owner(&self, principal: &PrincipalId) -> Option<String> {
         Some(principal.0.clone())
     }
+    /// Resolve private-memory ownership through this entrance's current identity policy.
+    fn memory_principal(&self, actor: &EventActor) -> Option<String> {
+        match actor {
+            EventActor::Principal { principal_id } => {
+                self.session_owner(&PrincipalId::from(principal_id.clone()))
+            }
+            _ => None,
+        }
+    }
     fn execution_binding(&self, input: &EngineTurnInput) -> Result<PayloadRecord, SessionError>;
     fn maintenance_binding(&self) -> Result<PayloadRecord, SessionError>;
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String>;
@@ -374,6 +383,18 @@ impl TurnExecutorPort for EngineExecutor<'_> {
 }
 #[async_trait::async_trait]
 impl zeroclaw_api::session_events::capture::SessionContextPort for EngineSession {
+    fn memory_principal(&self) -> anyhow::Result<Option<String>> {
+        SessionAccessPolicy::authorize_actor(
+            self.authority.as_ref(),
+            &self.actor,
+            &self.stream,
+            SessionAccess::Read,
+        )?;
+        self.authority
+            .authorize_context(&self.stream, &self.branch)?;
+        Ok(self.authority.memory_principal(&self.actor))
+    }
+
     async fn record_context_input(
         &self,
         input: EngineTurnInput,

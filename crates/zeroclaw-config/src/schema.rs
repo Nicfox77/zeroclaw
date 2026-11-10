@@ -12851,6 +12851,10 @@ pub enum SearchMode {
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
+    /// Exclusive Hindsight long-term memory configuration; unrelated to session history.
+    #[serde(default)]
+    #[nested]
+    pub hindsight: crate::hindsight::HindsightConfig,
     /// Dotted reference to the active storage instance: `<backend>.<alias>`
     /// (e.g. `"sqlite.default"`, `"postgres.work"`). Resolves through
     /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
@@ -13498,6 +13502,7 @@ fn default_response_cache_hot_entries() -> usize {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            hindsight: Default::default(),
             backend: "sqlite".into(),
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
@@ -24358,12 +24363,63 @@ impl Config {
         }
     }
 
+    pub fn validate_hindsight_memory(&self) -> anyhow::Result<()> {
+        let reserved = self.memory.backend.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            !reserved.starts_with("hindsight") || self.memory.backend == "hindsight",
+            "hindsight_backend_requires_exact_name"
+        );
+        let selected = self.memory.backend == "hindsight";
+        anyhow::ensure!(
+            !self.memory.backend.trim().starts_with("hindsight."),
+            "hindsight_backend_has_no_storage_alias"
+        );
+        if selected {
+            self.memory.hindsight.validate()?;
+            anyhow::ensure!(
+                !self.memory.types.enabled
+                    && !self.memory.consolidation_extract_facts
+                    && !self.memory.rerank_enabled
+                    && !self.knowledge.enabled,
+                "hindsight_conflicting_local_memory_processing"
+            );
+            anyhow::ensure!(
+                self.channels.session_persistence && self.channels.session_backend == "sqlite",
+                "hindsight_requires_persistent_native_sqlite_transcripts"
+            );
+        }
+        for agent in self.agents.values() {
+            let hindsight =
+                agent.memory.backend == crate::multi_agent::MemoryBackendKind::Hindsight;
+            anyhow::ensure!(
+                !hindsight || selected,
+                "hindsight_agent_requires_global_backend"
+            );
+            if selected {
+                anyhow::ensure!(
+                    matches!(
+                        agent.memory.backend,
+                        crate::multi_agent::MemoryBackendKind::Hindsight
+                            | crate::multi_agent::MemoryBackendKind::None
+                    ),
+                    "hindsight_backend_must_be_exclusive"
+                );
+                anyhow::ensure!(
+                    agent.workspace.read_memory_from.is_empty(),
+                    "hindsight_shared_bank_grants_unsupported"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        self.validate_hindsight_memory()?;
         if let Some(seconds) = self.pacing.turn_idle_timeout_secs {
             anyhow::ensure!(
                 seconds > 0

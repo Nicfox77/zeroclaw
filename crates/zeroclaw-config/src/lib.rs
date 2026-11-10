@@ -17,6 +17,7 @@ pub mod domain_matcher;
 pub mod env_overrides;
 pub mod field_visibility;
 pub mod helpers;
+pub mod hindsight;
 pub mod live;
 pub mod main_session;
 pub mod message_arrival;

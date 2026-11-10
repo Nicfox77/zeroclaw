@@ -44,6 +44,7 @@ impl Agent {
         let memory = capabilities
             .memory
             .memory(&MemoryRequest {
+                live_config: Some(live_config),
                 config,
                 agent_alias,
             })

@@ -78,6 +78,20 @@ impl Memory for PrincipalPlaneMemory {
         Some(self.scope.clone())
     }
 
+    async fn recall_context(
+        &self,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.inner
+            .recall_context_for_principal(&self.scope, query, question, limit, session)
+            .await
+    }
+    async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.inner.reflect_for_principal(&self.scope, query).await
+    }
     async fn store(
         &self,
         key: &str,

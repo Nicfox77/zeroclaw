@@ -2607,6 +2607,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             "/api/doctor",
             get(api::handle_api_doctor).post(api::handle_api_doctor),
         )
+        .route("/api/memory/status", get(api::handle_api_memory_status))
         .route("/api/memory", get(api::handle_api_memory_list))
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))

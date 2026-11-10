@@ -638,7 +638,17 @@ async fn handle_socket(
     // construction is deferred until after the optional `connect` frame so the
     // client can provide a per-session cwd for the security sandbox root.
     let config = state.config.read().clone();
-    let ws_memory = match resolve_ws_memory_handle(&config, &agent_alias).await {
+    let ws_memory = match async {
+        if config.memory.backend.trim() == "hindsight" {
+            zeroclaw_memory::create_memory_for_agent_live(&state.config, &agent_alias, None)
+                .await
+                .map(Some)
+        } else {
+            resolve_ws_memory_handle(&config, &agent_alias).await
+        }
+    }
+    .await
+    {
         Ok(memory) => memory,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -2459,7 +2469,7 @@ async fn process_chat_message(
         Ok(outcome) => {
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
-            if state.auto_save {
+            if state.auto_save && state.config.read().memory.backend.trim() != "hindsight" {
                 if let Some(mem) = ws_memory.clone() {
                     // Read the live provider/model AFTER the turn: a
                     // mid-session model switch replaces the agent's active

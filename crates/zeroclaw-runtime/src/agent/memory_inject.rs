@@ -100,6 +100,21 @@ impl MemoryInjectConfig {
         memory: &zeroclaw_config::schema::MemoryConfig,
         limit: usize,
     ) -> Self {
+        if memory.backend == "hindsight" {
+            let chars = memory.hindsight.recall_max_tokens.saturating_mul(4);
+            return Self {
+                limit: if memory.hindsight.auto_recall {
+                    limit
+                } else {
+                    0
+                },
+                max_entries: limit,
+                entry_max_chars: chars,
+                max_total_chars: chars,
+                date_stamp: true,
+                ..Default::default()
+            };
+        }
         let limit = if memory.rerank_enabled {
             rerank::bounded_final_limit(limit)
         } else {
@@ -295,12 +310,23 @@ pub async fn recall_memory_context(
     turn: TurnMeta<'_>,
     retained: &[ChatMessage],
 ) -> RecalledMemoryContext {
+    if cfg.limit == 0 {
+        return RecalledMemoryContext {
+            entries: Vec::new(),
+        };
+    }
     let backend = mem.name().to_string();
     let query_summary = make_query_summary(user_msg);
 
     // Over-fetch a larger candidate pool only when reranking is enabled;
     // otherwise recall exactly `limit` so the default path is unchanged.
-    let recall_limit = if cfg.rerank_enabled {
+    let recall_limit = if cfg.rerank_enabled
+        && !matches!(
+            mem.role(),
+            zeroclaw_api::attribution::Role::Memory(
+                zeroclaw_api::attribution::MemoryKind::Hindsight
+            )
+        ) {
         let requested_pool = cfg
             .limit
             .saturating_mul(cfg.candidate_multiplier)
@@ -321,9 +347,39 @@ pub async fn recall_memory_context(
     } else {
         sessions
     };
+    let retrieval_query = if matches!(
+        mem.role(),
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::Hindsight)
+    ) {
+        let context: Vec<_> = retained
+            .iter()
+            .rev()
+            .filter(|message| {
+                matches!(message.role.as_str(), "user" | "assistant") && message.content != user_msg
+            })
+            .take(2)
+            .collect();
+        let recent = context
+            .into_iter()
+            .rev()
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    message.role,
+                    truncate_with_ellipsis(&message.content, 512)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Current question: {user_msg}\n\nRecent conversation (retrieval context only):\n{recent}"
+        )
+    } else {
+        user_msg.to_owned()
+    };
     for session_id in scopes {
         match mem
-            .recall(user_msg, recall_limit, *session_id, None, None)
+            .recall_context(&retrieval_query, user_msg, recall_limit, *session_id)
             .await
         {
             Ok(recalled) => {
@@ -352,7 +408,14 @@ pub async fn recall_memory_context(
         turn_id: Some(turn.turn_id.to_string()),
     });
 
-    if cfg.rerank_enabled {
+    if cfg.rerank_enabled
+        && !matches!(
+            mem.role(),
+            zeroclaw_api::attribution::Role::Memory(
+                zeroclaw_api::attribution::MemoryKind::Hindsight
+            )
+        )
+    {
         // Relevance plane: blend (retrieval + importance + recency), collapse
         // near-duplicates, optionally diversify via MMR, apply the floor, and
         // trim back to the recall limit. The blend's recency factor subsumes
@@ -366,7 +429,10 @@ pub async fn recall_memory_context(
             }
             !should_skip_entry(&entry.key, &entry.content)
         });
-    } else {
+    } else if !matches!(
+        mem.role(),
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::Hindsight)
+    ) {
         // Older non-Core memories score lower; Core is evergreen.
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
     }

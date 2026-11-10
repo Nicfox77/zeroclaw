@@ -325,6 +325,41 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         None
     }
 
+    /// Automatic prompt retrieval, with the current question separate from
+    /// bounded immediate context. Legacy backends retain ordinary recall.
+    async fn recall_context(
+        &self,
+        query: &str,
+        _question: &str,
+        limit: usize,
+        session: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall(query, limit, session, None, None).await
+    }
+    async fn recall_context_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        _question: &str,
+        limit: usize,
+        session: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_for_principal(scope, query, limit, session, None, None)
+            .await
+    }
+
+    /// Native long-term synthesis. Backends without reflection fail explicitly.
+    async fn reflect(&self, _query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("memory_reflection_unsupported")
+    }
+    async fn reflect_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _query: &str,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("memory_reflection_unsupported")
+    }
+
     /// Store a memory entry, optionally scoped to a session
     async fn store(
         &self,

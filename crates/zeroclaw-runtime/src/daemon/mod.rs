@@ -724,6 +724,18 @@ pub async fn run_with_authority(
     Option<crate::live_config_authority::ConfigOwnershipGuard>,
 )> {
     let config = live_config_authority.snapshot_config();
+    let hindsight_runtime = match zeroclaw_memory::hindsight::runtime::Managed::start(
+        live_config_authority.live_handle(),
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            crate::health::mark_component_error("hindsight", error.to_string());
+            None
+        }
+    };
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -1508,6 +1520,11 @@ pub async fn run_with_authority(
         libc::malloc_trim(0);
     }
 
+    if let Some(runtime) = hindsight_runtime
+        && runtime.shutdown().await.is_err()
+    {
+        crate::health::mark_component_error("hindsight", "hindsight_managed_shutdown_failed");
+    }
     exit_result.map(|exit| (exit, transferred_ownership))
 }
 
@@ -2720,6 +2737,7 @@ async fn run_heartbeat_worker(
                     );
                     // Consolidate heartbeat output to memory for cross-session awareness.
                     if config.memory.auto_save
+                        && config.memory.backend.trim() != "hindsight"
                         && output.chars().count() >= 50
                         && let Some(ref mem) = heartbeat_memory
                     {

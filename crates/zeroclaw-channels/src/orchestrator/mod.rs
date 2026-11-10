@@ -17449,8 +17449,8 @@ pub async fn start_channels_with_history(
         }
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            &config,
+        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent_live(
+            &config_arc,
             agent_alias,
             provider_api_key.as_deref(),
         )

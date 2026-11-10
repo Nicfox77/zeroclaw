@@ -1075,32 +1075,92 @@ async fn resolve_memory_handle(
     state: &AppState,
     agent_alias: Option<&str>,
 ) -> Result<std::sync::Arc<dyn zeroclaw_memory::Memory>, (StatusCode, Json<serde_json::Value>)> {
-    let alias = match agent_alias.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(a) => a,
-        None => return Ok(state.mem.clone()),
-    };
     let config = state.config.read().clone();
+    let hindsight = config.memory.backend == "hindsight";
+    let explicit = agent_alias.map(str::trim).filter(|s| !s.is_empty());
+    let inferred = if hindsight && explicit.is_none() {
+        let mut enabled = config.agents.iter().filter(|(_, a)| {
+            a.enabled
+                && a.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight
+        });
+        match (enabled.next(), enabled.next()) {
+            (Some((alias, _)), None) => Some(alias.as_str()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let alias = match explicit.or(inferred) {
+        Some(alias) => alias,
+        None if !hindsight => return Ok(state.mem.clone()),
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"hindsight_agent_selection_required"})),
+            ));
+        }
+    };
     if config.agent(alias).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!(
-                "Unknown agent {alias:?} (no [agents.{alias}] entry configured)"
-            )})),
+            Json(serde_json::json!({"error":"unknown_memory_agent"})),
         ));
     }
-    let api_key = config
+    if hindsight && !config.gateway.require_pairing {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error":"hindsight_dashboard_requires_authenticated_operator"}),
+            ),
+        ));
+    }
+    let key = config
         .resolved_model_provider_for_agent(alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")}),
-                ),
-            )
-        })
+        .and_then(|(_, _, p)| p.api_key.clone());
+    let memory =
+        zeroclaw_memory::create_memory_for_agent_live(&state.config, alias, key.as_deref())
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"memory_backend_construction_failed"})),
+                )
+            })?;
+    if hindsight {
+        // These routes admit PairingGuard's installation operator, not OIDC
+        // principals. They never accept a caller-supplied private bank id.
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new(
+            zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR,
+        )
+        .with_agent(Some(alias.into()));
+        Ok(std::sync::Arc::new(
+            zeroclaw_memory::principal_plane::PrincipalPlaneMemory::new(memory, scope),
+        ))
+    } else {
+        Ok(memory)
+    }
+}
+
+/// GET /api/memory/status — credentials and private memory content are excluded.
+pub async fn handle_api_memory_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = require_auth(&state, &headers) {
+        return error.into_response();
+    }
+    let config = state.config.read().clone();
+    if config.memory.backend != "hindsight" {
+        return Json(serde_json::json!({"backend":config.memory.backend,"available":state.mem.health_check().await})).into_response();
+    }
+    match zeroclaw_memory::hindsight::runtime::status(&config).await {
+        Ok(status) => Json(status).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"backend":"hindsight","error":"hindsight_status_unavailable"})),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/memory — list or search memory entries

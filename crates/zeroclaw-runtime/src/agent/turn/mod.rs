@@ -4177,9 +4177,15 @@ pub(crate) async fn step_agent_memory(
     alias: &str,
     api_key: Option<&str>,
     owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    live: Option<&zeroclaw_config::live::LiveConfigHandle>,
 ) -> Result<Arc<dyn zeroclaw_memory::Memory>> {
     Ok(owned_step_memory(
-        zeroclaw_memory::create_memory_for_agent(config, alias, api_key).await?,
+        match live {
+            Some(live) => {
+                zeroclaw_memory::create_memory_for_agent_live(live, alias, api_key).await?
+            }
+            None => zeroclaw_memory::create_memory_for_agent(config, alias, api_key).await?,
+        },
         alias,
         owner,
     ))
@@ -4286,7 +4292,9 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             ))
         })?;
     let memory = owned_step_memory(
-        capabilities.agent_memory(config, alias).await?,
+        capabilities
+            .agent_memory_with_policy(config, alias, live_config.as_ref())
+            .await?,
         alias,
         memory_owner,
     );
