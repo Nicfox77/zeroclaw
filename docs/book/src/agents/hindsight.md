@@ -37,6 +37,11 @@ uncertain acknowledgments. Appends are serialized per stream; backoff and manual
 retry cannot let a newer turn overtake an older one. Historical imports enqueue
 before live capture resumes for that stream.
 
+Each message's original text is redacted and screened before JSON encoding.
+Screening does not join message boundaries or treat JSON-escaped newlines as
+ordinary characters. Disallowed source text still blocks delivery; a rejected
+turn remains in the durable queue and prevents later appends from overtaking it.
+
 Speaker labels resolve at delivery time from dedicated structured configuration:
 
 ```toml

