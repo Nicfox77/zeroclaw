@@ -129,6 +129,10 @@ impl HindsightMemory {
     }
     fn check_sources(&self, bank: &str) -> anyhow::Result<()> {
         self.policy()?;
+        anyhow::ensure!(
+            !self.ledger.rebuild_pending(bank)?,
+            "hindsight_conversation_erasure_rebuild_pending"
+        );
         let live = self
             .policy
             .as_ref()
@@ -238,8 +242,22 @@ impl HindsightMemory {
                 .agent
                 .as_ref()
                 .ok_or_else(|| anyhow::Error::msg("hindsight_agent_scope_required"))?;
-            let workspace = live.read().agent_workspace_dir(alias);
-            eligible_content(&zeroclaw_infra::memory_orientation::load(&workspace)?)
+            let (workspace, names) = {
+                let config = live.read();
+                (
+                    config.agent_workspace_dir(alias),
+                    zeroclaw_config::speakers::resolve(
+                        &config,
+                        alias,
+                        zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR,
+                    )?,
+                )
+            };
+            eligible_content(&format!(
+                "{}\n{}",
+                names.orientation(),
+                zeroclaw_infra::memory_orientation::load(&workspace)?
+            ))
         } else {
             String::new()
         };
@@ -475,6 +493,7 @@ impl HindsightMemory {
             metadata.insert("session_id".into(), session.into());
         }
         let item = Item {
+            update_mode: None,
             content,
             document_id: document,
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -1216,6 +1235,7 @@ mod service_tests {
             .retain(
                 &bank,
                 &[Item {
+                    update_mode: None,
                     content: source.into(),
                     document_id: document,
                     timestamp: chrono::Utc::now().to_rfc3339(),

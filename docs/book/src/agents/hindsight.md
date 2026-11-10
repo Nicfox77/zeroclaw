@@ -25,6 +25,84 @@ SQLite memories. Upstream adoption needs review against
 6. Retrieved evidence uses the existing structured, retained memory blocks. It is
    not ingested again as new source material.
 
+### Growing conversation documents
+
+Each agent/principal/conversation/branch has one stable Hindsight document. The
+background worker sends only the next completed turn with `update_mode: append`.
+Its content is a JSON array of messages with `role`, `speaker`, `content`, original
+RFC 3339 `timestamp`, `event_id`, and `turn_id`. Hindsight merges these arrays into
+one valid conversation array. It does not receive a growing full transcript from
+ZeroClaw on every request. Delivery UUIDs remain per turn and are reused after
+uncertain acknowledgments. Appends are serialized per stream; backoff and manual
+retry cannot let a newer turn overtake an older one. Historical imports enqueue
+before live capture resumes for that stream.
+
+Speaker labels resolve at delivery time from dedicated structured configuration:
+
+```toml
+[operator]
+display_name = "Alex"
+
+[agents.assistant]
+display_name = "Nova"
+```
+
+These settings create display metadata only. They never grant access, join
+accounts, or change principal IDs, bank IDs, or session ownership. The operator
+name applies only to the implicit installation operator; unrelated principals
+keep `User`. An empty agent display name falls back to the selected AIEOS
+`identity.names` (nickname, full name, first name, last name), then the agent
+alias. Runtime identity prompts and speaker labels share the same AIEOS name
+normalization. Explicit display names override AIEOS naming for these transcripts;
+AIEOS remains canonical when there is no override. Missing operator names use
+`User`. No name is inferred from Markdown or prose, and no name cache is kept.
+Changing or reformatting `IDENTITY.md` / `USER.md` cannot change these labels.
+
+The summary engine receives the same resolved names and its existing bounded
+identity references. Original transcript speakers keep names and roles; only
+newly generated memories and summaries use the assistant's first-person voice.
+AIEOS describes the agent, not its human operator; its `metadata.username` is
+also an agent identifier. Adopting AIEOS does not fill the operator setting.
+
+Hindsight requires source-text storage for append mode (upstream defaults to
+`HINDSIGHT_API_STORE_DOCUMENT_TEXT=true`). Its stored conversation is a derived
+memory source; SQLite remains canonical. Hindsight chunks the combined document
+and skips unchanged chunks. Extraction sees the chunks being processed, **not the
+entire endless conversation on every append**. JSON message boundaries provide
+neighboring context within those chunks; they do not guarantee cross-chunk
+reasoning.
+
+Prompt caching and delta extraction are separate optimizations. In tested
+Hindsight 1.2.0, extraction supplies a stable instruction/schema prefix to its
+provider caching interface; changing bank missions and source content remain in
+the request body after that prefix. Gemini can use explicit cache handles,
+Anthropic uses cache markers, and compatible automatic-cache providers can reuse
+matching leading tokens. MiniMax uses the OpenAI-compatible adapter: actual cache
+hits and billing depend on MiniMax, and no cache-hit rate is promised. Hindsight
+records cached-token usage when the provider reports it. The local MiniMax
+validation reported nonzero cached tokens for `retain_extract_facts`; this
+confirms cache use in that run, not a guaranteed rate for future requests. This is not one ongoing
+provider conversation or a guaranteed conversation-wide KV cache.
+
+Source erasure fences retrieval for the bank, drains in-flight appends, deletes
+the affected conversation document, and replays surviving canonical turn
+references in order under a new durable operation generation. It then clears and
+refreshes mental models before unfencing retrieval. Rebuild intent, phase, and
+UUIDs survive restarts; failed replay does not expose stale evidence or switch
+backends.
+
+**Upgrade from the earlier per-turn document format:** do not merely remove the
+turn suffix from an existing delivery receipt. Back up the Hindsight PostgreSQL
+store and delivery ledger, stop ingestion, delete only the explicitly selected
+agent/principal bank through Hindsight's native bank API, and reset that bank's
+conversation delivery receipts for an explicit chronological backfill. Preserve
+the agent/bank identity mapping, canonical archive, and summary data. This
+operator-approved rebuild intentionally discards derived memories in that bank,
+including manual notes/models; export anything that cannot be reconstructed
+before using it. An old pending receipt whose document ID no longer matches
+fails with `hindsight_document_format_requires_explicit_reimport` rather than
+silently replacing a different document.
+
 `<data_dir>/hindsight/delivery.db` holds agent/bank identities, transcript cursors,
 operation UUIDs, ingestion status, erasure frontiers, and backfill intents. It has
 no vectors, memory-search implementation, or substitute recall path. Standalone

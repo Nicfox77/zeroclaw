@@ -14,6 +14,7 @@ use std::{
 struct ServerState {
     drop_ack: bool,
     retain_posts: usize,
+    retained: Vec<serde_json::Value>,
     retry_posts: usize,
     deletes: usize,
     operation: Option<String>,
@@ -86,6 +87,7 @@ impl FaultApi {
                 let mut s = shared.lock().unwrap();
                 let (code, response) = if method == "POST" && path.ends_with("/memories") {
                     s.retain_posts += 1;
+                    s.retained.push(body.clone());
                     s.operation = Some(body["operation_id"].as_str().unwrap().into());
                     if s.status.is_empty() {
                         s.status = "processing".into();
@@ -179,6 +181,7 @@ impl TranscriptSource for Source {
     async fn load(&self, _stream: &Stream, _terminal: &str) -> anyhow::Result<Option<Vec<Item>>> {
         Ok((!self.erased.load(Ordering::Relaxed)).then(|| {
             vec![Item {
+                update_mode: None,
                 content: "User: The fictional Larch project uses SQLite.".into(),
                 document_id: "fixture-document".into(),
                 timestamp: "2026-01-01T00:00:00Z".into(),
@@ -282,4 +285,126 @@ async fn extraction_outage_requires_retry_and_erasure_waits_for_retain_and_model
         1
     );
     assert_eq!(server.state.lock().unwrap().retain_posts, 1);
+}
+
+#[derive(Default)]
+struct ConversationSource {
+    erased: AtomicBool,
+}
+#[async_trait::async_trait]
+impl TranscriptSource for ConversationSource {
+    async fn revision(&self, _stream: &Stream) -> anyhow::Result<String> {
+        Ok(if self.erased.load(Ordering::Relaxed) {
+            "revision-2"
+        } else {
+            "revision-1"
+        }
+        .into())
+    }
+    async fn next(&self, stream: &Stream) -> anyhow::Result<Vec<SourceEvent>> {
+        Ok((1..=2)
+            .filter(|n| *n > stream.cursor)
+            .map(|n| SourceEvent {
+                sequence: n,
+                occurred_at: n as i64,
+                committed_turn: Some(format!("turn-{n}")),
+            })
+            .collect())
+    }
+    async fn load(&self, _stream: &Stream, terminal: &str) -> anyhow::Result<Option<Vec<Item>>> {
+        if terminal == "turn-1" && self.erased.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(Some(vec![Item {update_mode:Some("append".into()),document_id:"zeroclaw:conversation:fixture".into(),
+            content:serde_json::json!([{"role":"user","speaker":"Alex","content":terminal,"timestamp":"2026-01-01T00:00:00Z"}]).to_string(),
+            timestamp:"2026-01-01T00:00:00Z".into(),context:"fixture".into(),metadata:Default::default()}]))
+    }
+}
+#[tokio::test]
+async fn conversation_appends_reconcile_lost_ack_and_rebuild_only_surviving_turns() {
+    let server = FaultApi::start();
+    server.state.lock().unwrap().drop_ack = true;
+    let dir = tempfile::tempdir().unwrap();
+    register(dir.path());
+    let source = ConversationSource::default();
+    let live = zeroclaw_config::live::LiveConfig::new(config(dir.path(), &server.url));
+    tick(&live.handle(), &source).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().retain_posts, 1);
+    server.state.lock().unwrap().status = "completed".into();
+    let ledger = Ledger::open(dir.path()).unwrap();
+    ledger.retry_pending().unwrap();
+    tick(&live.handle(), &source).await.unwrap();
+    tick(&live.handle(), &source).await.unwrap();
+    ledger.retry_pending().unwrap();
+    tick(&live.handle(), &source).await.unwrap();
+    assert_eq!(ledger.delivery_counts().unwrap()["completed"], 2);
+    assert_eq!(server.state.lock().unwrap().retain_posts, 2);
+    source.erased.store(true, Ordering::Relaxed);
+    tick(&live.handle(), &source).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().deletes, 1);
+    assert_eq!(server.state.lock().unwrap().retain_posts, 3);
+    let bank = ledger
+        .operation_source(server.state.lock().unwrap().operation.as_deref().unwrap())
+        .unwrap()
+        .0;
+    assert!(ledger.rebuild_pending(&bank).unwrap());
+    ledger.retry_pending().unwrap();
+    // Reopen the live policy and delivery ledger during replay.
+    let restarted = zeroclaw_config::live::LiveConfig::new(config(dir.path(), &server.url));
+    for _ in 0..3 {
+        tick(&restarted.handle(), &source).await.unwrap();
+    }
+    assert!(
+        !Ledger::open(dir.path())
+            .unwrap()
+            .rebuild_pending(&bank)
+            .unwrap()
+    );
+    let s = server.state.lock().unwrap();
+    assert_eq!(
+        s.retained[0]["items"][0]["document_id"],
+        s.retained[2]["items"][0]["document_id"]
+    );
+    assert_eq!(s.retained[2]["items"][0]["update_mode"], "append");
+    assert_ne!(s.retained[1]["operation_id"], s.retained[2]["operation_id"]);
+    assert!(
+        s.retained[2]["items"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("turn-2")
+    );
+    assert!(
+        !s.retained[2]["items"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("turn-1")
+    );
+}
+
+#[tokio::test]
+async fn missing_uncertain_append_is_not_proof_that_its_writer_was_cancelled() {
+    let server = FaultApi::start();
+    let dir = tempfile::tempdir().unwrap();
+    register(dir.path());
+    let source = ConversationSource::default();
+    let live = zeroclaw_config::live::LiveConfig::new(config(dir.path(), &server.url));
+    tick(&live.handle(), &source).await.unwrap();
+    let operation = server.state.lock().unwrap().operation.take().unwrap();
+    source.erased.store(true, Ordering::Relaxed);
+    tick(&live.handle(), &source).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().deletes, 0);
+    let ledger = Ledger::open(dir.path()).unwrap();
+    assert_eq!(ledger.rebuilds().unwrap()[0].phase, "draining");
+    assert_eq!(
+        ledger.status(&operation).unwrap().as_deref(),
+        Some("processing")
+    );
+    {
+        let mut state = server.state.lock().unwrap();
+        state.operation = Some(operation);
+        state.status = "completed".into();
+    }
+    tick(&live.handle(), &source).await.unwrap();
+    tick(&live.handle(), &source).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().deletes, 1);
 }

@@ -32,6 +32,17 @@ pub struct Backfill {
     pub until: Option<i64>,
 }
 
+/// A durable document rebuild intent. Generation is the canonical identity of
+/// this rewrite, so replay never reuses an append operation from the deleted body.
+#[derive(Clone, Debug)]
+pub struct Rebuild {
+    pub stream: String,
+    pub bank: String,
+    pub document: String,
+    pub generation: String,
+    pub phase: String,
+}
+
 pub struct Note {
     pub operation: String,
     pub agent: String,
@@ -88,6 +99,9 @@ impl Ledger {
             )?;
         }
         schema.execute_batch("CREATE INDEX IF NOT EXISTS delivery_active ON deliveries(status,next_attempt,sequence);
+            CREATE TABLE IF NOT EXISTS conversation_rebuilds(stream TEXT PRIMARY KEY,bank TEXT NOT NULL,document TEXT NOT NULL,generation TEXT NOT NULL,phase TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS rebuild_bank ON conversation_rebuilds(bank,phase);
+            CREATE INDEX IF NOT EXISTS delivery_order ON deliveries(stream,sequence,status);
             CREATE TABLE IF NOT EXISTS erasure_refreshes(delivery TEXT NOT NULL,model TEXT NOT NULL,operation TEXT NOT NULL,PRIMARY KEY(delivery,model));
             CREATE INDEX IF NOT EXISTS delivery_stream ON deliveries(stream,sequence);
             CREATE INDEX IF NOT EXISTS delivery_operation ON deliveries(operation,checked_revision,status);
@@ -164,11 +178,16 @@ impl Ledger {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         let mut q = c.prepare("SELECT bank_id FROM banks ORDER BY bank_id LIMIT 100")?;
+        let rebuilds: usize = c.query_row(
+            "SELECT count(*) FROM conversation_rebuilds WHERE phase!='completed'",
+            [],
+            |r| r.get(0),
+        )?;
         let banks = q
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(
-            serde_json::json!({"operations":activity,"last_successful_retain":last_retain,"pending_backfills":backfills,"delivery_errors":errors,"banks":banks}),
+            serde_json::json!({"operations":activity,"last_successful_retain":last_retain,"pending_backfills":backfills,"pending_conversation_rebuilds":rebuilds,"delivery_errors":errors,"banks":banks}),
         )
     }
     pub fn register_stream(
@@ -255,7 +274,9 @@ impl Ledger {
             .connection
             .lock()
             .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
-        let mut q = c.prepare("SELECT identity,stream,terminal,operation,status FROM deliveries WHERE (status IN ('pending','processing','retry_requested') OR (status='failed' AND ?1)) AND next_attempt<=unixepoch() ORDER BY rowid LIMIT ?2")?;
+        // One outstanding append per stream, even while its predecessor is in
+        // backoff or requires manual retry. Later appends must not overtake it.
+        let mut q = c.prepare("SELECT d.identity,d.stream,d.terminal,d.operation,d.status FROM deliveries d WHERE (d.status IN ('pending','processing','retry_requested') OR (d.status='failed' AND ?1)) AND d.next_attempt<=unixepoch() AND NOT EXISTS(SELECT 1 FROM deliveries previous WHERE previous.stream=d.stream AND previous.sequence<d.sequence AND previous.status NOT IN ('completed','erased')) AND NOT EXISTS(SELECT 1 FROM conversation_rebuilds r WHERE r.stream=d.stream AND r.phase IN ('draining','refreshing')) ORDER BY d.sequence,d.rowid LIMIT ?2")?;
         Ok(q.query_map(params![retry_failed, limit], |r| {
             Ok(Delivery {
                 id: r.get(0)?,
@@ -266,6 +287,116 @@ impl Ledger {
             })
         })?
         .collect::<Result<_, _>>()?)
+    }
+    pub fn stream_backfilling(&self, stream: &str) -> anyhow::Result<bool> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM backfills WHERE stream=?1 AND status='pending')",
+            [stream],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn generation(&self, stream: &str) -> anyhow::Result<String> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        Ok(c.query_row(
+            "SELECT generation FROM conversation_rebuilds WHERE stream=?1",
+            [stream],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+    }
+    pub fn has_legacy_sources(&self, stream: &str) -> anyhow::Result<bool> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM deliveries d JOIN operations o ON d.operation=o.operation_id WHERE d.stream=?1 AND d.status!='erased' AND o.document_id NOT LIKE 'zeroclaw:conversation:%')", [stream], |r|r.get(0))?)
+    }
+    pub fn begin_rebuild(&self, stream: &str, bank: &str, document: &str) -> anyhow::Result<()> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO conversation_rebuilds(stream,bank,document,generation,phase) VALUES(?1,?2,?3,?4,'draining') ON CONFLICT(stream) DO UPDATE SET generation=excluded.generation,phase='draining' WHERE conversation_rebuilds.phase!='draining'",params![stream,bank,document,uuid::Uuid::new_v4().to_string()])?;
+        tx.execute("DELETE FROM source_audits WHERE bank_id=?1", [bank])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn rebuilds(&self) -> anyhow::Result<Vec<Rebuild>> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        let mut q=c.prepare("SELECT stream,bank,document,generation,phase FROM conversation_rebuilds WHERE phase!='completed' LIMIT 32")?;
+        Ok(q.query_map([], |r| {
+            Ok(Rebuild {
+                stream: r.get(0)?,
+                bank: r.get(1)?,
+                document: r.get(2)?,
+                generation: r.get(3)?,
+                phase: r.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?)
+    }
+    pub fn rebuild_pending(&self, bank: &str) -> anyhow::Result<bool> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM conversation_rebuilds WHERE bank=?1 AND phase!='completed')",[bank],|r|r.get(0))?)
+    }
+    pub fn draining_operations(&self, stream: &str) -> anyhow::Result<Vec<String>> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        let mut q=c.prepare("SELECT o.operation_id FROM operations o JOIN deliveries d ON d.operation=o.operation_id WHERE d.stream=?1 AND o.status NOT IN ('completed','failed','cancelled') LIMIT 16")?;
+        Ok(q.query_map([stream], |r| r.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
+    /// Called only after the upstream document has been deleted. Atomic reset
+    /// leaves source references intact and allocates fresh append UUIDs on replay.
+    pub fn replay_rebuild(&self, rebuild: &Rebuild) -> anyhow::Result<()> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE deliveries SET status='erased',checked_revision=NULL WHERE stream=?1 AND status='erasing'",[&rebuild.stream])?;
+        tx.execute("UPDATE deliveries SET status='pending',operation=NULL,checked_revision=NULL,next_attempt=0,attempts=0,error_key=NULL WHERE stream=?1 AND status!='erased'",[&rebuild.stream])?;
+        tx.execute(
+            "UPDATE conversation_rebuilds SET phase='replaying' WHERE stream=?1 AND generation=?2",
+            params![rebuild.stream, rebuild.generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn replay_complete(&self, stream: &str) -> anyhow::Result<bool> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        Ok(c.query_row("SELECT NOT EXISTS(SELECT 1 FROM deliveries WHERE stream=?1 AND status NOT IN ('completed','erased'))",[stream],|r|r.get(0))?)
+    }
+    pub fn rebuild_phase(&self, rebuild: &Rebuild, phase: &str) -> anyhow::Result<()> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        c.execute(
+            "UPDATE conversation_rebuilds SET phase=?1 WHERE stream=?2 AND generation=?3",
+            params![phase, rebuild.stream, rebuild.generation],
+        )?;
+        Ok(())
     }
     pub fn delivery_state(
         &self,
@@ -448,6 +579,11 @@ impl Ledger {
         // The proof and receipt are one transaction: a concurrently attached
         // source must not invalidate the proof before a stale receipt is saved.
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rebuilding: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversation_rebuilds WHERE bank=?1 AND phase!='completed')",[bank],|r|r.get(0))?;
+        anyhow::ensure!(
+            !rebuilding,
+            "hindsight_conversation_erasure_rebuild_pending"
+        );
         let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deliveries d JOIN operations o ON d.operation=o.operation_id WHERE o.bank_id=?1 AND d.status!='erased' AND (d.status='erasing' OR d.checked_revision IS NULL OR d.checked_revision!=?2))",params![bank,revision],|r|r.get(0))?;
         anyhow::ensure!(!blocked, "hindsight_source_erasure_reconciliation_pending");
         tx.execute("INSERT INTO source_audits(bank_id,revision) VALUES(?1,?2) ON CONFLICT(bank_id) DO UPDATE SET revision=excluded.revision",params![bank,revision])?;
@@ -743,6 +879,85 @@ pub fn hash(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn ordered_appends_block_overtaking_even_during_backoff_and_manual_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(dir.path()).unwrap();
+        ledger
+            .register_stream("a", "owner", "session", "branch", 0)
+            .unwrap();
+        let stream = ledger.streams().unwrap().remove(0);
+        ledger.advance(&stream, 1, Some("first"), 16).unwrap();
+        ledger.advance(&stream, 2, Some("second"), 16).unwrap();
+        let jobs = ledger.pending(16, true).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].terminal, "first");
+        ledger
+            .delivery_state(&jobs[0].id, "failed", None, Some("outage"))
+            .unwrap();
+        assert!(ledger.pending(16, false).unwrap().is_empty());
+        assert!(ledger.pending(16, true).unwrap().is_empty());
+        ledger
+            .delivery_state(&jobs[0].id, "completed", None, None)
+            .unwrap();
+        assert_eq!(ledger.pending(16, true).unwrap()[0].terminal, "second");
+    }
+    #[test]
+    fn conversation_rebuild_survives_restart_fences_bank_and_reuses_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(dir.path()).unwrap();
+        ledger
+            .register_stream("a", "owner", "session", "branch", 0)
+            .unwrap();
+        let stream = ledger.streams().unwrap().remove(0);
+        ledger.advance(&stream, 1, Some("first"), 16).unwrap();
+        ledger.advance(&stream, 2, Some("second"), 16).unwrap();
+        let first = ledger.pending(16, true).unwrap().remove(0);
+        let original = ledger.operation("bank", "document", &first.id).unwrap();
+        ledger
+            .attach_validated_source(&first.id, &original, "revision")
+            .unwrap();
+        ledger
+            .delivery_state(&first.id, "completed", None, None)
+            .unwrap();
+        let second = ledger.pending(16, true).unwrap().remove(0);
+        ledger
+            .delivery_state(&second.id, "erasing", None, None)
+            .unwrap();
+        ledger
+            .begin_rebuild(&stream.id, "bank", "document")
+            .unwrap();
+        assert!(ledger.pending(16, true).unwrap().is_empty());
+        assert!(ledger.rebuild_pending("bank").unwrap());
+        assert!(ledger.record_source_audit("bank", "revision").is_err());
+        let generation = ledger.generation(&stream.id).unwrap();
+        assert!(!generation.is_empty());
+        drop(ledger);
+        let ledger = Ledger::open(dir.path()).unwrap();
+        let rebuild = ledger.rebuilds().unwrap().remove(0);
+        assert_eq!(rebuild.generation, generation);
+        ledger.replay_rebuild(&rebuild).unwrap();
+        let replay = ledger.pending(16, true).unwrap().remove(0);
+        assert_eq!(replay.terminal, "first");
+        let new = ledger
+            .operation("bank", "document", &format!("{}:{generation}", replay.id))
+            .unwrap();
+        assert_ne!(new, original);
+        assert_eq!(
+            ledger
+                .operation("bank", "document", &format!("{}:{generation}", replay.id))
+                .unwrap(),
+            new
+        );
+        ledger
+            .delivery_state(&replay.id, "completed", None, None)
+            .unwrap();
+        assert!(ledger.replay_complete(&stream.id).unwrap());
+        ledger.rebuild_phase(&rebuild, "completed").unwrap();
+        assert!(!ledger.rebuild_pending("bank").unwrap());
+        assert_eq!(ledger.generation(&stream.id).unwrap(), generation);
+    }
+
+    #[test]
     fn scope_binding_and_idempotency_survive_reopen_without_storing_content() {
         let d = tempfile::tempdir().unwrap();
         let l = Ledger::open(d.path()).unwrap();
@@ -854,6 +1069,7 @@ mod recovery_tests {
         let ledger = Ledger::open(d.path()).unwrap();
         let scope = PrincipalScope::new("owner").with_agent(Some("fixture".into()));
         let item = super::super::client::Item {
+            update_mode: None,
             content: "screened explicit note".into(),
             document_id: "document".into(),
             timestamp: "2026-01-01T00:00:00Z".into(),
@@ -882,6 +1098,7 @@ mod recovery_tests {
         let ledger = Ledger::open(directory.path()).unwrap();
         let scope = PrincipalScope::new("owner").with_agent(Some("fixture".into()));
         let mut item = super::super::client::Item {
+            update_mode: None,
             content: "first value".into(),
             document_id: "note-document".into(),
             timestamp: "2026-01-01T00:00:00Z".into(),
@@ -918,6 +1135,7 @@ mod recovery_tests {
         // A completed receipt proves an old write, not current remote content:
         // the Control Plane may since have removed or corrected that document.
         let item = super::super::client::Item {
+            update_mode: None,
             content: "first value".into(),
             document_id: "note-document".into(),
             timestamp: "2026-01-01T00:00:00Z".into(),
@@ -946,6 +1164,7 @@ mod recovery_tests {
             .unwrap();
         let scope = PrincipalScope::new("owner").with_agent(Some("fixture".into()));
         let item = super::super::client::Item {
+            update_mode: None,
             content: "fixture note".into(),
             document_id: "note".into(),
             timestamp: "2026-01-01T00:00:00Z".into(),

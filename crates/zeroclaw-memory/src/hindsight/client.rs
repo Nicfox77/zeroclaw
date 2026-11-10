@@ -68,6 +68,9 @@ pub struct Client {
 pub struct Item {
     pub content: String,
     pub document_id: String,
+    /// Native append is reserved for ordered canonical conversation delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<String>,
     pub timestamp: String,
     pub context: String,
     pub metadata: BTreeMap<String, String>,
