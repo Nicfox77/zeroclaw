@@ -24,16 +24,27 @@ run_firmware_protocol_gate() {
 
 build_smoke_image() {
   if docker buildx version >/dev/null 2>&1; then
-    mkdir -p "$SMOKE_CACHE_DIR"
     local build_args=(
       --load
       --target dev
-      --cache-to "type=local,dest=$SMOKE_CACHE_DIR,mode=max"
       -t zeroclaw-local-smoke:latest
       .
     )
-    if [ -f "$SMOKE_CACHE_DIR/index.json" ]; then
-      build_args=(--cache-from "type=local,src=$SMOKE_CACHE_DIR" "${build_args[@]}")
+    # The default docker driver may lack the containerd image store, and then
+    # rejects external cache export before it even starts a build. Its ordinary
+    # layer cache still works; do not change the operator's selected builder.
+    local smoke_driver
+    smoke_driver="$(docker buildx inspect | awk '$1 == "Driver:" {print $2; exit}')"
+    if [ -z "$smoke_driver" ]; then
+      echo 'Could not determine the selected Docker buildx driver.' >&2
+      return 1
+    fi
+    if [ "$smoke_driver" != docker ]; then
+      mkdir -p "$SMOKE_CACHE_DIR"
+      build_args=(--cache-to "type=local,dest=$SMOKE_CACHE_DIR,mode=max" "${build_args[@]}")
+      if [ -f "$SMOKE_CACHE_DIR/index.json" ]; then
+        build_args=(--cache-from "type=local,src=$SMOKE_CACHE_DIR" "${build_args[@]}")
+      fi
     fi
     docker buildx build "${build_args[@]}"
   else
