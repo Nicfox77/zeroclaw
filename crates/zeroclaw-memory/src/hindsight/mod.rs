@@ -77,7 +77,7 @@ impl HindsightMemory {
             "hindsight_connection_reconfigured"
         );
         runtime::check_applied(&config)?;
-        Ok(config.memory.hindsight.clone())
+        Ok((*config.memory.hindsight).clone())
     }
     fn admitted_scope(&self) -> anyhow::Result<PrincipalScope> {
         let session = zeroclaw_api::session_events::capture::current_session_execution()

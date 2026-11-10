@@ -12854,7 +12854,7 @@ pub struct MemoryConfig {
     /// Exclusive Hindsight long-term memory configuration; unrelated to session history.
     #[serde(default)]
     #[nested]
-    pub hindsight: crate::hindsight::HindsightConfig,
+    pub hindsight: Box<crate::hindsight::HindsightConfig>,
     /// Dotted reference to the active storage instance: `<backend>.<alias>`
     /// (e.g. `"sqlite.default"`, `"postgres.work"`). Resolves through
     /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
