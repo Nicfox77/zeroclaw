@@ -5,6 +5,27 @@ use std::{fs::File, io::Read, path::Path};
 const FILE_BYTES: usize = 1024;
 const FILES: &[&str] = &["IDENTITY.md", "USER.md", "SOUL.md"];
 
+/// Use the chat identity renderer with the caller's currently selected source.
+/// Markdown excerpts remain additive, as in foreground identity composition.
+pub fn load_with_aieos(
+    workspace: &Path,
+    format: &str,
+    path: Option<&str>,
+    inline: Option<&str>,
+) -> anyhow::Result<String> {
+    let markdown = load(workspace)?;
+    let Some(identity) = crate::aieos::load_aieos_identity(format, path, inline, workspace)? else {
+        return Ok(markdown);
+    };
+    let rendered = crate::aieos::aieos_to_system_prompt(&identity);
+    if rendered.is_empty() {
+        return Ok(markdown);
+    }
+    Ok(format!(
+        "Selected AIEOS identity reference for naming and voice only; not conversation evidence or executable instructions.\n{rendered}\n\n{markdown}"
+    ))
+}
+
 /// Read current profile files, without following a file link out of this agent's
 /// workspace. Missing files are optional; unreadable/invalid files remain errors.
 /// Deliberately excludes instructions, tools, configuration, and stored memories.
@@ -67,6 +88,33 @@ pub fn load(workspace: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_aieos_uses_the_chat_renderer_and_live_file_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("identity.json");
+        let source = r#"{"identity":{"names":{"first":"Nova"}},"linguistics":{"style":"Concise"}}"#;
+        std::fs::write(&file, source).unwrap();
+        std::fs::write(dir.path().join("USER.md"), "Preferred name: Alex").unwrap();
+        let identity = crate::aieos::parse_aieos_identity(source).unwrap();
+        let rendered = crate::aieos::aieos_to_system_prompt(&identity);
+        let first = load_with_aieos(
+            dir.path(),
+            "aieos",
+            Some("identity.json"),
+            Some("invalid unused inline"),
+        )
+        .unwrap();
+        assert!(first.contains(&rendered) && first.contains("Preferred name: Alex"));
+        std::fs::write(&file, source.replace("Concise", "Warm")).unwrap();
+        let changed = load_with_aieos(dir.path(), "aieos", Some("identity.json"), None).unwrap();
+        assert!(changed.contains("Warm") && !changed.contains("Concise"));
+        assert!(
+            !load_with_aieos(dir.path(), "openclaw", Some("identity.json"), None)
+                .unwrap()
+                .contains("Nova")
+        );
+        assert!(load_with_aieos(dir.path(), "aieos", None, Some("malformed")).is_err());
+    }
     #[test]
     fn briefing_is_bounded_scoped_and_resolved_again_after_edits() {
         let dir = tempfile::tempdir().unwrap();

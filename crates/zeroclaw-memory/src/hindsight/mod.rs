@@ -243,22 +243,12 @@ impl HindsightMemory {
                 .agent
                 .as_ref()
                 .ok_or_else(|| anyhow::Error::msg("hindsight_agent_scope_required"))?;
-            let (workspace, names) = {
-                let config = live.read();
-                (
-                    config.agent_workspace_dir(alias),
-                    zeroclaw_config::speakers::resolve(
-                        &config,
-                        alias,
-                        zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR,
-                    )?,
-                )
-            };
-            eligible_content(&format!(
-                "{}\n{}",
-                names.orientation(),
-                zeroclaw_infra::memory_orientation::load(&workspace)?
-            ))
+            let config = live.read();
+            eligible_content(&zeroclaw_config::speakers::memory_orientation(
+                &config,
+                alias,
+                zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR,
+            )?)
         } else {
             String::new()
         };

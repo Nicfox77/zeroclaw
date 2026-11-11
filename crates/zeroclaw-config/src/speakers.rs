@@ -43,6 +43,23 @@ pub fn validate(config: &Config) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Fresh identity reference for summaries and agent-owned memory operations.
+/// Configuration and profile files remain the authority; no cached persona.
+pub fn memory_orientation(config: &Config, alias: &str, principal: &str) -> anyhow::Result<String> {
+    let agent = config
+        .agent(alias)
+        .ok_or_else(|| anyhow::Error::msg("speaker_agent_unavailable"))?;
+    let names = resolve(config, alias, principal)?;
+    let identity = &agent.identity;
+    let briefing = zeroclaw_infra::memory_orientation::load_with_aieos(
+        &config.agent_workspace_dir(alias),
+        &identity.format,
+        identity.aieos_path.as_deref(),
+        identity.aieos_inline.as_deref(),
+    )?;
+    Ok(format!("{}\n{}", names.orientation(), briefing))
+}
 pub fn resolve(config: &Config, alias: &str, principal: &str) -> anyhow::Result<SpeakerNames> {
     let agent = config
         .agent(alias)
@@ -151,6 +168,29 @@ mod tests {
                 .assistant,
             "Configured name"
         );
+    }
+
+    #[test]
+    fn memory_orientation_keeps_selected_aieos_and_first_person_speaker_labels() {
+        let mut config = config();
+        let agent = config.agents.get_mut("fixture").unwrap();
+        agent.identity.format = "aieos".into();
+        agent.identity.aieos_inline = Some(
+            r#"{"identity":{"names":{"first":"Nova"}},"linguistics":{"style":"Warm and concise"}}"#
+                .into(),
+        );
+        let first = memory_orientation(&config, "fixture", "shared-operator").unwrap();
+        assert!(first.contains("Warm and concise") && first.contains("I/me means the assistant"));
+        config
+            .agents
+            .get_mut("fixture")
+            .unwrap()
+            .identity
+            .aieos_inline = Some(
+            r#"{"identity":{"names":{"first":"Nova"}},"linguistics":{"style":"Precise"}}"#.into(),
+        );
+        let changed = memory_orientation(&config, "fixture", "shared-operator").unwrap();
+        assert!(changed.contains("Precise") && !changed.contains("Warm and concise"));
     }
     #[test]
     fn markdown_reformatting_cannot_change_speaker_labels() {

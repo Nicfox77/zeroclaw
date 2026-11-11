@@ -649,3 +649,18 @@ See upstream [installation](https://hindsight.vectorize.io/developer/installatio
 [embed runtime](https://hindsight.vectorize.io/sdks/embed),
 [models](https://hindsight.vectorize.io/developer/models), and
 [decision models](https://hindsight.vectorize.io/developer/decision-models).
+
+## Identity context in memory and summaries
+
+With `identity_context = true`, Hindsight retention, observation consolidation
+and reflection receive the selected agent identity as a reference for naming
+and voice. When the agent selects `identity.format = "aieos"`, this uses the
+same structured identity parser and renderer as chat. Bounded excerpts from
+`IDENTITY.md`, `USER.md` and `SOUL.md` remain additive. Background session
+summaries use this identity reference too.
+
+The current agent configuration and identity files are read when preparing each
+operation; a separate cached persona is not created. Identity reference text is
+not conversation evidence, and existing first-person and speaker-attribution
+rules still apply. Ordinary recall performs retrieval rather than a separate
+LLM reflection call; its bank identity reference is refreshed before recall.
