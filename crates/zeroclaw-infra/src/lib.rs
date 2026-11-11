@@ -1,6 +1,7 @@
 //! Channel infrastructure: session backends, debouncing, and stall watchdog.
 //! These are cross-cutting utilities used by multiple channel implementations.
 
+pub mod aieos;
 pub mod conversation_owners;
 pub mod cost_ledger;
 pub mod debounce;

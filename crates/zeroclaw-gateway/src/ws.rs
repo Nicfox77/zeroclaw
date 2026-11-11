@@ -2505,7 +2505,16 @@ async fn process_chat_message(
                             return;
                         };
                         let consolidation = async {
-                            let orientation = zeroclaw_infra::memory_orientation::load(&workspace)?;
+                            let identity = &config
+                                .agent(&memory_agent)
+                                .ok_or_else(|| anyhow::Error::msg("speaker_agent_unavailable"))?
+                                .identity;
+                            let orientation = zeroclaw_infra::memory_orientation::load_with_aieos(
+                                &workspace,
+                                &identity.format,
+                                identity.aieos_path.as_deref(),
+                                identity.aieos_inline.as_deref(),
+                            )?;
                             zeroclaw_memory::consolidation::consolidate_turn_with_orientation(
                                 model_provider.as_ref(),
                                 &model,
