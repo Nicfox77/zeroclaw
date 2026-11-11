@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
 use zeroclaw_api::memory_traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, PrincipalScope,
+    ContextRecallMode, ExportFilter, Memory, MemoryCategory, MemoryEntry, PrincipalScope,
 };
 
 /// A `Memory` handle whose ordinary operations act on one principal's
@@ -84,9 +84,10 @@ impl Memory for PrincipalPlaneMemory {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.inner
-            .recall_context_for_principal(&self.scope, query, question, limit, session)
+            .recall_context_for_principal(&self.scope, query, question, limit, session, mode)
             .await
     }
     async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {

@@ -28,8 +28,8 @@ use crate::policy::PolicyEnforcer;
 use crate::redact::{self, RedactCategory};
 use crate::threat::{self, Scope};
 use crate::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
-    ProceduralMessage, StoreOptions,
+    ContextRecallMode, ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats,
+    PrincipalScope, ProceduralMessage, StoreOptions,
 };
 use async_trait::async_trait;
 use zeroclaw_config::schema::MemoryPolicyConfig;
@@ -349,10 +349,17 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.filter_recalled_limited(
             self.inner
-                .recall_context(query, question, Self::read_fetch_limit(limit), session)
+                .recall_context(
+                    query,
+                    question,
+                    Self::read_fetch_limit(limit),
+                    session,
+                    mode,
+                )
                 .await?,
             limit,
         )
@@ -364,6 +371,7 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.filter_recalled_limited(
             self.inner
@@ -373,6 +381,7 @@ impl<M: Memory> Memory for ScannedMemory<M> {
                     question,
                     Self::read_fetch_limit(limit),
                     session,
+                    mode,
                 )
                 .await?,
             limit,
