@@ -1693,6 +1693,31 @@ impl InFlightTaskCompletion {
     }
 }
 
+fn channel_memory_inject_config(
+    msg: &ChannelMessage,
+    memory: &zeroclaw_config::schema::MemoryConfig,
+    min_relevance_score: f64,
+) -> zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+    use zeroclaw_runtime::agent::memory_inject::{DEFAULT_RECALL_LIMIT, MemoryInjectConfig};
+    let cfg = MemoryInjectConfig {
+        min_relevance_score,
+        ..MemoryInjectConfig::from_memory_config(memory, DEFAULT_RECALL_LIMIT)
+    };
+    // SimpleX stamps call scope separately from ordinary voice-note origins.
+    if msg.channel == "simplex"
+        && msg.voice_origin
+        && msg
+            .interruption_scope_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+        && msg.thread_ts.as_deref().is_some_and(|id| !id.is_empty())
+    {
+        cfg.for_live_voice()
+    } else {
+        cfg
+    }
+}
+
 fn conversation_memory_key_in_scope(
     msg: &zeroclaw_api::channel::ChannelMessage,
     channel_scope: &str,
@@ -10673,13 +10698,11 @@ async fn process_channel_message_body_inner(
                     suppress: false,
                     // The relevance floor stays the context's resolved copy;
                     // the rerank stage settings thread from the live config.
-                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
-                        min_relevance_score: ctx.min_relevance_score,
-                        ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                            &ctx.prompt_config.memory,
-                            zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                        )
-                    },
+                    cfg: channel_memory_inject_config(
+                        &msg,
+                        &ctx.prompt_config.memory,
+                        ctx.min_relevance_score,
+                    ),
                 }),
                 ingress: channel_ingress_context(&msg),
                 agent_alias: Some(ctx.agent_alias.as_str()),
@@ -43007,6 +43030,35 @@ for await (const line of createInterface({input:process.stdin})) {
         ctx.prompt_config = Arc::new(prompt_config.clone());
         ctx.live_config = zeroclaw_config::live::LiveConfig::new(prompt_config).handle();
         ctx
+    }
+
+    #[test]
+    fn automatic_recall_uses_compact_mode_only_for_live_call_metadata() {
+        use zeroclaw_api::memory_traits::ContextRecallMode;
+        let mut memory = zeroclaw_config::schema::MemoryConfig::default();
+        memory.backend = "hindsight".into();
+        let mut msg = ChannelMessage::new("fixture", "sender", "recipient", "hello", "simplex", 1);
+        for (voice, thread, call, compact) in [
+            (false, None, None, false),
+            (true, None, None, false),
+            (true, Some("scope"), None, false),
+            (true, None, Some("call"), false),
+            (true, Some(""), Some("call"), false),
+            (true, Some("scope"), Some("call"), true),
+        ] {
+            msg.voice_origin = voice;
+            msg.thread_ts = thread.map(str::to_owned);
+            msg.interruption_scope_id = call.map(str::to_owned);
+            let cfg = channel_memory_inject_config(&msg, &memory, 0.25);
+            assert_eq!(cfg.mode == ContextRecallMode::Compact, compact);
+            assert_eq!(cfg.min_relevance_score, 0.25);
+            assert_eq!(cfg.max_total_chars, if compact { 1024 } else { 8192 });
+        }
+        msg.channel = "telegram".into();
+        assert_eq!(
+            channel_memory_inject_config(&msg, &memory, 0.25).mode,
+            ContextRecallMode::Standard
+        );
     }
 
     #[test]

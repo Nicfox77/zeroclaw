@@ -3,7 +3,7 @@ pub mod client;
 pub mod delivery;
 pub mod ledger;
 pub mod runtime;
-use crate::traits::{Memory, MemoryCategory, MemoryEntry, PrincipalScope};
+use crate::traits::{ContextRecallMode, Memory, MemoryCategory, MemoryEntry, PrincipalScope};
 use async_trait::async_trait;
 use client::{Client, Fact, Item};
 use ledger::Ledger;
@@ -303,13 +303,15 @@ impl HindsightMemory {
         scope: &PrincipalScope,
         query: &str,
         limit: usize,
-        since: Option<&str>,
-        until: Option<&str>,
+        range: (Option<&str>, Option<&str>),
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let lower = since
+        let lower = range
+            .0
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()?;
-        let upper = until
+        let upper = range
+            .1
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()?;
         anyhow::ensure!(
@@ -318,18 +320,23 @@ impl HindsightMemory {
         );
         let query = eligible_content(query);
         let config = self.policy()?;
+        let (budget, tokens) = match mode {
+            ContextRecallMode::Standard => {
+                (config.recall_budget.as_str(), config.recall_max_tokens)
+            }
+            ContextRecallMode::Compact => (
+                "low",
+                config
+                    .recall_max_tokens
+                    .min(ContextRecallMode::COMPACT_MAX_TOKENS),
+            ),
+        };
         let bank = self.bank(scope)?;
         self.prepare_bank(&bank, scope).await?;
         let started = std::time::Instant::now();
         let result = self
             .client
-            .recall(
-                &bank,
-                &query,
-                &config.recall_budget,
-                config.recall_max_tokens,
-                config.prefer_observations,
-            )
+            .recall(&bank, &query, budget, tokens, config.prefer_observations)
             .await;
         self.ledger.observe(
             "recall",
@@ -587,9 +594,17 @@ impl Memory for HindsightMemory {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.recall_context_for_principal(&self.admitted_scope()?, query, question, limit, session)
-            .await
+        self.recall_context_for_principal(
+            &self.admitted_scope()?,
+            query,
+            question,
+            limit,
+            session,
+            mode,
+        )
+        .await
     }
     async fn recall_context_for_principal(
         &self,
@@ -598,12 +613,14 @@ impl Memory for HindsightMemory {
         question: &str,
         limit: usize,
         _session: Option<&str>,
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let config = self.policy()?;
         if !config.auto_recall {
             return Ok(vec![]);
         }
-        let reflect = config.auto_reflect
+        let reflect = mode == ContextRecallMode::Standard
+            && config.auto_reflect
             && match config.reflect_mode {
                 ReflectMode::Off => false,
                 ReflectMode::Always => true,
@@ -612,7 +629,8 @@ impl Memory for HindsightMemory {
         if reflect {
             self.reflect_scoped(scope, query).await
         } else {
-            self.recall_scoped(scope, query, limit, None, None).await
+            self.recall_scoped(scope, query, limit, (None, None), mode)
+                .await
         }
     }
     async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
@@ -726,7 +744,14 @@ impl Memory for HindsightMemory {
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         // Hindsight temporal_window ranks rather than filters. Apply strict
         // source-mention bounds after native retrieval without reranking.
-        self.recall_scoped(scope, query, limit, since, until).await
+        self.recall_scoped(
+            scope,
+            query,
+            limit,
+            (since, until),
+            ContextRecallMode::Standard,
+        )
+        .await
     }
     async fn list_for_principal(
         &self,
@@ -976,7 +1001,7 @@ mod tests {
         let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let recorded = requests.clone();
         let server = zeroclaw_spawn::spawn!(async move {
-            for _ in 0..4 {
+            for _ in 0..8 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let header_end = loop {
@@ -1047,16 +1072,57 @@ mod tests {
             .await
             .unwrap();
         memory.reflect_for_principal(&scope, &query).await.unwrap();
+        // A memory-dependent live question stays on bounded retrieval even
+        // when adaptive reflection would trigger for a standard chat turn.
+        memory
+            .recall_context_for_principal(
+                &scope,
+                &query,
+                "What did we decide?",
+                2,
+                None,
+                ContextRecallMode::Compact,
+            )
+            .await
+            .unwrap();
+        config.memory.hindsight.recall_max_tokens = 128;
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        memory
+            .recall_context_for_principal(
+                &scope,
+                &query,
+                "What did we decide?",
+                2,
+                None,
+                ContextRecallMode::Compact,
+            )
+            .await
+            .unwrap();
         server.await.unwrap();
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 8);
         assert!(requests.iter().all(|body| !body.contains(&credential)));
         assert_eq!(
             requests
                 .iter()
                 .filter(|body| body.contains("project"))
                 .count(),
-            2
+            4
+        );
+        let recall: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|body| serde_json::from_str::<serde_json::Value>(body).unwrap())
+            .filter(|body| body.get("budget").is_some())
+            .collect();
+        assert_eq!(recall.len(), 4);
+        assert_eq!(recall[0]["budget"], "mid");
+        assert_eq!(recall[0]["max_tokens"], 2048);
+        assert_eq!(recall[2]["budget"], "low");
+        assert_eq!(recall[2]["max_tokens"], 256);
+        assert_eq!(recall[3]["max_tokens"], 128);
+        assert!(
+            recall[2].get("include").is_none(),
+            "compact mode must use recall, not reflect"
         );
     }
     #[test]
@@ -1208,6 +1274,7 @@ mod service_tests {
                 "Why did we choose the Larch transcript storage?",
                 8,
                 None,
+                ContextRecallMode::Standard,
             )
             .await
             .unwrap();

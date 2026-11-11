@@ -1,8 +1,8 @@
 //! Audit trail for memory operations.
 
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
-    ProceduralMessage, StoreOptions,
+    ContextRecallMode, ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats,
+    PrincipalScope, ProceduralMessage, StoreOptions,
 };
 use crate::sqlite_permissions::{check_sqlite_storage, prepare_sqlite_storage};
 use async_trait::async_trait;
@@ -197,6 +197,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.log_audit(
             AuditOp::Recall,
@@ -206,7 +207,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             Some("automatic_context"),
         );
         self.inner
-            .recall_context(query, question, limit, session)
+            .recall_context(query, question, limit, session, mode)
             .await
     }
     async fn recall_context_for_principal(
@@ -216,6 +217,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.log_audit(
             AuditOp::Recall,
@@ -225,7 +227,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             Some(&Self::scope_detail(scope)),
         );
         self.inner
-            .recall_context_for_principal(scope, query, question, limit, session)
+            .recall_context_for_principal(scope, query, question, limit, session, mode)
             .await
     }
     async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {

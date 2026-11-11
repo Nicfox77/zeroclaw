@@ -945,9 +945,10 @@ impl Memory for NativeMemoryBinding {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: zeroclaw_api::memory_traits::ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.begin_operation()
-            .recall_context(query, question, limit, session)
+            .recall_context(query, question, limit, session, mode)
             .await
     }
     async fn recall_context_for_principal(
@@ -957,9 +958,10 @@ impl Memory for NativeMemoryBinding {
         question: &str,
         limit: usize,
         session: Option<&str>,
+        mode: zeroclaw_api::memory_traits::ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.begin_operation()
-            .recall_context_for_principal(scope, query, question, limit, session)
+            .recall_context_for_principal(scope, query, question, limit, session, mode)
             .await
     }
     async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
