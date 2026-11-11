@@ -565,6 +565,12 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 name = "component"
 path = "tests/test_component.rs"
 
+# Memory commands are exposed by the runtime-enabled CLI dispatcher.
+[[test]]
+name = "hindsight_retention_cli"
+path = "tests/component/hindsight_retention_cli.rs"
+required-features = ["agent-runtime"]
+
 [[test]]
 name = "integration"
 path = "tests/test_integration.rs"

@@ -103,6 +103,17 @@ pub async fn tick(live: &LiveConfigHandle, source: &dyn TranscriptSource) -> any
     }
     enqueue_backfills(&ledger, source, &streams, capacity).await?;
     for delivery in ledger.pending(16, retry)? {
+        // Keep capture/backfill cursors moving while holding unsubmitted work.
+        // Existing operations still reconcile outside an admission window.
+        if delivery.operation.is_none()
+            && !super::retention::allowed(
+                &live.read().memory.hindsight.retention,
+                &ledger,
+                chrono::Utc::now(),
+            )?
+        {
+            continue;
+        }
         let stream = streams
             .iter()
             .find(|s| s.id == delivery.stream)
@@ -289,6 +300,9 @@ async fn deliver(
         };
         ledger.operation(&bank, document, &digest)?
     };
+    if delivery.operation.is_none() && !super::retention::ready(live, ledger, &operation)? {
+        return Ok(());
+    }
     let revision = source.revision(stream).await?;
     anyhow::ensure!(
         revision == source_revision,
@@ -310,6 +324,9 @@ async fn deliver(
                                 || delivery.status == "retry_requested",
                             "hindsight_retain_failed_manual_retry_required"
                         );
+                        if !super::retention::admit(live, ledger, &operation)? {
+                            return Ok(());
+                        }
                         backend
                             .client
                             .request(
@@ -336,6 +353,9 @@ async fn deliver(
             Err(error) => return Err(error.into()),
         }
     }
+    if !super::retention::ready(live, ledger, &operation)? {
+        return Ok(());
+    }
     backend.prepare_bank(&bank, &scope).await?;
     let revision = source.revision(stream).await?;
     anyhow::ensure!(
@@ -343,6 +363,9 @@ async fn deliver(
         "hindsight_source_changed_during_delivery"
     );
     backend.policy()?;
+    if !super::retention::admit(live, ledger, &operation)? {
+        return Ok(());
+    }
     backend.client.retain(&bank, &items, &operation).await?;
     ledger.update(&operation, "processing")?;
     // Acceptance is deliberately not completion. The next tick reconciles it.
@@ -666,6 +689,9 @@ async fn resume_notes(
                                 backend.policy()?.retry_failed_retains || retry_requested,
                                 "hindsight_retain_failed_manual_retry_required"
                             );
+                            if !super::retention::admit(live, ledger, &note.operation)? {
+                                return Ok(());
+                            }
                             backend
                                 .client
                                 .request(
@@ -708,8 +734,14 @@ async fn resume_notes(
                             )
                             .await?;
                     }
+                    if !super::retention::ready(live, ledger, &note.operation)? {
+                        return Ok(());
+                    }
                     backend.prepare_bank(&bank, &note.scope).await?;
                     backend.policy()?;
+                    if !super::retention::admit(live, ledger, &note.operation)? {
+                        return Ok(());
+                    }
                     backend
                         .client
                         .retain(&bank, &items, &note.operation)

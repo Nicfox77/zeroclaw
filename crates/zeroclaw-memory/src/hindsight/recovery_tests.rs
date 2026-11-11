@@ -16,6 +16,7 @@ struct ServerState {
     retain_posts: usize,
     retained: Vec<serde_json::Value>,
     retry_posts: usize,
+    recall_posts: usize,
     deletes: usize,
     operation: Option<String>,
     status: String,
@@ -99,6 +100,12 @@ impl FaultApi {
                     (
                         200,
                         serde_json::json!({"operation_id":s.operation,"status":"accepted"}),
+                    )
+                } else if path.ends_with("/recall") {
+                    s.recall_posts += 1;
+                    (
+                        200,
+                        serde_json::json!({"results":[{"id":"fixture-fact","text":"The fictional Larch project uses SQLite."}]}),
                     )
                 } else if path.ends_with("/retry") {
                     s.retry_posts += 1;
@@ -407,4 +414,146 @@ async fn missing_uncertain_append_is_not_proof_that_its_writer_was_cancelled() {
     tick(&live.handle(), &source).await.unwrap();
     tick(&live.handle(), &source).await.unwrap();
     assert_eq!(server.state.lock().unwrap().deletes, 1);
+}
+
+#[tokio::test]
+async fn deferred_capture_survives_restart_and_manual_drain_does_not_flood_after_lost_ack() {
+    let server = FaultApi::start();
+    let dir = tempfile::tempdir().unwrap();
+    register(dir.path());
+    Ledger::open(dir.path())
+        .unwrap()
+        .register_stream(
+            "fixture",
+            "another-fixture-owner",
+            "another-session",
+            "branch",
+            0,
+        )
+        .unwrap();
+    let source = Source::default();
+    let mut cfg = config(dir.path(), &server.url);
+    cfg.memory.hindsight.retention.deferred = true;
+    let live = zeroclaw_config::live::LiveConfig::new(cfg.clone());
+    tick(&live.handle(), &source).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().retain_posts, 0);
+    assert_eq!(
+        Ledger::open(dir.path()).unwrap().delivery_counts().unwrap()["pending"],
+        2
+    );
+    drop(live);
+    let ledger = Ledger::open(dir.path()).unwrap();
+    ledger
+        .set_retention_control(&super::super::retention::Control::Draining {
+            until: chrono::Utc::now().timestamp() + 60,
+        })
+        .unwrap();
+    drop(ledger);
+    let restarted = zeroclaw_config::live::LiveConfig::new(cfg);
+    server.state.lock().unwrap().drop_ack = true;
+    tick(&restarted.handle(), &source).await.unwrap();
+    assert_eq!(
+        server.state.lock().unwrap().retain_posts,
+        1,
+        "unknown acknowledgement must hold the single-operation claim"
+    );
+    Ledger::open(dir.path()).unwrap().retry_pending().unwrap();
+    tick(&restarted.handle(), &source).await.unwrap();
+    assert_eq!(
+        server.state.lock().unwrap().retain_posts,
+        1,
+        "poll the original UUID rather than starting another job"
+    );
+    server.state.lock().unwrap().status = "completed".into();
+    Ledger::open(dir.path()).unwrap().retry_pending().unwrap();
+    tick(&restarted.handle(), &source).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().retain_posts, 2);
+    let ledger = Ledger::open(dir.path()).unwrap();
+    ledger
+        .set_retention_control(&super::super::retention::Control::Paused)
+        .unwrap();
+    // Expire the normal delivery backoff without lifting admission's pause.
+    ledger.retry_pending().unwrap();
+    tick(&restarted.handle(), &source).await.unwrap();
+    assert_eq!(
+        ledger.delivery_counts().unwrap()["completed"],
+        2,
+        "accepted work still reconciles while paused"
+    );
+    assert_eq!(server.state.lock().unwrap().retain_posts, 2);
+}
+
+#[tokio::test]
+async fn deferred_explicit_note_returns_without_extraction_and_existing_recall_remains_available() {
+    let server = FaultApi::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), &server.url);
+    cfg.memory.hindsight.retention.deferred = true;
+    let live = zeroclaw_config::live::LiveConfig::new(cfg.clone());
+    let memory = HindsightMemory::new(
+        &cfg.memory.hindsight,
+        dir.path(),
+        Some("fixture"),
+        Some(live.handle()),
+    )
+    .unwrap();
+    let scope = PrincipalScope::new("fixture-owner").with_agent(Some("fixture".into()));
+    memory
+        .retain_scoped(
+            &scope,
+            "fixture-note",
+            "The fictional Larch project uses SQLite.",
+            zeroclaw_api::memory_traits::MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(server.state.lock().unwrap().retain_posts, 0);
+    let facts = memory
+        .recall_scoped(
+            &scope,
+            "Which database?",
+            5,
+            (None, None),
+            zeroclaw_api::memory_traits::ContextRecallMode::Standard,
+        )
+        .await
+        .unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(server.state.lock().unwrap().recall_posts, 1);
+    assert_eq!(server.state.lock().unwrap().retain_posts, 0);
+    let ledger = Ledger::open(dir.path()).unwrap();
+    assert_eq!(ledger.diagnostics().unwrap()["pending_notes"], 1);
+    ledger
+        .set_retention_control(&super::super::retention::Control::Draining {
+            until: chrono::Utc::now().timestamp() + 60,
+        })
+        .unwrap();
+    tick(&live.handle(), &Source::default()).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().retain_posts, 1);
+}
+
+#[tokio::test]
+async fn source_erased_while_deferred_is_never_submitted_by_a_later_manual_drain() {
+    let server = FaultApi::start();
+    let dir = tempfile::tempdir().unwrap();
+    register(dir.path());
+    let source = Source::default();
+    let mut cfg = config(dir.path(), &server.url);
+    cfg.memory.hindsight.retention.deferred = true;
+    let live = zeroclaw_config::live::LiveConfig::new(cfg);
+    tick(&live.handle(), &source).await.unwrap();
+    source.erased.store(true, Ordering::Relaxed);
+    Ledger::open(dir.path())
+        .unwrap()
+        .set_retention_control(&super::super::retention::Control::Draining {
+            until: chrono::Utc::now().timestamp() + 60,
+        })
+        .unwrap();
+    tick(&live.handle(), &source).await.unwrap();
+    assert_eq!(server.state.lock().unwrap().retain_posts, 0);
+    assert_eq!(
+        Ledger::open(dir.path()).unwrap().delivery_counts().unwrap()["erased"],
+        1
+    );
 }

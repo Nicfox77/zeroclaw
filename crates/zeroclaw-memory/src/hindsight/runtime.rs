@@ -682,7 +682,7 @@ pub async fn status(config: &Config) -> anyhow::Result<serde_json::Value> {
         .and_then(|e| e.get("HINDSIGHT_API_LLM_PROVIDER"));
     let llm_model = env.as_ref().and_then(|e| e.get("HINDSIGHT_API_LLM_MODEL"));
     Ok(
-        serde_json::json!({"backend":config.memory.backend,"mode":h.mode,"configuration_applied":applied,"process_state":process_state,"managed_owner_present":owner_present,"managed_profile":profile(config),"api_available":health.is_ok(),"api_error":health.err().map(|e|e.to_string()),"database":database,"embedding":h.models.embedding,"reranker":h.models.reranker,"decision_model":h.models.decision,"decision_available":decision_available,"decision_recall_rerank":h.models.decision_recall_rerank,"llm_provider":llm_provider,"llm_model":llm_model,"deliveries":ledger.delivery_counts()?,"diagnostics":ledger.diagnostics()?}),
+        serde_json::json!({"backend":config.memory.backend,"mode":h.mode,"configuration_applied":applied,"process_state":process_state,"managed_owner_present":owner_present,"managed_profile":profile(config),"api_available":health.is_ok(),"api_error":health.err().map(|e|e.to_string()),"database":database,"embedding":h.models.embedding,"reranker":h.models.reranker,"decision_model":h.models.decision,"decision_available":decision_available,"decision_recall_rerank":h.models.decision_recall_rerank,"llm_provider":llm_provider,"llm_model":llm_model,"retention":super::retention::status(&h.retention, &ledger)?,"deliveries":ledger.delivery_counts()?,"diagnostics":ledger.diagnostics()?}),
     )
 }
 #[cfg(test)]
