@@ -98,6 +98,8 @@ impl Ledger {
                 [],
             )?;
         }
+        schema.execute_batch("CREATE TABLE IF NOT EXISTS retention_control(id INTEGER PRIMARY KEY CHECK(id=1),intent TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS retention_inflight(id INTEGER PRIMARY KEY CHECK(id=1),operation TEXT NOT NULL);")?;
         schema.execute_batch("CREATE INDEX IF NOT EXISTS delivery_active ON deliveries(status,next_attempt,sequence);
             CREATE TABLE IF NOT EXISTS conversation_rebuilds(stream TEXT PRIMARY KEY,bank TEXT NOT NULL,document TEXT NOT NULL,generation TEXT NOT NULL,phase TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS rebuild_bank ON conversation_rebuilds(bank,phase);
@@ -114,6 +116,67 @@ impl Ledger {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+    pub fn retention_control(&self) -> anyhow::Result<super::retention::Control> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        let value: Option<String> = c
+            .query_row("SELECT intent FROM retention_control WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        value
+            .map(|v| serde_json::from_str(&v).map_err(anyhow::Error::from))
+            .transpose()
+            .map(|v| v.unwrap_or_default())
+    }
+    pub fn set_retention_control(&self, control: &super::retention::Control) -> anyhow::Result<()> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        c.execute("INSERT INTO retention_control(id,intent) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET intent=excluded.intent", [serde_json::to_string(control)?])?;
+        Ok(())
+    }
+    pub fn retention_in_flight(&self) -> anyhow::Result<Option<String>> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        Ok(c.query_row(
+            "SELECT operation FROM retention_inflight WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+    }
+    /// Admission is its own durable fact: operation status alone cannot distinguish
+    /// a queued note from an attempted submission whose acknowledgement was lost.
+    pub fn claim_retention(&self, operation: &str) -> anyhow::Result<bool> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1)",
+            [operation],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(exists, "hindsight_unknown_delivery_operation");
+        tx.execute(
+            "INSERT OR IGNORE INTO retention_inflight(id,operation) VALUES(1,?1)",
+            [operation],
+        )?;
+        let claimed: String = tx.query_row(
+            "SELECT operation FROM retention_inflight WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(claimed == operation)
     }
     /// Created receipts for upstream full-refresh operations during erasure;
     /// definitions and memory content remain solely in Hindsight.
@@ -186,8 +249,9 @@ impl Ledger {
         let banks = q
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        let pending_notes: usize = c.query_row("SELECT count(*) FROM notes", [], |r| r.get(0))?;
         Ok(
-            serde_json::json!({"operations":activity,"last_successful_retain":last_retain,"pending_backfills":backfills,"pending_conversation_rebuilds":rebuilds,"delivery_errors":errors,"banks":banks}),
+            serde_json::json!({"pending_notes":pending_notes,"operations":activity,"last_successful_retain":last_retain,"pending_backfills":backfills,"pending_conversation_rebuilds":rebuilds,"delivery_errors":errors,"banks":banks}),
         )
     }
     pub fn register_stream(
@@ -729,6 +793,10 @@ impl Ledger {
         let tx = c.transaction()?;
         tx.execute("UPDATE operations SET status='completed',updated_at=CURRENT_TIMESTAMP WHERE operation_id=?1",[operation])?;
         tx.execute("DELETE FROM notes WHERE operation=?1", [operation])?;
+        tx.execute(
+            "DELETE FROM retention_inflight WHERE operation=?1",
+            [operation],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -846,16 +914,25 @@ impl Ledger {
             |r| r.get(0),
         )?)
     }
+    /// Observed upstream state, distinct from locally recorded transport failures.
     pub fn update(&self, operation: &str, status: &str) -> anyhow::Result<()> {
-        let c = self
+        let mut c = self
             .connection
             .lock()
             .map_err(|_| anyhow::Error::msg("hindsight_delivery_lock_poisoned"))?;
-        let changed = c.execute(
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE operations SET status=?1,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?2",
             params![status, operation],
         )?;
         anyhow::ensure!(changed == 1, "hindsight_unknown_delivery_operation");
+        if matches!(status, "completed" | "failed" | "cancelled") {
+            tx.execute(
+                "DELETE FROM retention_inflight WHERE operation=?1",
+                [operation],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
     pub fn status(&self, operation: &str) -> anyhow::Result<Option<String>> {

@@ -1034,9 +1034,9 @@ use config::Config;
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
-    GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
-    ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
-    SopCommands, SopGraphFormat,
+    GatewayCommands, HardwareCommands, IntegrationCommands, MemoryRetentionCommands,
+    MigrateCommands, PeripheralCommands, ProvidersCommands, ServiceCommands, ServiceLogStream,
+    SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -8814,6 +8814,11 @@ enum MemoryCommands {
     Setup,
     /// Retry and reconcile unfinished Hindsight deliveries.
     RetryPending,
+    /// Inspect or control deferred Hindsight retention.
+    Retention {
+        #[command(subcommand)]
+        command: zeroclaw::MemoryRetentionCommands,
+    },
     /// Schedule a resumable import from canonical native conversation events.
     Backfill {
         #[arg(long)]

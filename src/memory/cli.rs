@@ -64,6 +64,44 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
             );
             Ok(())
         }
+        crate::MemoryCommands::Retention { command } => {
+            anyhow::ensure!(
+                config.memory.backend.trim() == "hindsight",
+                "{}",
+                mt(
+                    "cli-hindsight-required",
+                    "Hindsight must be the selected memory backend."
+                )
+            );
+            config.validate_hindsight_memory()?;
+            let ledger = super::hindsight::ledger::Ledger::open(&config.data_dir)?;
+            use super::hindsight::retention::{self, Control};
+            let intent = match command {
+                crate::MemoryRetentionCommands::Status => None,
+                crate::MemoryRetentionCommands::Pause => Some(Control::Paused),
+                crate::MemoryRetentionCommands::Resume => Some(Control::Automatic),
+                crate::MemoryRetentionCommands::Drain { minutes } => {
+                    anyhow::ensure!(
+                        (1..=1440).contains(&minutes),
+                        "hindsight_invalid_drain_minutes"
+                    );
+                    Some(Control::Draining {
+                        until: chrono::Utc::now().timestamp() + i64::from(minutes) * 60,
+                    })
+                }
+            };
+            if let Some(intent) = intent {
+                ledger.set_retention_control(&intent)?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&retention::status(
+                    &config.memory.hindsight.retention,
+                    &ledger
+                )?)?
+            );
+            Ok(())
+        }
         crate::MemoryCommands::RetryPending => {
             anyhow::ensure!(
                 config.memory.backend.trim() == "hindsight",

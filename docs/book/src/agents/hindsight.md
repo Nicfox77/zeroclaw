@@ -467,6 +467,82 @@ knowledge pages, not rolling context summaries. Do not create a mental model per
 turn or session. `decision_recall_rerank = true` changes upstream recall ordering to
 the decision model; it does not add another Rust reranker after Hindsight.
 
+## Deferred retention on a shared local model
+
+Retention can wait for a daily window while chat continues to recall existing
+memories. Keep `auto_retain = true`: that registers conversations and collects
+bounded pages of canonical transcript references. Turning it off disables
+capture rather than merely postponing extraction.
+
+```toml
+[memory.hindsight.retention]
+deferred = true
+window = "04:00-08:00"
+timezone = "America/Los_Angeles"
+```
+
+The window is local wall-clock time in the named IANA timezone, including DST.
+Its start is inclusive and end exclusive. Overnight windows such as
+`"23:00-02:00"` are supported. Omit `window` for manual-only retention. The default
+`deferred = false` preserves immediate/background delivery without a time gate.
+These are live admission settings; each new submission reads current policy.
+
+The existing delivery ledger remains the queue authority. Conversation bodies
+stay in the native transcript; standalone explicit notes use the existing
+private, screened note spool until delivery completes. `memory_store` and
+`hindsight_retain` acknowledge the durable queue write in deferred mode rather
+than waiting for extraction. Queued information becomes searchable only after
+Hindsight finishes retaining it. Capacity limits leave the transcript cursor
+behind rather than dropping conversation turns or blocking chat.
+
+The daemon's existing delivery worker must be running. Local operator commands
+can inspect or temporarily override its admission policy without starting a
+second worker or making an LLM call:
+
+```sh
+zeroclaw memory retention status
+zeroclaw memory retention drain --minutes 240
+zeroclaw memory retention pause
+zeroclaw memory retention resume
+```
+
+`drain` grants a bounded permission (default 240 minutes, maximum 1440), including
+outside the daily window. The worker drains eligible work asynchronously and
+can accept newly queued work during that permission. The grant expires by wall
+clock and survives a process restart. It does not reset delivery failures or
+bypass retry policy: `memory retry-pending` requests retry separately. `pause`
+persists a stop on new retention admissions, even during the daily window;
+`resume` clears the manual override and restores the configured schedule.
+`retention status` is a local JSON view of the current policy, override,
+admission state, queue counts and in-flight operation. It does not contact the
+LLM or need a healthy Hindsight service. These are local administrative CLI
+commands, not new remotely exposed slash commands. An authorized operator can
+also ask their agent to run the command through its existing shell tool.
+
+Deferred mode admits only one new retention operation at a time across notes
+and conversations. Its claim is durable before submission. A lost HTTP
+acknowledgement keeps that claim until reconciliation observes an upstream
+terminal state; a local transport failure cannot release it and flood the
+server with more work. Retries are gated too. Polling previously admitted
+operations continues while paused/outside the window. Closing the window or
+pausing does not preempt an inference already admitted to Hindsight, reclaim its
+KV cache, cancel work queued by other clients, or disable Hindsight's own
+consolidation. Allow time for the last admitted operation to finish.
+
+Recall is independent of the gate. Reflection and privacy-required erasure/
+mental-model cleanup also retain their existing behavior; those may invoke a
+model outside the retention window. Redaction checks and erasure fences still
+apply, and source text erased while queued is never sent later. A queued replay
+needed after erasure waits for retention admission, so the affected bank can
+remain fenced until its safe rebuild completes. To share one accelerated model,
+point Hindsight's generative LLM at the same compatible endpoint/model as chat;
+this policy does not load or choose another model.
+
+Roll back by first pausing/stopping the delivery worker, then restoring the
+previous binary/config. An older binary ignores the new admission settings and
+control tables and will resume its original immediate delivery behavior. Keep
+the ledger and native transcripts; never delete them to clear a backlog.
+
 ## Status, recovery, and historical import
 
 ```sh
