@@ -50,6 +50,8 @@ pub const DEFAULT_MAX_TOTAL_CHARS: usize = 4_000;
 /// [`resolve_inject_policy`]'s arguments.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MemoryInjectConfig {
+    /// Per-turn automatic retrieval policy supplied by the ingress surface.
+    pub mode: zeroclaw_api::memory_traits::ContextRecallMode,
     /// Entries requested from each `recall` call.
     pub limit: usize,
     /// Entries scoring below this (post-decay) are dropped; entries without
@@ -78,6 +80,7 @@ pub struct MemoryInjectConfig {
 impl Default for MemoryInjectConfig {
     fn default() -> Self {
         Self {
+            mode: zeroclaw_api::memory_traits::ContextRecallMode::Standard,
             limit: DEFAULT_RECALL_LIMIT,
             min_relevance_score: 0.0,
             max_entries: DEFAULT_MAX_ENTRIES,
@@ -92,6 +95,19 @@ impl Default for MemoryInjectConfig {
 }
 
 impl MemoryInjectConfig {
+    /// Bound the live-call prompt using the same cap sent to the backend.
+    #[must_use]
+    pub fn for_live_voice(mut self) -> Self {
+        use zeroclaw_api::memory_traits::ContextRecallMode;
+        self.mode = ContextRecallMode::Compact;
+        let chars = ContextRecallMode::COMPACT_MAX_TOKENS * 4;
+        self.max_total_chars = self.max_total_chars.min(chars);
+        self.entry_max_chars = self.entry_max_chars.min(chars.saturating_sub(192));
+        self.max_entries = self.max_entries.min(2);
+        self.limit = self.limit.min(2);
+        self
+    }
+
     /// Build the injection config from the agent's resolved memory config
     /// plus the effective recall limit. Threads the relevance floor and the
     /// rerank stage settings; budgets stay at the renderer defaults.
@@ -342,7 +358,16 @@ pub async fn recall_memory_context(
     let mut seen_keys: HashSet<String> = HashSet::new();
     let mut any_ok = false;
     // A turn with no session scopes still recalls once, unscoped.
-    let scopes: &[Option<&str>] = if sessions.is_empty() {
+    let scopes: &[Option<&str>] = if sessions.is_empty()
+        || (cfg.mode == zeroclaw_api::memory_traits::ContextRecallMode::Compact
+            && matches!(
+                mem.role(),
+                zeroclaw_api::attribution::Role::Memory(
+                    zeroclaw_api::attribution::MemoryKind::Hindsight
+                )
+            )) {
+        // Hindsight is scoped by the handle's authorized principal/agent bank.
+        // Legacy sender and conversation IDs select the same bank.
         &[None]
     } else {
         sessions
@@ -379,7 +404,13 @@ pub async fn recall_memory_context(
     };
     for session_id in scopes {
         match mem
-            .recall_context(&retrieval_query, user_msg, recall_limit, *session_id)
+            .recall_context(
+                &retrieval_query,
+                user_msg,
+                recall_limit,
+                *session_id,
+                cfg.mode,
+            )
             .await
         {
             Ok(recalled) => {
@@ -491,10 +522,12 @@ pub async fn recall_memory_context(
             content,
             stored_on: stamp.map(str::to_owned),
         };
-        if prior
-            .get(entry.key.as_str())
-            .is_some_and(|previous| **previous == snapshot)
-        {
+        if prior.get(entry.key.as_str()).is_some_and(|previous| {
+            **previous == snapshot
+                || (cfg.mode == zeroclaw_api::memory_traits::ContextRecallMode::Compact
+                    && previous.content == entry.content
+                    && previous.stored_on == snapshot.stored_on)
+        }) {
             continue;
         }
         if used_chars + line_chars > cfg.max_total_chars {
@@ -511,6 +544,28 @@ pub async fn recall_memory_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_voice_recall_caps_effort_and_preserves_smaller_budgets() {
+        use zeroclaw_api::memory_traits::ContextRecallMode;
+        let compact = MemoryInjectConfig::default().for_live_voice();
+        assert_eq!(compact.mode, ContextRecallMode::Compact);
+        assert_eq!(compact.limit, 2);
+        assert_eq!(compact.max_entries, 2);
+        assert_eq!(compact.max_total_chars, 1024);
+        assert!(compact.entry_max_chars < compact.max_total_chars);
+        let smaller = MemoryInjectConfig {
+            limit: 0,
+            max_entries: 1,
+            max_total_chars: 500,
+            entry_max_chars: 200,
+            ..Default::default()
+        }
+        .for_live_voice();
+        assert_eq!(smaller.limit, 0);
+        assert_eq!(smaller.max_entries, 1);
+        assert_eq!(smaller.max_total_chars, 500);
+        assert_eq!(smaller.entry_max_chars, 200);
+    }
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
@@ -549,6 +604,7 @@ mod tests {
     /// so rerank tests can assert the over-fetch gating.
     struct FixtureMemory {
         by_session: HashMap<Option<String>, Vec<MemoryEntry>>,
+        hindsight: bool,
         fail: bool,
         recalls: std::sync::atomic::AtomicUsize,
         recorded_limits: Mutex<Vec<usize>>,
@@ -564,6 +620,7 @@ mod tests {
         fn with_sessions(by_session: HashMap<Option<String>, Vec<MemoryEntry>>) -> Self {
             Self {
                 by_session,
+                hindsight: false,
                 fail: false,
                 recalls: std::sync::atomic::AtomicUsize::new(0),
                 recorded_limits: Mutex::new(Vec::new()),
@@ -573,6 +630,7 @@ mod tests {
         fn failing() -> Self {
             Self {
                 by_session: HashMap::new(),
+                hindsight: false,
                 fail: true,
                 recalls: std::sync::atomic::AtomicUsize::new(0),
                 recorded_limits: Mutex::new(Vec::new()),
@@ -673,13 +731,103 @@ mod tests {
 
     impl ::zeroclaw_api::attribution::Attributable for FixtureMemory {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Memory(
-                ::zeroclaw_api::attribution::MemoryKind::InMemory,
-            )
+            ::zeroclaw_api::attribution::Role::Memory(if self.hindsight {
+                ::zeroclaw_api::attribution::MemoryKind::Hindsight
+            } else {
+                ::zeroclaw_api::attribution::MemoryKind::InMemory
+            })
         }
         fn alias(&self) -> &str {
             "FixtureMemory"
         }
+    }
+
+    #[tokio::test]
+    async fn live_hindsight_recalls_its_authorized_bank_once_across_legacy_session_scopes() {
+        for (hindsight, mode, expected) in [
+            (
+                true,
+                zeroclaw_api::memory_traits::ContextRecallMode::Compact,
+                1,
+            ),
+            (
+                false,
+                zeroclaw_api::memory_traits::ContextRecallMode::Compact,
+                2,
+            ),
+            (
+                true,
+                zeroclaw_api::memory_traits::ContextRecallMode::Standard,
+                2,
+            ),
+        ] {
+            let mut memory = FixtureMemory::with(vec![]);
+            memory.hindsight = hindsight;
+            recall_memory_context(
+                &memory,
+                &crate::observability::NoopObserver,
+                "hello",
+                &[Some("conversation"), Some("sender")],
+                &MemoryInjectConfig {
+                    mode,
+                    ..Default::default()
+                },
+                false,
+                TurnMeta {
+                    parent_agent_alias: None,
+                    agent_alias: None,
+                    turn_id: "fixture",
+                    channel_name: "simplex",
+                },
+                &[],
+            )
+            .await;
+            assert_eq!(
+                memory.recalls.load(std::sync::atomic::Ordering::SeqCst),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_recall_does_not_append_a_truncated_copy_of_retained_full_evidence() {
+        let content = "A durable project decision with supporting details. ".repeat(25);
+        let memory = FixtureMemory::with(vec![entry(
+            "decision",
+            &content,
+            MemoryCategory::Core,
+            None,
+        )]);
+        let mut user = ChatMessage::user("earlier question");
+        user.recalled_memory = Some(RecalledMemoryContext {
+            entries: vec![RecalledMemoryEntry {
+                key: "decision".into(),
+                content,
+                stored_on: None,
+            }],
+        });
+        let cfg = MemoryInjectConfig {
+            date_stamp: false,
+            ..Default::default()
+        }
+        .for_live_voice();
+        let recalled = recall_memory_context(
+            &memory,
+            &crate::observability::NoopObserver,
+            "current question",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "fixture",
+                channel_name: "simplex",
+            },
+            &[user],
+        )
+        .await;
+        assert!(recalled.entries.is_empty());
     }
 
     #[tokio::test]

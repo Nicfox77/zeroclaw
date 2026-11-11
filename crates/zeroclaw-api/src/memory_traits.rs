@@ -303,6 +303,19 @@ pub enum MemoryPolicyDecision {
     Deny { reason: String },
 }
 
+/// Automatic retrieval effort for the current turn.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContextRecallMode {
+    #[default]
+    Standard,
+    /// Bound automatic retrieval for a latency-sensitive conversational turn.
+    Compact,
+}
+
+impl ContextRecallMode {
+    pub const COMPACT_MAX_TOKENS: usize = 256;
+}
+
 /// Core memory trait — implement for any persistence backend
 ///
 /// Some wrappers forward every method to another `Memory`, such as the
@@ -333,6 +346,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         _question: &str,
         limit: usize,
         session: Option<&str>,
+        _mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.recall(query, limit, session, None, None).await
     }
@@ -343,6 +357,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         _question: &str,
         limit: usize,
         session: Option<&str>,
+        _mode: ContextRecallMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.recall_for_principal(scope, query, limit, session, None, None)
             .await

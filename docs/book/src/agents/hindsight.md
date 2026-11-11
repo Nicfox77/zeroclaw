@@ -25,6 +25,23 @@ SQLite memories. Upstream adoption needs review against
 6. Retrieved evidence uses the existing structured, retained memory blocks. It is
    not ingested again as new source material.
 
+### Automatic recall during live voice
+
+Live SimpleX calls select a compact automatic recall policy from the incoming
+call scope. Each turn asks Hindsight for its `low` retrieval budget and up to
+256 tokens, honoring a smaller configured `recall_max_tokens` value. The prompt
+renderer allows up to two memories within 1024 characters including entry labels.
+Character limits are approximate token budgets because conversational models use
+different tokenizers.
+
+Live calls query the authorized Hindsight bank once. The legacy sender and
+conversation session IDs resolve to that same bank, so they share one lookup.
+
+Compact automatic recall uses native retrieval for historical questions too.
+The agent can call its explicit memory and reflection tools when deeper evidence
+is needed. Voice notes and text messages use the standard automatic policy.
+This selection is resolved for each turn and adds no persistent configuration.
+
 ### Growing conversation documents
 
 Each agent/principal/conversation/branch has one stable Hindsight document. The
