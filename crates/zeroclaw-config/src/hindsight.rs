@@ -124,6 +124,76 @@ impl Default for MentalModel {
     }
 }
 
+/// Admission policy for new Hindsight retention work; transcript capture is independent.
+#[derive(Clone, Debug, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.hindsight.retention"]
+#[serde(default)]
+pub struct Retention {
+    /// Queue writes for the worker rather than extracting inside a chat turn.
+    pub deferred: bool,
+    /// Optional daily HH:MM-HH:MM window, start inclusive and end exclusive.
+    /// Without a window, deferred retention requires a manual drain request.
+    pub window: Option<String>,
+    /// IANA timezone for the daily window, including daylight-saving transitions.
+    pub timezone: String,
+}
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            deferred: false,
+            window: None,
+            timezone: "UTC".into(),
+        }
+    }
+}
+impl Retention {
+    fn bounds(&self) -> anyhow::Result<Option<(chrono::NaiveTime, chrono::NaiveTime)>> {
+        self.window
+            .as_deref()
+            .map(|window| {
+                let (start, end) = window
+                    .split_once('-')
+                    .ok_or_else(|| anyhow::Error::msg("hindsight_invalid_retention_window"))?;
+                let parse = |value: &str| -> anyhow::Result<chrono::NaiveTime> {
+                    anyhow::ensure!(value.len() == 5, "hindsight_invalid_retention_window");
+                    chrono::NaiveTime::parse_from_str(value, "%H:%M")
+                        .map_err(|_| anyhow::Error::msg("hindsight_invalid_retention_window"))
+                };
+                let start = parse(start)?;
+                let end = parse(end)?;
+                anyhow::ensure!(start != end, "hindsight_invalid_retention_window");
+                Ok((start, end))
+            })
+            .transpose()
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| anyhow::Error::msg("hindsight_invalid_retention_timezone"))?;
+        self.bounds()?;
+        Ok(())
+    }
+    pub fn allows_at(&self, now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<bool> {
+        if !self.deferred {
+            return Ok(true);
+        }
+        let Some((start, end)) = self.bounds()? else {
+            return Ok(false);
+        };
+        let zone = self
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| anyhow::Error::msg("hindsight_invalid_retention_timezone"))?;
+        let time = now.with_timezone(&zone).time();
+        Ok(if start < end {
+            time >= start && time < end
+        } else {
+            time >= start || time < end
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory.hindsight"]
@@ -141,6 +211,8 @@ pub struct HindsightConfig {
     pub request_timeout_secs: u64,
     pub reflect_timeout_secs: u64,
     pub auto_retain: bool,
+    #[nested]
+    pub retention: Retention,
     pub auto_recall: bool,
     pub auto_reflect: bool,
     pub reflect_mode: ReflectMode,
@@ -177,6 +249,7 @@ impl Default for HindsightConfig {
             request_timeout_secs: 15,
             reflect_timeout_secs: 120,
             auto_retain: true,
+            retention: Retention::default(),
             auto_recall: true,
             auto_reflect: true,
             reflect_mode: ReflectMode::Adaptive,
@@ -220,6 +293,7 @@ pub fn validate_url(value: &str) -> anyhow::Result<url::Url> {
 }
 impl HindsightConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.retention.validate()?;
         let url = validate_url(&self.api_url)?;
         anyhow::ensure!(
             url.path() == "/" || url.path().is_empty(),
@@ -446,5 +520,101 @@ mod tests {
         c.models.decision_enabled = false;
         c.models.decision_recall_rerank = true;
         assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::Retention;
+    fn at(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+    #[test]
+    fn deferred_window_tracks_pacific_dst_and_excludes_closing_time() {
+        let policy = Retention {
+            deferred: true,
+            window: Some("04:00-08:00".into()),
+            timezone: "America/Los_Angeles".into(),
+        };
+        policy.validate().unwrap();
+        for (time, allowed) in [
+            ("2026-01-10T11:59:59Z", false),
+            ("2026-01-10T12:00:00Z", true),
+            ("2026-01-10T15:59:59Z", true),
+            ("2026-01-10T16:00:00Z", false),
+            ("2026-07-10T10:59:59Z", false),
+            ("2026-07-10T11:00:00Z", true),
+            ("2026-07-10T14:59:59Z", true),
+            ("2026-07-10T15:00:00Z", false),
+            ("2026-03-08T11:00:00Z", true),
+            ("2026-11-01T12:00:00Z", true),
+        ] {
+            assert_eq!(policy.allows_at(at(time)).unwrap(), allowed, "{time}");
+        }
+    }
+    #[test]
+    fn manual_only_and_overnight_windows_have_distinct_admission() {
+        let mut policy = Retention {
+            deferred: true,
+            ..Default::default()
+        };
+        assert!(!policy.allows_at(at("2026-01-01T12:00:00Z")).unwrap());
+        policy.window = Some("23:00-02:00".into());
+        for (time, allowed) in [
+            ("2026-01-01T23:00:00Z", true),
+            ("2026-01-02T01:59:59Z", true),
+            ("2026-01-02T02:00:00Z", false),
+            ("2026-01-02T12:00:00Z", false),
+        ] {
+            assert_eq!(policy.allows_at(at(time)).unwrap(), allowed);
+        }
+        assert!(
+            Retention::default()
+                .allows_at(at("2026-01-01T12:00:00Z"))
+                .unwrap()
+        );
+    }
+    #[test]
+    fn invalid_retention_policy_is_rejected_and_nested_props_roundtrip() {
+        for window in [
+            "04:00-04:00",
+            "25:00-08:00",
+            "4:00-08:00",
+            "04:00-08:00-extra",
+            "04:00",
+        ] {
+            let policy = Retention {
+                window: Some(window.into()),
+                ..Default::default()
+            };
+            assert!(policy.validate().is_err(), "{window}");
+        }
+        assert!(
+            Retention {
+                timezone: "invalid-zone".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        let mut config = crate::schema::Config::default();
+        config
+            .set_prop("memory.hindsight.retention.deferred", "true")
+            .unwrap();
+        config
+            .set_prop("memory.hindsight.retention.window", "04:00-08:00")
+            .unwrap();
+        config
+            .set_prop("memory.hindsight.retention.timezone", "America/Los_Angeles")
+            .unwrap();
+        let restored: crate::schema::Config =
+            toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(restored.memory.hindsight.retention.deferred);
+        assert_eq!(
+            restored.memory.hindsight.retention.window.as_deref(),
+            Some("04:00-08:00")
+        );
     }
 }

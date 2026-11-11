@@ -2,6 +2,7 @@
 pub mod client;
 pub mod delivery;
 pub mod ledger;
+pub mod retention;
 pub mod runtime;
 use crate::traits::{ContextRecallMode, Memory, MemoryCategory, MemoryEntry, PrincipalScope};
 use async_trait::async_trait;
@@ -518,6 +519,14 @@ impl HindsightMemory {
         if self.ledger.status(&operation)?.as_deref() == Some("completed") {
             return Ok(());
         }
+        // Deferred notes are durably accepted here; only the serialized worker
+        // may submit them, including while a scheduled/manual window is open.
+        let policy = self.policy()?;
+        if policy.retention.deferred
+            || !retention::allowed(&policy.retention, &self.ledger, chrono::Utc::now())?
+        {
+            return Ok(());
+        }
         anyhow::ensure!(
             self.ledger.note_is_next(&operation)?,
             "hindsight_retain_pending operation={operation}"
@@ -529,6 +538,12 @@ impl HindsightMemory {
         self.policy()?;
         self.prepare_bank(&bank, scope).await?;
         self.bank(scope)?;
+        let policy = self.policy()?;
+        if policy.retention.deferred
+            || !retention::allowed(&policy.retention, &self.ledger, chrono::Utc::now())?
+        {
+            return Ok(());
+        }
         self.client.retain(&bank, &note.items, &operation).await?;
         self.ledger.update(&operation, "processing")?;
         let deadline = tokio::time::Instant::now()

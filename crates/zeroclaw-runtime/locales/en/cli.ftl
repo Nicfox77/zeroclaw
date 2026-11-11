@@ -1803,3 +1803,9 @@ cli-hindsight-backfill-count = Scheduled resumable imports for { $count } conver
 
 cli-hindsight-agent-required = Select an agent with --agent.
 cli-hindsight-agent-unavailable = The selected memory agent is unavailable.
+
+cli-memory-retention-about = Inspect or control deferred Hindsight retention
+cli-memory-retention-status-about = Show the retention window, durable override and queued work
+cli-memory-retention-drain-about = Allow the running worker to drain queued retention for a bounded time
+cli-memory-retention-pause-about = Stop new submissions; already accepted work may still finish
+cli-memory-retention-resume-about = Clear the manual override and return to the configured schedule

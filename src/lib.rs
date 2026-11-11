@@ -926,6 +926,23 @@ Examples:
     },
 }
 
+/// Operator controls for durable Hindsight retention admission.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MemoryRetentionCommands {
+    /// Show the retention window, durable override and queued work.
+    Status,
+    /// Allow the running worker to drain queued retention for a bounded time.
+    Drain {
+        /// Maximum duration of the manual drain permission, in minutes.
+        #[arg(long, default_value_t = 240, value_parser = clap::value_parser!(u32).range(1..=1440))]
+        minutes: u32,
+    },
+    /// Stop new submissions; already accepted work may still finish.
+    Pause,
+    /// Clear the manual override and return to the configured schedule.
+    Resume,
+}
+
 /// Memory management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryCommands {
@@ -937,6 +954,11 @@ pub enum MemoryCommands {
     Setup,
     /// Retry and reconcile unfinished Hindsight deliveries.
     RetryPending,
+    /// Inspect or control deferred Hindsight retention.
+    Retention {
+        #[command(subcommand)]
+        command: MemoryRetentionCommands,
+    },
     /// Schedule a resumable import from canonical native conversation events.
     Backfill {
         #[arg(long)]
