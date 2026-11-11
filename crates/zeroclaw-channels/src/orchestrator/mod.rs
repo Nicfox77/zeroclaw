@@ -6468,23 +6468,31 @@ async fn run_draft_updater_with_leak_detection(
                                 .is_none_or(|recipient| recipient == reply_target)
                     })
                 });
-                if outbound_hooks.is_none()
-                    && preview_route
-                    && let Err(e) = session_history::observe_delivery(
-                        "update_draft",
-                        channel.name(),
-                        &reply_target,
-                        &visible,
-                        channel.update_draft(&reply_target, &draft_id, &visible),
-                    )
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                if outbound_hooks.is_none() && preview_route {
+                    let update = channel.update_draft(&reply_target, &draft_id, &visible);
+                    let result = if channel.buffers_draft_text_updates() {
+                        update.await
+                    } else {
+                        session_history::observe_delivery(
+                            "update_draft",
+                            channel.name(),
+                            &reply_target,
+                            &visible,
+                            update,
+                        )
+                        .await
+                    };
+                    if let Err(e) = result {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Draft update failed"
-                    );
+                            "Draft update failed"
+                        );
+                    }
                 }
             }
             StreamDelta::FlushBarrier(ack) => {
@@ -9314,7 +9322,20 @@ async fn process_channel_message_body_inner(
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
     if let Some(native) = &native_history {
-        match native.restore_context().await {
+        let restore_started = std::time::Instant::now();
+        let restored = native.restore_context().await;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                serde_json::json!({
+                    "restore_ms": restore_started.elapsed().as_millis(),
+                    "restored": matches!(&restored, Ok(Some(_))),
+                    "restore_failed": restored.is_err(),
+                })
+            ),
+            "channel_context_restore_timing"
+        );
+        match restored {
             Ok(Some(context)) => {
                 ctx.conversation_histories
                     .lock()
