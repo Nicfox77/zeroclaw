@@ -522,10 +522,12 @@ pub async fn recall_memory_context(
             content,
             stored_on: stamp.map(str::to_owned),
         };
-        if prior
-            .get(entry.key.as_str())
-            .is_some_and(|previous| **previous == snapshot)
-        {
+        if prior.get(entry.key.as_str()).is_some_and(|previous| {
+            **previous == snapshot
+                || (cfg.mode == zeroclaw_api::memory_traits::ContextRecallMode::Compact
+                    && previous.content == entry.content
+                    && previous.stored_on == snapshot.stored_on)
+        }) {
             continue;
         }
         if used_chars + line_chars > cfg.max_total_chars {
@@ -785,6 +787,47 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn compact_recall_does_not_append_a_truncated_copy_of_retained_full_evidence() {
+        let content = "A durable project decision with supporting details. ".repeat(25);
+        let memory = FixtureMemory::with(vec![entry(
+            "decision",
+            &content,
+            MemoryCategory::Core,
+            None,
+        )]);
+        let mut user = ChatMessage::user("earlier question");
+        user.recalled_memory = Some(RecalledMemoryContext {
+            entries: vec![RecalledMemoryEntry {
+                key: "decision".into(),
+                content,
+                stored_on: None,
+            }],
+        });
+        let cfg = MemoryInjectConfig {
+            date_stamp: false,
+            ..Default::default()
+        }
+        .for_live_voice();
+        let recalled = recall_memory_context(
+            &memory,
+            &crate::observability::NoopObserver,
+            "current question",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "fixture",
+                channel_name: "simplex",
+            },
+            &[user],
+        )
+        .await;
+        assert!(recalled.entries.is_empty());
     }
 
     #[tokio::test]
