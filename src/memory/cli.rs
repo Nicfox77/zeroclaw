@@ -40,17 +40,68 @@ fn mt_args(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
 /// Handle `zeroclaw memory <subcommand>` CLI commands.
 pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> Result<()> {
     match command {
+        crate::MemoryCommands::Status | crate::MemoryCommands::Health => {
+            if config.memory.backend.trim() == "hindsight" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &super::hindsight::runtime::status(config).await?
+                    )?
+                );
+                Ok(())
+            } else {
+                handle_stats(config).await
+            }
+        }
+        crate::MemoryCommands::Setup => {
+            super::hindsight::runtime::setup(config)?;
+            println!(
+                "{}",
+                mt(
+                    "cli-hindsight-setup-complete",
+                    "Protected Hindsight profile written. Provision the pinned runtime and cached models before startup."
+                )
+            );
+            Ok(())
+        }
+        crate::MemoryCommands::RetryPending => {
+            anyhow::ensure!(
+                config.memory.backend.trim() == "hindsight",
+                "{}",
+                mt(
+                    "cli-hindsight-required",
+                    "Hindsight must be the selected memory backend."
+                )
+            );
+            let count =
+                super::hindsight::ledger::Ledger::open(&config.data_dir)?.retry_pending()?;
+            println!(
+                "{}",
+                mt_args(
+                    "cli-hindsight-retry-count",
+                    &[("count", &count.to_string())],
+                    "Unfinished Hindsight deliveries scheduled for reconciliation."
+                )
+            );
+            Ok(())
+        }
         crate::MemoryCommands::List {
+            agent,
             category,
             session,
             limit,
             offset,
-        } => handle_list(config, category, session, limit, offset).await,
-        crate::MemoryCommands::Get { key } => handle_get(config, &key).await,
-        crate::MemoryCommands::Stats => handle_stats(config).await,
-        crate::MemoryCommands::Clear { key, category, yes } => {
-            handle_clear(config, key, category, yes).await
+        } => handle_list(config, category, session, limit, offset, agent.as_deref()).await,
+        crate::MemoryCommands::Get { key, agent } => {
+            handle_get(config, &key, agent.as_deref()).await
         }
+        crate::MemoryCommands::Stats => handle_stats(config).await,
+        crate::MemoryCommands::Clear {
+            key,
+            category,
+            yes,
+            agent,
+        } => handle_clear(config, key, category, yes, agent.as_deref()).await,
         crate::MemoryCommands::Reindex => handle_reindex(config).await,
     }
 }
@@ -97,14 +148,56 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
     }
 }
 
+async fn scoped_cli_memory(
+    config: &Config,
+    agent: Option<&str>,
+) -> Result<std::sync::Arc<dyn Memory>> {
+    if config.memory.backend != "hindsight" && agent.is_none() {
+        return Ok(std::sync::Arc::from(create_cli_memory(config)?));
+    }
+    let alias = agent.ok_or_else(|| {
+        anyhow::Error::msg(mt(
+            "cli-hindsight-agent-required",
+            "Select an agent with --agent.",
+        ))
+    })?;
+    anyhow::ensure!(
+        config.agent(alias).is_some_and(|a| a.enabled),
+        "{}",
+        mt(
+            "cli-hindsight-agent-unavailable",
+            "The selected memory agent is unavailable."
+        )
+    );
+    let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+    let memory = Box::pin(zeroclaw_memory::create_memory_for_agent_live(
+        &live.handle(),
+        alias,
+        None,
+    ))
+    .await?;
+    if config.memory.backend == "hindsight" {
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new(
+            zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR,
+        )
+        .with_agent(Some(alias.into()));
+        Ok(std::sync::Arc::new(
+            zeroclaw_memory::principal_plane::PrincipalPlaneMemory::new(memory, scope),
+        ))
+    } else {
+        Ok(memory)
+    }
+}
+
 async fn handle_list(
     config: &Config,
     category: Option<String>,
     session: Option<String>,
     limit: usize,
     offset: usize,
+    agent: Option<&str>,
 ) -> Result<()> {
-    let mem = create_cli_memory(config)?;
+    let mem = scoped_cli_memory(config, agent).await?;
     let cat = category.as_deref().map(parse_category);
     let entries = mem.list(cat.as_ref(), session.as_deref()).await?;
 
@@ -160,8 +253,8 @@ async fn handle_list(
     Ok(())
 }
 
-async fn handle_get(config: &Config, key: &str) -> Result<()> {
-    let mem = create_cli_memory(config)?;
+async fn handle_get(config: &Config, key: &str, agent: Option<&str>) -> Result<()> {
+    let mem = scoped_cli_memory(config, agent).await?;
 
     // Try exact match first.
     if let Some(entry) = mem.get(key).await? {
@@ -247,6 +340,13 @@ fn print_entry(entry: &super::traits::MemoryEntry) {
 }
 
 async fn handle_stats(config: &Config) -> Result<()> {
+    if config.memory.backend == "hindsight" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&super::hindsight::runtime::status(config).await?)?
+        );
+        return Ok(());
+    }
     let mem = create_cli_memory(config)?;
     let healthy = mem.health_check().await;
     let total = mem.count().await.unwrap_or(0);
@@ -317,6 +417,7 @@ async fn handle_clear(
     key: Option<String>,
     category: Option<String>,
     yes: bool,
+    agent: Option<&str>,
 ) -> Result<()> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(
@@ -325,7 +426,7 @@ async fn handle_clear(
     ) {
         bail!(unsupported_clear_backend_message(&backend));
     }
-    let mem = create_cli_memory(config)?;
+    let mem = scoped_cli_memory(config, agent).await?;
 
     // Single-key deletion (exact or prefix match).
     if let Some(key) = key {
@@ -509,7 +610,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        handle_list(&config, None, None, 10, 0).await.unwrap();
+        handle_list(&config, None, None, 10, 0, None).await.unwrap();
 
         let reopened = SqliteMemory::new("sqlite", tmp.path()).unwrap();
         assert!(reopened.get("protected").await.unwrap().is_some());
@@ -567,6 +668,7 @@ mod tests {
 
         let err = handle_command(
             crate::MemoryCommands::Clear {
+                agent: None,
                 key: None,
                 category: None,
                 yes: true,
@@ -591,6 +693,7 @@ mod tests {
 
         let err = handle_command(
             crate::MemoryCommands::Clear {
+                agent: None,
                 key: None,
                 category: None,
                 yes: true,
@@ -613,6 +716,7 @@ mod tests {
 
         let err = handle_command(
             crate::MemoryCommands::Clear {
+                agent: None,
                 key: None,
                 category: None,
                 yes: true,

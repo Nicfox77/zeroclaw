@@ -1608,7 +1608,7 @@ impl DelegateTool {
         let memory = self
             .target_binding()
             .capabilities
-            .agent_memory(config, agent_name)
+            .agent_memory_with_policy(config, agent_name, self.live_config.as_ref())
             .await?;
         let scope = self.principal_scope.read().clone();
         Ok(Some(match scope {

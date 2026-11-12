@@ -130,7 +130,14 @@ pub async fn seed_default_personality(
         include_memory,
         ..Default::default()
     };
-    crate::agent::personality_templates::ensure_personality_preset(workspace_dir, &ctx).await
+    crate::agent::personality_templates::ensure_personality_preset_for_backend(
+        workspace_dir,
+        &ctx,
+        config.agents.get(alias).is_some_and(|a| {
+            a.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight
+        }),
+    )
+    .await
 }
 
 /// Load a specific set of personality files from a workspace directory.
@@ -141,6 +148,11 @@ pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> Perso
         let path = workspace_dir.join(filename);
         match std::fs::read_to_string(&path) {
             Ok(raw) => {
+                let raw = if !filenames.contains(&"MEMORY.md") {
+                    super::personality_templates::without_manual_memory(filename, &raw)
+                } else {
+                    raw
+                };
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
                     profile.missing.push(filename.to_string());

@@ -724,6 +724,20 @@ pub async fn run_with_authority(
     Option<crate::live_config_authority::ConfigOwnershipGuard>,
 )> {
     let config = live_config_authority.snapshot_config();
+    let _hindsight_runtime = match zeroclaw_memory::hindsight::runtime::Managed::start(
+        live_config_authority.live_handle(),
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            crate::health::mark_component_error("hindsight", error.to_string());
+            None
+        }
+    };
+    let _hindsight_worker =
+        zeroclaw_memory::hindsight::upstream::start(live_config_authority.live_handle());
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability

@@ -1339,7 +1339,9 @@ async fn run_agent_job_inner(
                     .with_attrs(error_attributes),
                 "cron_agent_job_failed"
             );
-            if matches!(job.session_target, SessionTarget::Isolated) {
+            if matches!(job.session_target, SessionTarget::Isolated)
+                && config.memory.backend != "hindsight"
+            {
                 let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
                     "cli:{}",
                     session_path.display()

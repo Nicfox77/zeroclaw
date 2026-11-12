@@ -131,6 +131,7 @@ pub mod wrappers;
 mod coding_agent_budget_tests;
 
 pub const MEMORY_TOOL_NAMES: &[&str] = &[
+    "hindsight_reflect",
     "memory_store",
     "memory_recall",
     "memory_forget",

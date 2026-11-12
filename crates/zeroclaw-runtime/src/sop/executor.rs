@@ -761,9 +761,15 @@ async fn headless_step_memory(
     let api_key = config
         .resolved_model_provider_for_agent(agent_alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    crate::agent::turn::step_agent_memory(config, agent_alias, api_key.as_deref(), Some(owner))
-        .await
-        .map(Some)
+    crate::agent::turn::step_agent_memory(
+        config,
+        agent_alias,
+        api_key.as_deref(),
+        Some(owner),
+        None,
+    )
+    .await
+    .map(Some)
 }
 
 /// Test-only: the owner of the memory override each headless step turn was

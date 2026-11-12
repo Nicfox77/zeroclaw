@@ -83,6 +83,7 @@
   - [Delegation & SubAgents](./agents/delegation.md)
   - [Runtime internals](./agents/internals.md)
   - [History management](./agents/history-management.md)
+  - [Hindsight memory](./agents/hindsight.md)
 - [Model Providers](./providers/overview.md)
   - [Provider catalog](./providers/catalog.md)
   - [Configuration](./providers/configuration.md)

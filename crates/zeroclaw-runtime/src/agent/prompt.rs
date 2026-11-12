@@ -344,7 +344,7 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        let profile = if ctx.inject_memory {
+        let mut profile = if ctx.inject_memory {
             personality::load_personality(ctx.agent_workspace_dir)
         } else {
             personality::load_personality_files(
@@ -352,6 +352,12 @@ impl PromptSection for IdentitySection {
                 &personality::personality_files_without_memory(),
             )
         };
+        if !ctx.inject_memory {
+            for file in &mut profile.files {
+                file.content =
+                    super::personality_templates::without_manual_memory(&file.name, &file.content);
+            }
+        }
         prompt.push_str(&profile.render());
 
         Ok(prompt)

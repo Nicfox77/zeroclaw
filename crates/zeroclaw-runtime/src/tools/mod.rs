@@ -19,6 +19,7 @@ pub mod delegate;
 mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
+pub mod hindsight;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
@@ -936,6 +937,43 @@ impl Memory for NativeMemoryBinding {
         self.selected().principal_scope()
     }
 
+    async fn recall_context(
+        &self,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+        mode: zeroclaw_api::memory_traits::ContextRecallMode,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation()
+            .recall_context(query, question, limit, session, mode)
+            .await
+    }
+    async fn recall_context_for_principal(
+        &self,
+        scope: &zeroclaw_api::memory_traits::PrincipalScope,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+        mode: zeroclaw_api::memory_traits::ContextRecallMode,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation()
+            .recall_context_for_principal(scope, query, question, limit, session, mode)
+            .await
+    }
+    async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation().reflect(query).await
+    }
+    async fn reflect_for_principal(
+        &self,
+        scope: &zeroclaw_api::memory_traits::PrincipalScope,
+        query: &str,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.begin_operation()
+            .reflect_for_principal(scope, query)
+            .await
+    }
     async fn store(
         &self,
         key: &str,
@@ -1280,6 +1318,7 @@ impl Memory for NativeMemoryBinding {
 /// These kinds are stamped only by the actual fixed native constructors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NativeMemoryKind {
+    HindsightReflect,
     Store,
     Recall,
     Forget,
@@ -1343,6 +1382,11 @@ impl NativeMemoryOrigins {
             .as_ref()
             .map(|chain| chain.weak_policy_observations());
         let actual: Arc<dyn Tool> = match kind {
+            NativeMemoryKind::HindsightReflect => Arc::new(hindsight::HindsightTool::new(
+                memory,
+                security,
+                hindsight::Operation::Reflect,
+            )),
             NativeMemoryKind::Store => Arc::new(MemoryStoreTool::new(memory, security)),
             NativeMemoryKind::Recall => Arc::new(MemoryRecallTool::new(memory)),
             NativeMemoryKind::Forget => Arc::new(MemoryForgetTool::new(memory, security)),
@@ -2515,8 +2559,28 @@ fn all_tools_with_runtime_on_thread(
         "cron_runs",
         Arc::new(CronRunsTool::new(config.clone(), agent_alias))
     );
-    register_tool!("memory_store", construct_memory(NativeMemoryKind::Store));
-    register_tool!("memory_recall", construct_memory(NativeMemoryKind::Recall));
+    if matches!(
+        memory.role(),
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::Hindsight)
+    ) {
+        // Reserve suppressed native names too: plugins cannot reintroduce a
+        // duplicate manual path under names callers recognize as native.
+        for name in [
+            "memory_store",
+            "memory_recall",
+            "hindsight_retain",
+            "hindsight_recall",
+        ] {
+            reserved_host_names.insert(name.to_owned());
+        }
+        register_tool!(
+            "hindsight_reflect",
+            construct_memory(NativeMemoryKind::HindsightReflect)
+        );
+    } else {
+        register_tool!("memory_store", construct_memory(NativeMemoryKind::Store));
+        register_tool!("memory_recall", construct_memory(NativeMemoryKind::Recall));
+    }
     register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));
     register_tool!("memory_export", construct_memory(NativeMemoryKind::Export));
     register_tool!("memory_purge", construct_memory(NativeMemoryKind::Purge));
@@ -4451,6 +4515,108 @@ mod tests {
         );
         assert_eq!(constructions.get(), 1);
         assert_eq!(registry[0].spec().name, "calculator");
+    }
+
+    #[tokio::test]
+    async fn hindsight_assembly_exposes_reflection_without_manual_memory_paths() {
+        use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.tools.optional = vec!["hindsight_reflect".into()];
+        config.memory.backend = "hindsight".into();
+        config.memory.hindsight.mode = zeroclaw_config::hindsight::RuntimeMode::External;
+        config.channels.session_persistence = true;
+        config.channels.session_backend = "sqlite".into();
+        config
+            .agents
+            .insert("fixture".into(), AliasedAgentConfig::default());
+        config.agents.get_mut("fixture").unwrap().memory.backend =
+            zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight;
+        config.agents.get_mut("fixture").unwrap().model_provider = "openai.fixture".into();
+        config
+            .providers
+            .models
+            .openai
+            .insert("fixture".into(), Default::default());
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let memory = zeroclaw_memory::create_memory_for_agent_live(&live.handle(), "fixture", None)
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().into(),
+            ..Default::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let built = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "fixture",
+            Arc::clone(&runtime),
+            memory,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            tmp.path(),
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        for name in [
+            "memory_store",
+            "memory_recall",
+            "hindsight_retain",
+            "hindsight_recall",
+        ] {
+            assert!(
+                built.reserved_host_names.contains(name),
+                "suppressed name must stay reserved: {name}"
+            );
+        }
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "fixture",
+            security: &security,
+            built,
+            skills: &[],
+            runtime,
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+        let names: Vec<_> = assembled.registry.iter().map(|t| t.spec().name).collect();
+        assert!(names.iter().any(|n| n == "hindsight_reflect"));
+        for name in [
+            "memory_store",
+            "memory_recall",
+            "hindsight_retain",
+            "hindsight_recall",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == name),
+                "manual path leaked: {name}"
+            );
+        }
+        assert!(!config.data_dir.join("brain.db").exists());
     }
 
     #[tokio::test]
@@ -8647,12 +8813,18 @@ permissions = ["http_client"]
     #[tokio::test]
     async fn every_inventoried_tool_registers_under_a_maximal_config() {
         // Rows a unit test cannot construct, with the reason.
-        let unconstructible = std::collections::BTreeMap::from([(
-            "tool_search",
-            "assembly mints it only behind two gates: `mcp.deferred_loading`, which \
+        let unconstructible = std::collections::BTreeMap::from([
+            (
+                "hindsight_reflect",
+                "requires the exclusive Hindsight backend; covered by hindsight_assembly_exposes_reflection_without_manual_memory_paths",
+            ),
+            (
+                "tool_search",
+                "assembly mints it only behind two gates: `mcp.deferred_loading`, which \
              defaults to false and is on here, and an MCP registry that advertises at \
              least one tool, which only a connected MCP server does",
-        )]);
+            ),
+        ]);
         for name in unconstructible.keys() {
             assert!(
                 zeroclaw_tools::inventory::is_builtin_tool_name(name),

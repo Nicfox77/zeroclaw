@@ -7184,13 +7184,23 @@ impl RpcDispatcher {
             }
             Ok(guard)
         };
+        let hindsight_scope = self
+            .ctx
+            .sessions
+            .session_owner_principal(sid)
+            .await
+            .flatten()
+            .map(|owner| {
+                zeroclaw_api::memory_traits::PrincipalScope::new(owner)
+                    .with_agent(Some(agent_alias.clone()))
+            });
         let turn = crate::rpc::turn::execute_turn_prepared(
             agent,
             prompt.clone(),
             cancel.clone(),
             TurnAttribution {
                 session_key: Some(sid.to_string()),
-                agent_alias,
+                agent_alias: agent_alias.clone(),
                 model_provider,
                 model,
                 channel: "rpc",
@@ -7470,13 +7480,32 @@ impl RpcDispatcher {
                     // already trimmed underneath it.
                     let agent = agent.lock().await;
                     let durable = zeroclaw_providers::durable_chat_messages(agent.history());
-                    replace_rpc_chat_conversation_state(
+                    let persisted = replace_rpc_chat_conversation_state(
                         backend.as_ref(),
                         sid,
                         &key,
                         &durable,
                         agent.history_has_trim_breadcrumb(),
                     );
+                    if persisted
+                        && let Ok(TurnOutcome::Completed { text, .. }) = &outcome
+                        && let Some(scope) = hindsight_scope.as_ref()
+                        && zeroclaw_memory::hindsight::upstream::capture_completed_turn(
+                            &self.ctx.config,
+                            scope,
+                            &key,
+                            &turn_id,
+                            &req.prompt,
+                            text,
+                        )
+                        .is_err()
+                    {
+                        zeroclaw_log::record!(
+                            WARN,
+                            zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Note),
+                            "hindsight_turn_capture_failed"
+                        );
+                    }
                 }
             }
         }
@@ -9531,14 +9560,18 @@ impl RpcDispatcher {
         let api_key = config
             .resolved_model_provider_for_agent(alias)
             .and_then(|(_, _, provider)| provider.api_key.clone());
-        let shared = zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
-            .await
-            .map_err(|error| {
-                rpc_err(
-                    INTERNAL_ERROR,
-                    format!("Agent memory unavailable: {error:#}"),
-                )
-            })?;
+        let shared = zeroclaw_memory::create_memory_for_agent_live(
+            &self.ctx.config,
+            alias,
+            api_key.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Agent memory unavailable: {error:#}"),
+            )
+        })?;
         Ok((shared, Some(alias.to_string())))
     }
 

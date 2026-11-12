@@ -101,6 +101,21 @@ impl MemoryInjectConfig {
         memory: &zeroclaw_config::schema::MemoryConfig,
         limit: usize,
     ) -> Self {
+        if memory.backend == "hindsight" {
+            let chars = memory.hindsight.recall_max_tokens.saturating_mul(4);
+            return Self {
+                limit: if memory.hindsight.auto_recall {
+                    limit
+                } else {
+                    0
+                },
+                max_entries: limit,
+                entry_max_chars: chars,
+                max_total_chars: chars,
+                date_stamp: true,
+                ..Default::default()
+            };
+        }
         let limit = if memory.rerank_enabled {
             rerank::bounded_final_limit(limit)
         } else {
@@ -275,6 +290,9 @@ pub async fn render_memory_context(
     exclude_conversation: bool,
     turn: TurnMeta<'_>,
 ) -> String {
+    if cfg.limit == 0 {
+        return String::new();
+    }
     let backend = mem.name().to_string();
     let query_summary = make_query_summary(user_msg);
 
@@ -303,7 +321,13 @@ pub async fn render_memory_context(
     };
     for session_id in scopes {
         match mem
-            .recall(user_msg, recall_limit, *session_id, None, None)
+            .recall_context(
+                user_msg,
+                user_msg,
+                recall_limit,
+                *session_id,
+                zeroclaw_api::memory_traits::ContextRecallMode::Standard,
+            )
             .await
         {
             Ok(recalled) => {
@@ -332,7 +356,14 @@ pub async fn render_memory_context(
         turn_id: Some(turn.turn_id.to_string()),
     });
 
-    if cfg.rerank_enabled {
+    if cfg.rerank_enabled
+        && !matches!(
+            mem.role(),
+            zeroclaw_api::attribution::Role::Memory(
+                zeroclaw_api::attribution::MemoryKind::Hindsight
+            )
+        )
+    {
         // Relevance plane: blend (retrieval + importance + recency), collapse
         // near-duplicates, optionally diversify via MMR, apply the floor, and
         // trim back to the recall limit. The blend's recency factor subsumes
@@ -346,7 +377,10 @@ pub async fn render_memory_context(
             }
             !should_skip_entry(&entry.key, &entry.content)
         });
-    } else {
+    } else if !matches!(
+        mem.role(),
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::Hindsight)
+    ) {
         // Older non-Core memories score lower; Core is evergreen.
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
     }

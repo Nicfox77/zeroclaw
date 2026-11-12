@@ -149,6 +149,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
+        name: "hindsight_reflect",
+        tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
         name: "memory_store",
         tier: ToolTier::Core,
         compilation: BuiltinToolCompilation::Always,

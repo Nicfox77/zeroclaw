@@ -1764,3 +1764,16 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+cli-hindsight-tool-reflect = Reason across my long-term memories using Hindsight reflection and supporting references. The result is generated synthesis, not independently verified fact.
+cli-hindsight-query-required = A nonempty memory query is required.
+
+cli-memory-status-about = Show backend availability and durable delivery diagnostics
+cli-memory-health-about = Check the configured memory service
+cli-memory-setup-about = Write the protected Hindsight daemon profile after explicit provisioning
+cli-memory-retry-pending-about = Retry and reconcile unfinished Hindsight deliveries
+cli-hindsight-setup-complete = Protected Hindsight profile written. Provision the pinned runtime and cached models before startup.
+cli-hindsight-required = Hindsight must be the selected memory backend.
+cli-hindsight-retry-count = Scheduled { $count } unfinished deliveries for reconciliation.
+cli-hindsight-agent-required = Select an agent with --agent.
+cli-hindsight-agent-unavailable = The selected memory agent is unavailable.

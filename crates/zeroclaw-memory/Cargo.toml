@@ -9,6 +9,7 @@ homepage.workspace = true
 publish = true
 
 [dependencies]
+zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-providers.workspace = true

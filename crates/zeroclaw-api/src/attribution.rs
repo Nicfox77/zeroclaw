@@ -364,6 +364,7 @@ pub enum TunnelProviderKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum MemoryKind {
+    Hindsight,
     Sqlite,
     Json,
     InMemory,

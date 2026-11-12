@@ -1,0 +1,61 @@
+# Hindsight memory without a session-history dependency
+
+Hindsight is an exclusive long-term memory backend. Its LLM extracts and consolidates memories; the main agent receives automatic retrieval and can request deeper synthesis with `hindsight_reflect`. The agent does not receive `memory_store`, `memory_recall`, `hindsight_retain`, or `hindsight_recall`. Native deletion tools retain their existing policy checks.
+
+This feature does not install the proposed native session-event history subsystem. Upstream SQLite sessions remain the authority for session ownership and deletion. Hindsight owns extracted memories. A protected delivery outbox temporarily owns pending extraction payloads; it is not searchable memory, a resume transcript, or a history export.
+
+## Configuration
+
+Start with an independently provisioned Hindsight service and a normal configured agent. Select `hindsight` both globally and for that agent, enable SQLite session persistence, and disable the local memory processors rejected by configuration validation. Other enabled agents must select Hindsight or `none`; cross-agent memory grants are unsupported.
+
+```toml
+[memory]
+backend = "hindsight"
+
+[memory.hindsight]
+mode = "external"
+api_url = "http://127.0.0.1:9077"
+auto_retain = true
+auto_recall = true
+
+[channels]
+session_persistence = true
+session_backend = "sqlite"
+
+[agents.assistant.memory]
+backend = "hindsight"
+```
+
+Use the normal secret configuration mechanism for service credentials. Never commit credentials or a managed runtime profile. Managed mode additionally requires provisioning the pinned runtime/models and running `zeroclaw memory setup`; setup writes a protected profile, not a runtime installation. Start the daemon to run the background delivery worker. `zeroclaw memory status` reports service and delivery diagnostics; `zeroclaw memory retry-pending` schedules unfinished operations for reconciliation.
+
+Hindsight reflection is an optional built-in: full tool selection includes it; minimal selection can add `hindsight_reflect` to `[tools].optional`. Permission policy still controls its availability. Turning off automatic recall does not restore manual recall or write tools.
+
+## Public source adapter
+
+The public adapter accepts completed, successful turns from authenticated RPC Chat sessions and sender-scoped channels. Capture checks the admitted agent/principal against current session ownership and live channel admission policy. Anonymous legacy WebSocket sessions, unowned RPC sessions, ACP/Code, cron, nested work, and shared-room channel sessions are not automatic retention sources. Shared-room metadata currently records the latest sender, which is insufficient authority for a private memory bank.
+
+The handoff stages the original admitted request and accepted final response. Tool output, hidden reasoning, injected retrieval context, and intermediate provider messages are excluded. Capture timestamps are explicitly identified as capture times, not original speech or message timestamps. Native history remains necessary for full-fidelity steering/intermediate-message replay.
+
+A stable turn identity makes repeated capture idempotent. The SQLite outbox survives restart and context trimming, including deferred extraction windows. The HTTP delivery ledger reconciles uncertain acknowledgments and remote asynchronous operations before retrying. Payloads are released after acknowledgment; identity receipts remain for deletion reconciliation. Queue capacity is bounded; a full queue or failed handoff reports `hindsight_turn_capture_failed` and does not prevent the user's chat response. Operators must investigate these errors: there is no silent historical backfill.
+
+The upstream session write and outbox write are separate transactions. A crash between them can leave a completed session turn uncaptured. This adapter does not claim exactly-once capture across that boundary. Closing that window requires an upstream commit/outbox seam, not copying the native-history feature into this backend.
+
+Deleting a whole source session invalidates source visibility and schedules remote document erasure. Recall fails closed until the affected source audit completes. Changing owner, revoking admission, or an unreadable source also fails closed. Transcript trimming is not memory erasure. Public upstream does not supply individual-turn erasure/replay authority, and acknowledged outbox payloads cannot be reconstructed for partial replay; such a request fails explicitly. Use Hindsight memory deletion for individual extracted memories.
+
+## Backend and host boundary
+
+`hindsight::source::TranscriptAuthority` supplies admitted execution scope and synchronous source-visibility checks. Explicitly principal-bound memory calls remain the preferred API. The unbound authority rejects reads of banks with transcript sources. `hindsight::delivery::TranscriptSource` supplies resumable source references, payload loading, and visibility checks. Separating visibility from payload loading lets the public outbox release acknowledged text without pretending that text is a permanent archive.
+
+A host with native events can keep its existing event-backed delivery source and provide its own authority through `create_memory_for_agent_live_with_authority`. No native event types, installation guards, session catalog, history schema, or history migration are required by the shared Hindsight backend. Stable bank, document, stream, and operation identities are unchanged for existing native hosts.
+
+The private downstream uses this seam to preserve its canonical event capture, original timestamps, steering records, historical imports, and erasure/replay support. It does not enable the public adapter in parallel and does not re-ingest existing conversations.
+
+## Prompts and migration
+
+Hindsight extraction and identity orientation are supplied to Hindsight's own service configuration and bank mission. The main agent's generated prompt does not assign memory writing duties when no memory-write tool is registered. File-based `MEMORY.md` is excluded from Hindsight prompt construction. Untouched stock workspace instructions are rendered without manual memory duties; customized workspace files remain user-owned and must be reviewed explicitly for old `memory_store`, `memory_recall`, daily-note, and `MEMORY.md` instructions.
+
+Selecting Hindsight does not import or delete an existing local memory database. There is no public `memory backfill` command because mutable transcripts cannot prove historical completeness. Keep the previous backend and configuration for rollback. Disabling this feature stops new capture; preserve the protected Hindsight directory if outstanding deliveries need reconciliation.
+
+## Review boundaries
+
+This is a backend proposal, not an implementation or acceptance of the permanent-history RFC. ADR-010 remains proposed; this exclusive remote backend and its explicit completed-turn ingestion need review against that proposal's enrichment and transcript-authority requirements. Runtime changes are composition and existing-agent/tool wiring; the implementation resides in `zeroclaw-memory`, configuration in `zeroclaw-config`, and the strict ownership read in `zeroclaw-infra`. Upstream reviewers must resolve any holding-crate exception needed before merging.

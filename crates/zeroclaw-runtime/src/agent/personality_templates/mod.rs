@@ -69,6 +69,31 @@ pub fn render(filename: &str, ctx: &TemplateContext) -> Option<String> {
     Some(substitute(raw, ctx))
 }
 
+/// Adapt only untouched stock instructions. Custom workspace policies remain
+/// user-owned and need an explicit migration, never fuzzy text rewriting.
+pub fn without_manual_memory(filename: &str, content: &str) -> String {
+    if filename == "AGENTS.md"
+        && let (Some((title, body)), Some((_, stock))) = (
+            content.trim().split_once('\n'),
+            AGENTS.trim().split_once('\n'),
+        )
+        && body == stock
+    {
+        let (_, rest) = AGENTS_NO_MEMORY.split_once("## Safety").unwrap_or(("", ""));
+        return format!(
+            "{title}\n\nUse the supplied identity and conversation context. Persistent memory, when enabled, is handled outside these workspace files.\n\n## Safety{rest}"
+        );
+    }
+    if filename == "TOOLS.md" && content.trim() == TOOLS.trim() {
+        let start = TOOLS.find("- **memory_store**");
+        let end = TOOLS.find("\n---");
+        if let (Some(start), Some(end)) = (start, end) {
+            return format!("{}{}", &TOOLS[..start], &TOOLS[end..]);
+        }
+    }
+    content.to_owned()
+}
+
 /// Render the full default preset for every editable file.
 #[must_use]
 pub fn render_preset_default(ctx: &TemplateContext) -> Vec<(&'static str, String)> {
@@ -83,8 +108,24 @@ pub async fn ensure_personality_preset(
     workspace_dir: &Path,
     ctx: &TemplateContext,
 ) -> std::io::Result<Vec<&'static str>> {
+    ensure_personality_preset_for_backend(workspace_dir, ctx, false).await
+}
+
+pub async fn ensure_personality_preset_for_backend(
+    workspace_dir: &Path,
+    ctx: &TemplateContext,
+    automatic_memory: bool,
+) -> std::io::Result<Vec<&'static str>> {
     let mut written = Vec::new();
     for (filename, content) in render_preset_default(ctx) {
+        if automatic_memory && filename == "MEMORY.md" {
+            continue;
+        }
+        let content = if automatic_memory {
+            without_manual_memory(filename, &content)
+        } else {
+            content
+        };
         let path = workspace_dir.join(filename);
         let needs_seed = match tokio::fs::read_to_string(&path).await {
             Ok(existing) => existing.trim().is_empty(),
@@ -263,5 +304,24 @@ mod tests {
             .await
             .unwrap();
         assert!(!agents.trim().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod automatic_memory_tests {
+    use super::*;
+    #[test]
+    fn stock_prompts_stop_assigning_manual_memory_work_but_custom_files_are_preserved() {
+        let stock = render("AGENTS.md", &TemplateContext::default()).unwrap();
+        let adapted = without_manual_memory("AGENTS.md", &stock);
+        assert!(!adapted.contains("memory_recall"));
+        assert!(!adapted.contains("WRITE IT TO A FILE"));
+        assert!(!adapted.contains("MEMORY.md"));
+        assert!(adapted.contains("## Safety"));
+        let tools = without_manual_memory("TOOLS.md", TOOLS);
+        assert!(!tools.contains("memory_store"));
+        assert!(tools.contains("file_read"));
+        let custom = format!("{stock}\nCustom policy.");
+        assert_eq!(without_manual_memory("AGENTS.md", &custom), custom);
     }
 }

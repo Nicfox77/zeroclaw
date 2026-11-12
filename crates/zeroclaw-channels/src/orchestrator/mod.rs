@@ -9655,6 +9655,12 @@ async fn process_channel_message_body(
     // collapse_inline_image_payloads downstream.
     let autosave_content = strip_inline_data_image_markers(&history_user_content);
     if ctx.auto_save_memory
+        && !matches!(
+            ctx.memory.role(),
+            zeroclaw_api::attribution::Role::Memory(
+                zeroclaw_api::attribution::MemoryKind::Hindsight
+            )
+        )
         && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
     {
@@ -10437,6 +10443,26 @@ async fn process_channel_message_body(
         ctx.prompt_config
             .effective_max_execution_tree_iterations(&ctx.agent_alias),
     );
+    // Mutable shared-room metadata cannot authorize a participant's private bank.
+    let hindsight_scope = if ctx.live_config.read().memory.backend == "hindsight"
+        && msg.conversation_scope == zeroclaw_api::channel::ChannelConversationScope::Sender
+    {
+        zeroclaw_config::hindsight::channel_principal(
+            &ctx.live_config.read(),
+            &ctx.agent_alias,
+            &msg.channel,
+            msg.channel_alias.as_deref().unwrap_or(""),
+            &msg.sender,
+            false,
+        )
+        .ok()
+        .map(|principal| {
+            zeroclaw_api::memory_traits::PrincipalScope::new(principal)
+                .with_agent(Some(ctx.agent_alias.to_string()))
+        })
+    } else {
+        None
+    };
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -10708,7 +10734,12 @@ async fn process_channel_message_body(
         let safeguard = take_last_safeguard_fallback();
         (llm_result, fb, safeguard)
     }));
-    let (llm_result, fallback_info, safeguard_notice) = scope_safeguard_fallback(scoped_turn).await;
+    let (llm_result, fallback_info, safeguard_notice) =
+        zeroclaw_memory::hindsight::upstream::scope_principal(
+            hindsight_scope.clone(),
+            scope_safeguard_fallback(scoped_turn),
+        )
+        .await;
 
     if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
         && let Some(tx) = delta_tx.as_ref()
@@ -10947,6 +10978,25 @@ async fn process_channel_message_body(
                     ctx.as_ref(),
                     &history_key,
                     ChatMessage::assistant(&history_response),
+                );
+            }
+
+            if !history_resync_failed
+                && let Some(scope) = hindsight_scope.as_ref()
+                && zeroclaw_memory::hindsight::upstream::capture_completed_turn(
+                    &ctx.live_config,
+                    scope,
+                    &history_key,
+                    &turn_id,
+                    &msg.content,
+                    &history_response,
+                )
+                .is_err()
+            {
+                zeroclaw_log::record!(
+                    WARN,
+                    zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Note),
+                    "hindsight_turn_capture_failed"
                 );
             }
 
@@ -17166,8 +17216,8 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         }
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            &config,
+        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent_live(
+            &config_arc,
             agent_alias,
             provider_api_key.as_deref(),
         )
@@ -17388,7 +17438,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             config.effective_skills_prompt_mode(agent_alias),
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
-            true,
+            config.memory.backend != "hindsight",
             config.channels.show_tool_calls,
             runtime.shell_profile().as_ref(),
         );

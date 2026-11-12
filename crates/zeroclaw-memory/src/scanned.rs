@@ -28,8 +28,8 @@ use crate::policy::PolicyEnforcer;
 use crate::redact::{self, RedactCategory};
 use crate::threat::{self, Scope};
 use crate::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
-    ProceduralMessage, StoreOptions,
+    ContextRecallMode, ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats,
+    PrincipalScope, ProceduralMessage, StoreOptions,
 };
 use async_trait::async_trait;
 use zeroclaw_config::schema::MemoryPolicyConfig;
@@ -61,7 +61,12 @@ enum OnHit {
 /// content at the write and recall boundaries.
 pub struct ScannedMemory<M: Memory> {
     inner: M,
-    policy: MemoryPolicyConfig,
+    policy: PolicySource,
+}
+
+enum PolicySource {
+    Fixed(MemoryPolicyConfig),
+    Live(zeroclaw_config::live::LiveConfigHandle),
 }
 
 impl<M: Memory> ::zeroclaw_api::attribution::Attributable for ScannedMemory<M> {
@@ -78,12 +83,33 @@ impl<M: Memory> ScannedMemory<M> {
     pub fn new(inner: M, policy: &MemoryPolicyConfig) -> Self {
         Self {
             inner,
-            policy: policy.clone(),
+            policy: PolicySource::Fixed(policy.clone()),
+        }
+    }
+
+    /// Hindsight operations resolve current content policy at each boundary.
+    pub fn with_live_policy(inner: M, live: zeroclaw_config::live::LiveConfigHandle) -> Self {
+        Self {
+            inner,
+            policy: PolicySource::Live(live),
+        }
+    }
+
+    fn policy(&self) -> MemoryPolicyConfig {
+        match &self.policy {
+            PolicySource::Fixed(policy) => policy.clone(),
+            PolicySource::Live(live) => live.read().memory.policy.clone(),
         }
     }
 
     fn scan_mode(&self) -> anyhow::Result<ThreatScanMode> {
-        match self.policy.threat_scan.trim().to_ascii_lowercase().as_str() {
+        match self
+            .policy()
+            .threat_scan
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "off" => Ok(ThreatScanMode::Off),
             "on" => Ok(ThreatScanMode::On),
             "strict" => Ok(ThreatScanMode::Strict),
@@ -95,7 +121,7 @@ impl<M: Memory> ScannedMemory<M> {
 
     fn on_hit(&self) -> anyhow::Result<OnHit> {
         match self
-            .policy
+            .policy()
             .threat_scan_on_hit
             .trim()
             .to_ascii_lowercase()
@@ -119,16 +145,17 @@ impl<M: Memory> ScannedMemory<M> {
 
     /// Scope for read-time re-scanning; `None` disables read filtering.
     fn read_scope(&self) -> anyhow::Result<Option<Scope>> {
-        if !self.policy.threat_scan_load_time {
+        if !self.policy().threat_scan_load_time {
             return Ok(None);
         }
         self.scan_scope()
     }
 
     fn redaction_categories(&self) -> anyhow::Result<Vec<RedactCategory>> {
-        let mut parsed = Vec::with_capacity(self.policy.redact_categories.len());
+        let mut parsed = Vec::with_capacity(self.policy().redact_categories.len());
         let mut invalid = Vec::new();
-        for category in &self.policy.redact_categories {
+        let policy = self.policy();
+        for category in &policy.redact_categories {
             match RedactCategory::from_config(category) {
                 Some(category) => parsed.push(category),
                 None => invalid.push(category.as_str()),
@@ -156,14 +183,14 @@ impl<M: Memory> ScannedMemory<M> {
     /// configured categories (when `redact_on_write` is enabled), then scan
     /// the content that would actually be persisted. Returns the content to
     /// persist, or an error when the write must not proceed.
-    fn process_content(
+    pub(crate) fn process_content(
         &self,
         key: &str,
         content: &str,
         namespace: Option<&str>,
     ) -> anyhow::Result<String> {
         let mut persisted = content.to_string();
-        if self.policy.redact_on_write {
+        if self.policy().redact_on_write {
             let categories = self.redaction_categories()?;
             if !categories.is_empty() {
                 let (redacted, hits) = redact::redact(&persisted, &categories);
@@ -220,14 +247,14 @@ impl<M: Memory> ScannedMemory<M> {
 
     /// Validate namespace/category policy for a write. Any violation
     /// aborts the write.
-    async fn enforce_policy(
+    pub(crate) async fn enforce_policy(
         &self,
         key: &str,
         namespace: Option<&str>,
         category: &MemoryCategory,
     ) -> anyhow::Result<()> {
         let namespace = namespace.unwrap_or("default");
-        let enforcer = PolicyEnforcer::new(&self.policy);
+        let enforcer = PolicyEnforcer::new(&self.policy());
         if let Err(error) =
             crate::policy_gate::validate_store(&self.inner, &enforcer, namespace, category).await
         {
@@ -316,6 +343,60 @@ impl<M: Memory> Memory for ScannedMemory<M> {
             .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
+    async fn recall_context(
+        &self,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+        mode: ContextRecallMode,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.filter_recalled_limited(
+            self.inner
+                .recall_context(
+                    query,
+                    question,
+                    Self::read_fetch_limit(limit),
+                    session,
+                    mode,
+                )
+                .await?,
+            limit,
+        )
+    }
+    async fn recall_context_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        question: &str,
+        limit: usize,
+        session: Option<&str>,
+        mode: ContextRecallMode,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.filter_recalled_limited(
+            self.inner
+                .recall_context_for_principal(
+                    scope,
+                    query,
+                    question,
+                    Self::read_fetch_limit(limit),
+                    session,
+                    mode,
+                )
+                .await?,
+            limit,
+        )
+    }
+    async fn reflect(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.filter_recalled(self.inner.reflect(query).await?)
+    }
+    async fn reflect_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.filter_recalled(self.inner.reflect_for_principal(scope, query).await?)
+    }
     async fn store(
         &self,
         key: &str,

@@ -66,6 +66,12 @@ pub async fn consolidate_turn(
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
+    if matches!(
+        memory.role(),
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::Hindsight)
+    ) {
+        return Ok(());
+    }
     let turn_text = format!(
         "User: {}\nAssistant: {}",
         strip_media_markers(user_message),

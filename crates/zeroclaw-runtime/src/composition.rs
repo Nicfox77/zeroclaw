@@ -138,10 +138,21 @@ impl RuntimeCapabilities {
         config: &Config,
         agent_alias: &str,
     ) -> anyhow::Result<Arc<dyn Memory>> {
+        self.agent_memory_with_policy(config, agent_alias, None)
+            .await
+    }
+
+    pub(crate) async fn agent_memory_with_policy(
+        &self,
+        config: &Config,
+        agent_alias: &str,
+        live_config: Option<&zeroclaw_config::live::LiveConfigHandle>,
+    ) -> anyhow::Result<Arc<dyn Memory>> {
         self.memory
             .memory(&MemoryRequest {
                 config,
                 agent_alias,
+                live_config,
             })
             .await
     }
@@ -279,6 +290,8 @@ pub trait ProviderSource: Send + Sync {
 
 /// What the runtime is asking a [`MemorySource`] for.
 pub struct MemoryRequest<'a> {
+    /// Current authority for backends whose operation policy can change in flight.
+    pub live_config: Option<&'a zeroclaw_config::live::LiveConfigHandle>,
     /// The config generation the request belongs to.
     pub config: &'a Config,
     /// The agent whose memory is requested.

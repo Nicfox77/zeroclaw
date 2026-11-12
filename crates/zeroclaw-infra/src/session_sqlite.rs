@@ -64,7 +64,56 @@ const SETTLE_RUNNING_TURNS_SQL: &str = "UPDATE session_metadata \
      SET state = 'error', turn_started_at = NULL WHERE state = 'running'";
 
 impl SqliteSessionBackend {
-    /// Where the store for `workspace_dir` lives, whether or not it exists.
+    fn snapshot_metadata_on(
+        conn: &Connection,
+        session_key: &str,
+    ) -> rusqlite::Result<Option<SessionMetadata>> {
+        conn.query_row(
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
+             FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| {
+                let key: String = row.get(0)?;
+                let created_str: String = row.get(1)?;
+                let activity_str: String = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                let name: Option<String> = row.get(4)?;
+                let agent_alias: Option<String> = row.get(5)?;
+                let channel_id: Option<String> = row.get(6)?;
+                let room_id: Option<String> = row.get(7)?;
+                let sender_id: Option<String> = row.get(8)?;
+                let principal_id: Option<String> = row.get(9)?;
+
+                let created = DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+                let activity = DateTime::parse_from_rfc3339(&activity_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                Ok(SessionMetadata {
+                    key,
+                    name,
+                    created_at: created,
+                    last_activity: activity,
+                    message_count: count as usize,
+                    agent_alias,
+                    channel_id,
+                    room_id,
+                    sender_id,
+                    principal_id,
+                })
+            },
+        ).optional()
+    }
+
+    /// Read canonical session ownership, distinguishing deletion from read failure.
+    pub fn read_metadata(&self, session_key: &str) -> std::io::Result<Option<SessionMetadata>> {
+        let connection = self.conn.lock();
+        Self::snapshot_metadata_on(&connection, session_key).map_err(std::io::Error::other)
+    }
+
     pub fn db_path(workspace_dir: &Path) -> PathBuf {
         workspace_dir.join("sessions").join("sessions.db")
     }
@@ -1540,46 +1589,9 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
-             FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
-            |row| {
-                let key: String = row.get(0)?;
-                let created_str: String = row.get(1)?;
-                let activity_str: String = row.get(2)?;
-                let count: i64 = row.get(3)?;
-                let name: Option<String> = row.get(4)?;
-                let agent_alias: Option<String> = row.get(5)?;
-                let channel_id: Option<String> = row.get(6)?;
-                let room_id: Option<String> = row.get(7)?;
-                let sender_id: Option<String> = row.get(8)?;
-                let principal_id: Option<String> = row.get(9)?;
-
-                let created = DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let activity = DateTime::parse_from_rfc3339(&activity_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                Ok(SessionMetadata {
-                    key,
-                    name,
-                    created_at: created,
-                    last_activity: activity,
-                    message_count: count as usize,
-                    agent_alias,
-                    channel_id,
-                    room_id,
-                    sender_id,
-                    principal_id,
-                })
-            },
-        )
-        .ok()
+        Self::snapshot_metadata_on(&self.conn.lock(), session_key)
+            .ok()
+            .flatten()
     }
 
     fn set_session_state(
@@ -3881,5 +3893,36 @@ mod tests {
             backend.get_session_trim_breadcrumb("s1").unwrap(),
             Some(false)
         );
+    }
+}
+
+#[cfg(test)]
+mod strict_metadata_tests {
+    use super::*;
+    #[test]
+    fn ownership_read_distinguishes_deletion_from_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteSessionBackend::new(directory.path()).unwrap();
+        assert!(store.read_metadata("fixture").unwrap().is_none());
+        store
+            .append("fixture", &ChatMessage::user("fictional input"))
+            .unwrap();
+        store
+            .set_session_agent_alias("fixture", "assistant")
+            .unwrap();
+        store.set_session_principal("fixture", "owner").unwrap();
+        let metadata = store.read_metadata("fixture").unwrap().unwrap();
+        assert_eq!(metadata.principal_id.as_deref(), Some("owner"));
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE session_metadata SET created_at='corrupt' WHERE session_key='fixture'",
+                [],
+            )
+            .unwrap();
+        assert!(store.read_metadata("fixture").is_err());
+        store.delete_session("fixture").unwrap();
+        assert!(store.read_metadata("fixture").unwrap().is_none());
     }
 }

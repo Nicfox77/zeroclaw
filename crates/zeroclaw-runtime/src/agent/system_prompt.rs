@@ -53,7 +53,13 @@ fn load_openclaw_bootstrap_files(
     );
 
     for filename in BOOTSTRAP_FILES {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+        inject_workspace_file_with_policy(
+            prompt,
+            workspace_dir,
+            filename,
+            max_chars_per_file,
+            inject_memory,
+        );
     }
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
@@ -755,11 +761,26 @@ fn inject_workspace_file(
     filename: &str,
     max_chars: usize,
 ) {
+    inject_workspace_file_with_policy(prompt, workspace_dir, filename, max_chars, true)
+}
+
+fn inject_workspace_file_with_policy(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    filename: &str,
+    max_chars: usize,
+    manual_memory: bool,
+) {
     use std::fmt::Write;
 
     let path = workspace_dir.join(filename);
     match std::fs::read_to_string(&path) {
         Ok(content) => {
+            let content = if manual_memory {
+                content
+            } else {
+                super::personality_templates::without_manual_memory(filename, &content)
+            };
             let (text, truncation) = truncate_bootstrap_content(&content, max_chars);
             if text.is_empty() && truncation.is_none() {
                 return;

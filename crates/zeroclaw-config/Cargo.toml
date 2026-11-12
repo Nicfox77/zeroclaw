@@ -9,6 +9,7 @@ homepage.workspace = true
 publish = true
 
 [dependencies]
+chrono-tz = "0.10"
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true

@@ -326,3 +326,6 @@ mod tests {
         assert!(message.contains("unable to open database file"));
     }
 }
+
+pub mod identity_names;
+pub mod memory_orientation;

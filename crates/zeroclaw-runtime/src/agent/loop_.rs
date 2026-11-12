@@ -1750,7 +1750,14 @@ async fn run_inner(
         } else {
             match overrides.memory {
                 Some(m) => m,
-                None => capabilities.agent_memory(&config, agent_alias).await?,
+                None => {
+                    let live = execution_capability
+                        .as_ref()
+                        .map(AgentExecutionCapability::config_handle);
+                    capabilities
+                        .agent_memory_with_policy(&config, agent_alias, live.as_ref())
+                        .await?
+                }
             }
         };
         ::zeroclaw_log::record!(
@@ -2198,7 +2205,7 @@ async fn run_inner(
             eff_prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
-            true,
+            config.memory.backend != "hindsight",
             config.channels.show_tool_calls,
             None,
             runtime.shell_profile().as_ref(),
@@ -2299,7 +2306,7 @@ async fn run_inner(
                 eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
-                true,
+                config.memory.backend != "hindsight",
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
                 runtime.shell_profile().as_ref(),
@@ -2330,7 +2337,11 @@ async fn run_inner(
 
             // Auto-save user message to memory (skip autonomous origins
             // and short/trivial or synthetic messages).
-            if should_autosave_user_message(config.memory.auto_save, origin, &effective_msg) {
+            if should_autosave_user_message(
+                config.memory.auto_save && config.memory.backend.trim() != "hindsight",
+                origin,
+                &effective_msg,
+            ) {
                 let user_key = autosave_memory_key("user_msg");
                 let store_start = std::time::Instant::now();
                 let store_result = mem
@@ -2435,7 +2446,7 @@ async fn run_inner(
                         eff_prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
-                        true,
+                        config.memory.backend != "hindsight",
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
                         runtime.shell_profile().as_ref(),
@@ -2949,7 +2960,11 @@ async fn run_inner(
 
                 // Auto-save conversation turns (skip autonomous origins
                 // and short/trivial or synthetic messages).
-                if should_autosave_user_message(config.memory.auto_save, origin, &effective_input) {
+                if should_autosave_user_message(
+                    config.memory.auto_save && config.memory.backend.trim() != "hindsight",
+                    origin,
+                    &effective_input,
+                ) {
                     let user_key = autosave_memory_key("user_msg");
                     let store_start = std::time::Instant::now();
                     let store_result = mem
@@ -3089,7 +3104,7 @@ async fn run_inner(
                             eff_prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
-                            true,
+                            config.memory.backend != "hindsight",
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
                             runtime.shell_profile().as_ref(),
@@ -3860,7 +3875,9 @@ async fn process_message_inner(
             }
         };
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
-        let mem: Arc<dyn Memory> = capabilities.agent_memory(&config, agent_alias).await?;
+        let mem: Arc<dyn Memory> = capabilities
+            .agent_memory_with_policy(&config, agent_alias, live_config.as_ref())
+            .await?;
 
         let tool_config = Arc::clone(&config);
         let tool_request = crate::composition::ToolRequest {
