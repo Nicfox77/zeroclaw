@@ -395,7 +395,7 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
         assert!(sessions.remove("headless-probe").await);
         let current = caller.current_prompt_authority().unwrap();
         let restored = current
-            .rehydrate_reaped_session("headless-probe", current.stamped_grants())
+            .rehydrate_reaped_session("headless-probe", current.stamped_grants().as_ref())
             .await
             .unwrap()
             .unwrap();
@@ -479,7 +479,7 @@ async fn wildcard_non_admin_sessions_hold_no_unrestricted_tools() {
         assert!(sessions.remove("marked-probe").await);
         let current = caller.current_prompt_authority().unwrap();
         let restored = current
-            .rehydrate_reaped_session("marked-probe", current.stamped_grants())
+            .rehydrate_reaped_session("marked-probe", current.stamped_grants().as_ref())
             .await
             .unwrap()
             .unwrap();
