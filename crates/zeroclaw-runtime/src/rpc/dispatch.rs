@@ -35,8 +35,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(LiveConfigHandle, String) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
@@ -48,13 +51,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -91,305 +87,8 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
-//
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionEvents,
-    SessionEventsSubscribe,
-    SessionPayload,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-    SessionSteer,
-    SessionAbort,
-    SessionAppend,
-    SessionCompact,
-    SessionRename,
-    SessionRunOnce,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionEvents, "session/events"),
-        (Method::SessionEventsSubscribe, "session/events-subscribe"),
-        (Method::SessionPayload, "session/payload"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        (Method::SessionSteer, "session/steer"),
-        (Method::SessionAbort, "session/abort"),
-        (Method::SessionAppend, "session/append"),
-        (Method::SessionCompact, "session/compact"),
-        (Method::SessionRename, "session/rename"),
-        (Method::SessionRunOnce, "session/run-once"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -397,7 +96,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -531,7 +234,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -1189,6 +892,12 @@ pub struct RpcDispatcher {
     /// The transport-intrinsic credential (kernel peer uid on local
     /// sockets), presented during `initialize` when no explicit token is.
     transport_credential: crate::security::auth_provider::Credential,
+    /// The signed-in principal and the OIDC provider as configured at sign-in,
+    /// that this connection's bearer is bound to. Set by the side that opens
+    /// the connection, never by the client: every `initialize` on it is
+    /// verified with [`crate::rpc::auth::RpcInboundAuth::authenticate_bound`],
+    /// so a provider repointed since then never receives the bearer.
+    auth_binding: Option<super::inproc::OidcSessionBinding>,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
@@ -1351,6 +1060,7 @@ impl RpcDispatcher {
             auth: None,
             transport_kind: crate::rpc::transport::TransportKind::Local,
             transport_credential: crate::security::auth_provider::Credential::None,
+            auth_binding: None,
             tui_id: None,
             tui_epoch: None,
             peer_label,
@@ -1411,6 +1121,14 @@ impl RpcDispatcher {
     ) -> Self {
         self.transport_kind = kind;
         self.transport_credential = credential;
+        self
+    }
+
+    /// Bind this connection's bearer to one OIDC provider; see the
+    /// `auth_binding` field.
+    #[must_use]
+    pub fn with_auth_binding(mut self, binding: Option<super::inproc::OidcSessionBinding>) -> Self {
+        self.auth_binding = binding;
         self
     }
 
@@ -2519,6 +2237,31 @@ impl RpcDispatcher {
         Err(denied)
     }
 
+    /// Re-establish the caller's authority over `agent`'s cron rows once the
+    /// config writer gate is held.
+    ///
+    /// The cron store writes synchronously and can wait out SQLite's busy
+    /// timeout, so the grants stamped at the gate may be stale by the time
+    /// the row is written. Every accepted-policy publication, from RPC or the
+    /// gateway, is admitted through `begin_config_commit`, which takes the
+    /// writer mutex that `lock_config_writer` returns, and so does a paired
+    /// token revocation. The cron handlers hold that mutex from this check
+    /// through their write: a revocation published while the request queued
+    /// is seen here, and none can land between this check and the commit
+    /// however long the store waits for the database.
+    fn recheck_cron_write_authority(
+        &self,
+        method: Method,
+        agent: &str,
+        require_configured: bool,
+        _config_writer: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        self.check_agent_selector_with_grants(method, &grants, agent, require_configured)
+    }
+
     /// Confine a session workspace to a directory the agent's own policy lets
     /// it both read and write.
     ///
@@ -2860,6 +2603,14 @@ impl RpcDispatcher {
             "forwarded client environment is not retained for this connection"
         );
         std::collections::HashMap::new()
+    }
+
+    /// A caller that is not this host's local IPC: the WSS listener, or the
+    /// in-process seam, which relays a remote browser. Local-only behaviour
+    /// that keys on the peer keys on this, never on the peer label alone.
+    fn is_remote_caller(&self) -> bool {
+        self.peer_label.starts_with("wss:")
+            || self.transport_kind == crate::rpc::transport::TransportKind::Inproc
     }
 
     fn may_use_forwarded_environment(
@@ -3789,6 +3540,7 @@ impl RpcDispatcher {
             auth: self.auth.clone(),
             transport_kind: self.transport_kind,
             transport_credential: self.transport_credential.clone(),
+            auth_binding: self.auth_binding.clone(),
             tui_id: self.tui_id.clone(),
             // Same connection, so the same registration: this handle shares the
             // parent's epoch rather than claiming one of its own. It never runs
@@ -4493,20 +4245,52 @@ impl RpcDispatcher {
         // authority — a credential is re-presented on every initialize, so
         // reconnect can never outlive or bypass the authentication that
         // created it.
-        let connection_auth = match self
-            .ctx
-            .auth
-            .authenticate(
-                self.transport_kind,
-                self.transport_credential.clone(),
-                req.auth_token.as_deref(),
-                req.auth_provider.as_deref(),
-            )
-            .await
-        {
+        let verified = match (
+            &self.auth_binding,
+            req.auth_token.as_deref(),
+            req.auth_provider.as_deref(),
+        ) {
+            // A bound connection presents its bearer only to the provider it
+            // is bound to, and nothing else.
+            (Some(binding), Some(token), Some(provider)) => {
+                self.ctx
+                    .auth
+                    .authenticate_bound(self.transport_kind, token, provider, &binding.provider)
+                    .await
+            }
+            (Some(_), _, _) => {
+                return Err(rpc_err(
+                    AUTH_REQUIRED,
+                    "This connection requires its bound bearer and provider",
+                ));
+            }
+            (None, token, provider) => {
+                self.ctx
+                    .auth
+                    .authenticate(
+                        self.transport_kind,
+                        self.transport_credential.clone(),
+                        token,
+                        provider,
+                    )
+                    .await
+            }
+        };
+        let connection_auth = match verified {
             Ok(auth) => auth,
             Err(denied) => return Err(rpc_err(denied.code, denied.message)),
         };
+
+        if self
+            .auth_binding
+            .as_ref()
+            .is_some_and(|binding| binding.principal_id != connection_auth.principal.id)
+        {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                crate::i18n::get_required_cli_string("rpc-auth-credential-rejected"),
+            ));
+        }
 
         // TUI identity: reconnect with previous credentials or generate new
         let tui_id = if let (Some(claimed_id), Some(sig)) =
@@ -5063,7 +4847,7 @@ impl RpcDispatcher {
                     let session = session
                         .filter(|s| Arc::ptr_eq(&s.agent, &expected_agent))
                         .ok_or_else(|| current.stale_session_incarnation_error())?;
-                    if remote && session.owner_tui_id != current.tui_id {
+                    if remote && session.owner_tui_id() != current.tui_id.as_deref() {
                         return Err(current.stale_session_incarnation_error());
                     }
                     // Channel refresh uses the Agent mutex. Keep transport eligibility,
@@ -5168,7 +4952,7 @@ impl RpcDispatcher {
                         if session.generation != expected_generation
                             || !Arc::ptr_eq(&session.agent, expected_agent)
                             || (self.access_policy == RpcAccessPolicy::RemoteSessionOwner
-                                && session.owner_tui_id != self.tui_id)
+                                && session.owner_tui_id() != self.tui_id.as_deref())
                         {
                             return Err(self.stale_session_incarnation_error());
                         }
@@ -5294,13 +5078,17 @@ impl RpcDispatcher {
         create_only: Option<&parking_lot::Mutex<Option<u64>>>,
     ) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        // A create-only call never resumes, so a supplied id that names no
+        // live session yet is not a resume the caller must already own.
         let expected_generation = match req.session_id.as_deref() {
-            Some(session_id) => self.capture_session_access(session_id).await?,
-            None => None,
+            Some(session_id) if create_only.is_none() => {
+                self.capture_session_access(session_id).await?
+            }
+            _ => None,
         };
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
-        let resuming = req.session_id.is_some();
+        let resuming = req.session_id.is_some() && create_only.is_none();
         let mut authorized_resume = None;
         // Check the selected existing session's owner before admission. The
         // durable owner used for restoration is selected again after admission,
@@ -6413,10 +6201,15 @@ impl RpcDispatcher {
             hooks.fire_session_start(&session_id, "rpc").await;
         }
 
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("session-new-return")
+            .await;
         if let Some(created) = create_only {
-            // Still under the admission permit: this is the incarnation this
-            // call created, not one a later caller installed.
-            *created.lock() = self.ctx.sessions.get_generation(&session_id).await;
+            // This is the incarnation this call published, not one a later
+            // caller installed. Report it even if it has since been removed,
+            // so the bound turn and close refuse rather than run unbound.
+            *created.lock() = Some(published_generation);
         }
 
         to_result(SessionNewResult {
@@ -7808,12 +7601,13 @@ impl RpcDispatcher {
                 .agent_workspace_dir(&agent_alias)
                 .to_string_lossy()
                 .to_string();
-            let is_wss = self.peer_label.starts_with("wss:");
+            let is_remote = self.is_remote_caller();
             // Resolve + authorize attachment sources once; the returned slots
             // are index-aligned with req.attachments and carry the exact
-            // canonical target each read must bind to. On WSS, path sources are
-            // rejected inside process_file_entry, so no resolution is needed.
-            let attachment_sources = if is_wss {
+            // canonical target each read must bind to. For a remote caller,
+            // path sources are rejected inside process_file_entry, so no
+            // resolution is needed.
+            let attachment_sources = if is_remote {
                 Vec::new()
             } else {
                 match self.authorize_attachment_sources(
@@ -7844,7 +7638,7 @@ impl RpcDispatcher {
                         entry,
                         sid,
                         &upload_root,
-                        is_wss,
+                        is_remote,
                         source,
                         &self.ctx.sessions,
                     ) => result?,
@@ -8659,7 +8453,7 @@ impl RpcDispatcher {
                 let usage = usage_fold.lock().totals(final_context_limits);
                 let safeguard_wire = safeguard_fallback
                     .as_ref()
-                    .map(crate::rpc::types::SafeguardFallbackWire::from);
+                    .map(crate::rpc::types::safeguard_fallback_wire);
                 let text = crate::agent::append_safeguard_fallback_notice(
                     text,
                     safeguard_fallback.as_ref(),
@@ -9143,44 +8937,52 @@ impl RpcDispatcher {
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         }
 
+        // Only a model or provider the request itself names is an explicit
+        // selection; one carried over from earlier overrides is not.
+        let explicit_model_selection =
+            req.overrides.model.is_some() || req.overrides.model_provider.is_some();
+        let update = built_model_provider.map(
+            |(
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation,
+            )| crate::rpc::session::ModelProviderUpdate {
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation: Arc::clone(&config_generation),
+                temperature: None,
+                multimodal_config: config_generation.multimodal.clone(),
+            },
+        );
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
-            .await
+            .configure_authorized(
+                &req.session_id,
+                session_generation,
+                merged,
+                explicit_model_selection,
+                update,
+                |session| {
+                    if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                        && session.owner_tui_id() != self.tui_id.as_deref()
+                    {
+                        return Err(self.stale_session_incarnation_error());
+                    }
+                    self.session_effect_lease(
+                        Method::SessionConfigure,
+                        session.owner_principal_id.as_deref(),
+                    )
+                },
+            )
+            .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-
-        if let Some((
-            model_provider,
-            model_provider_name,
-            model_name,
-            model_route_resolver,
-            tool_dispatcher,
-            config_generation,
-        )) = built_model_provider
-        {
-            self.ctx
-                .sessions
-                .apply_model_provider(
-                    &req.session_id,
-                    session_generation,
-                    crate::rpc::session::ModelProviderUpdate {
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        model_route_resolver,
-                        tool_dispatcher,
-                        config_generation: Arc::clone(&config_generation),
-                        // Temperature is already committed through
-                        // `set_overrides_gated` on this path.
-                        temperature: None,
-                        multimodal_config: config_generation.multimodal.clone(),
-                    },
-                )
-                .await
-                .then_some(())
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        }
 
         to_result(SessionConfigureResult {
             session_id: req.session_id,
@@ -9371,11 +9173,28 @@ impl RpcDispatcher {
             origin: TurnOrigin::Interactive,
             internal_principal: None,
         });
-        match self.ctx.sessions.steer_session_for_generation(
-            &req.session_id,
-            session_generation,
-            input,
-        ) {
+        // Fence the current transport owner through queue insertion. Consumption
+        // checks the revocable binding too, without contending on the global map.
+        let outcome = self
+            .ctx
+            .sessions
+            .with_session_effect(&req.session_id, |session| {
+                if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                    && !session.is_some_and(|live| {
+                        Some(live.generation) == session_generation
+                            && live.owner_tui_id() == self.tui_id.as_deref()
+                    })
+                {
+                    return Err(self.stale_session_incarnation_error());
+                }
+                Ok(self.ctx.sessions.steer_session_for_generation(
+                    &req.session_id,
+                    session_generation,
+                    input,
+                ))
+            })
+            .await?;
+        match outcome {
             crate::rpc::session::SteerOutcome::Accepted => to_result(SessionSteerResult {
                 session_id: req.session_id.clone(),
                 accepted: true,
@@ -9416,11 +9235,19 @@ impl RpcDispatcher {
         .await?;
         let grants = self.recheck_authority_after_admission(Method::SessionAbort)?;
         self.require_ownership_under(grants.as_ref(), record.as_ref())?;
-        if !self
+        let signalled = self
             .ctx
             .sessions
-            .abort_session_for_generation(&req.session_id, session_generation)
-        {
+            .signal_cancellation_authorized(
+                &req.session_id,
+                session_generation,
+                self.resume_access_fence(session_generation),
+                crate::rpc::session::CancelCause::OperatorAbort,
+                |owner| self.session_effect_lease(Method::SessionAbort, owner),
+            )
+            .await?
+            .ok_or_else(|| self.stale_session_incarnation_error())?;
+        if !signalled {
             return Err(rpc_err(
                 SESSION_NOT_FOUND,
                 "No active turn for this session",
@@ -9520,13 +9347,14 @@ impl RpcDispatcher {
         let generation = record
             .and_then(|rec| rec.live_generation)
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "No active turn for this session"))?;
-        let (agent_alias, workspace, has_environment, reaction_channels) = self
+        let (agent_alias, workspace, has_environment, reaction_channels, owner_revoked) = self
             .ctx
             .sessions
             .steering_binding_for_generation(
                 session_id,
                 generation,
                 record.and_then(|rec| rec.owner.as_deref()),
+                self.resume_access_fence(Some(generation)),
             )
             .await
             .ok_or_else(|| self.stale_session_incarnation_error())?;
@@ -9539,6 +9367,11 @@ impl RpcDispatcher {
                 audit_denial(binding.as_ref(), Method::SessionSteer, &denied);
                 SteeringAdmission::Refused(message)
             };
+            if dispatcher.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                && owner_revoked.is_cancelled()
+            {
+                return refuse("Session transport ownership changed".into());
+            }
             if dispatcher.access_policy != RpcAccessPolicy::TrustedLocal
                 && let Err(denied) = Self::ensure_session_channel_access(&reaction_channels)
             {
@@ -9547,21 +9380,37 @@ impl RpcDispatcher {
             let Some(binding) = binding.as_ref() else {
                 return SteeringAdmission::Admitted(SteeringPosture::default());
             };
-            let grants = match current_authority(&inbound, binding, Method::SessionSteer) {
+            // Match publication lock order and resolve the whole steering
+            // decision from one config/accepted-policy view. The lease ends
+            // here, before any asynchronous memory write by the consumer.
+            let config = dispatcher.ctx.config.read();
+            let authority = inbound.hold_authority();
+            let grants = match current_authority_under(&authority, binding, Method::SessionSteer) {
                 Ok(grants) => grants,
                 Err(denied) => {
                     audit_denial(Some(binding), Method::SessionSteer, &denied);
                     return SteeringAdmission::Refused(denied.message);
                 }
             };
-            if let Err(denied) = dispatcher.authorize_admitted_session(
-                Method::SessionSteer,
-                Some(&grants),
-                admitted.as_ref(),
-                &agent_alias,
-                Some(&workspace),
-                has_environment,
-            ) {
+            let checked = dispatcher
+                .require_ownership_under(Some(&grants), admitted.as_ref())
+                .and_then(|()| {
+                    dispatcher.authorize_live_session_binding(
+                        Method::SessionSteer,
+                        Some(&grants),
+                        &config,
+                        &agent_alias,
+                        &workspace,
+                    )
+                })
+                .and_then(|()| {
+                    dispatcher.authorize_session_environment(
+                        Method::SessionSteer,
+                        Some(&grants),
+                        has_environment,
+                    )
+                });
+            if let Err(denied) = checked {
                 return refuse(denied.message);
             }
             SteeringAdmission::Admitted(principal_tool_posture(&grants))
@@ -9878,20 +9727,25 @@ impl RpcDispatcher {
             zeroclaw_api::grants::Resource::Sessions,
             zeroclaw_api::grants::Verb::Create,
         )?;
+        // Closing is a session update. Refuse before creating or executing if
+        // the caller cannot perform every effect of this composite operation.
+        self.require_additional_grant(
+            Method::SessionRunOnce,
+            zeroclaw_api::grants::Resource::Sessions,
+            zeroclaw_api::grants::Verb::Update,
+        )?;
         // The session is closed when the turn ends, so the call must not
         // adopt one that already exists under a caller-chosen id. This early
         // check gives a clear error; the create-only session/new below is what
         // makes it hold against a concurrent creator. A scoped caller naming
         // another principal's session gets the uniform ownership denial
         // first, so run-once cannot probe which ids exist.
+        let grants = self.recheck_authority_after_admission(Method::SessionRunOnce)?;
+        let scope = self.scoped_principal_id_from(grants.as_ref());
         let session_id = match req.session_id {
             Some(sid) => {
                 if self
-                    .resolve_session_record_for_mode(
-                        &sid,
-                        None,
-                        self.scoped_principal_id().as_deref(),
-                    )
+                    .resolve_session_record_for_mode(&sid, None, scope.as_deref())
                     .await?
                     .is_some()
                 {
@@ -9937,8 +9791,9 @@ impl RpcDispatcher {
             .await;
 
         let close = serde_json::json!({ "session_id": session_id });
-        if let Err(e) = Box::pin(self.handle_session_close_bound(&close, created_generation)).await
-        {
+        let close_result =
+            Box::pin(self.handle_session_close_bound(&close, created_generation)).await;
+        if let Err(e) = &close_result {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -9953,6 +9808,15 @@ impl RpcDispatcher {
         }
 
         let (result, usage) = turn?;
+        close_result.map_err(|error| {
+            rpc_err(
+                error.code,
+                format!(
+                    "Turn completed, but could not close transient session {session_id}: {}",
+                    error.message,
+                ),
+            )
+        })?;
         to_result(SessionRunOnceResult {
             session_id: result.session_id,
             stop_reason: result.stop_reason,
@@ -10658,7 +10522,7 @@ impl RpcDispatcher {
                         // A trusted-local resume rebinds the TUI owner without a
                         // new generation, so the remote owner is rechecked here too.
                         if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
-                            && live.is_none_or(|s| s.owner_tui_id != self.tui_id)
+                            && live.is_none_or(|s| s.owner_tui_id() != self.tui_id.as_deref())
                         {
                             return Err(self.stale_session_incarnation_error());
                         }
@@ -11947,33 +11811,68 @@ impl RpcDispatcher {
     async fn handle_cron_add(&self, params: &Value) -> RpcResult {
         let req: CronAddParams = parse_params(params)?;
         self.selector_agent(Method::CronAdd, &req.agent)?;
+        // The alias reservation first and the config writer gate second, the
+        // order `config/set` takes them, and both are held through the insert:
+        // a lifecycle delete or rename of the alias cannot land between the
+        // authority recheck and the row, and neither can a grant publication.
+        // See `recheck_cron_write_authority`.
         let _reservation = self
             .ctx
             .agent_lifecycle
             .reserve_config_mutation(req.agent.trim())
             .map_err(|error| rpc_err(SESSION_BUSY, error.to_string()))?;
+        let config_writer_guard = self.ctx.config_authority.lock_config_writer().await;
+        self.recheck_cron_write_authority(Method::CronAdd, &req.agent, true, &config_writer_guard)?;
         let config = self.ctx.config.read().clone();
         let schedule = Schedule::Cron {
             expr: req.schedule,
             tz: req.tz,
         };
-        let job = crate::cron::add_shell_job_with_approval(
+        // An RPC request is not an approval. The command goes through the same
+        // supervised-autonomy gate as the CLI and the gateway, so a medium- or
+        // high-risk command is refused here instead of being stored as though
+        // an operator had approved it.
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            rpc_err(
+                AUTH_REQUIRED,
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )
+        })?;
+        let mut denied = None;
+        let job = crate::cron::add_shell_job_authorized(
             &config,
             &req.agent,
             req.name,
             schedule,
             req.command.as_deref().unwrap_or(""),
             req.delivery,
-            true, // RPC calls are pre-approved
-        )
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
+            false,
+            Default::default(),
+            || {
+                // The config writer serializes policy changes, but a credential
+                // can expire or reach its revalidation deadline while SQLite waits.
+                let authority = self.ctx.auth.hold_authority();
+                current_authority_under(&authority, auth, Method::CronAdd)
+                    .map(|_| authority)
+                    .map_err(|error| {
+                        self.audit_auth_denial(Method::CronAdd, &error);
+                        let message = error.message.clone();
+                        denied = Some(rpc_err(error.code, error.message));
+                        anyhow::Error::msg(message)
+                    })
+            },
+        );
+        if let Some(error) = denied {
+            return Err(error);
+        }
+        let job = job.map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
+        drop(config_writer_guard);
         to_result(job)
     }
 
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
         self.selector_agent(Method::CronPatch, &req.agent)?;
-        let config = self.ctx.config.read().clone();
         let patch = CronJobPatch {
             schedule: req.schedule.map(|s| Schedule::Cron {
                 expr: s,
@@ -11988,9 +11887,28 @@ impl RpcDispatcher {
             name: req.name,
             ..Default::default()
         };
-        // Keep the opaque initial ownership refusal, but repeat all authority
-        // and row checks under the actual writer transaction below.
-        self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        // Keep the opaque initial ownership refusal. The config snapshot is
+        // dropped before the gate is awaited: held across it, a whole
+        // `Config` would live in this future and in the dispatch future that
+        // embeds it.
+        let owner = {
+            let config = self.ctx.config.read().clone();
+            self.authorize_cron_job(Method::CronPatch, &config, &req.id)?
+        };
+        // Held through the update: see `recheck_cron_write_authority`. The
+        // config is read again under it, so the command is validated against
+        // the policy the write commits under.
+        let config_writer_guard = self.ctx.config_authority.lock_config_writer().await;
+        self.recheck_cron_write_authority(
+            Method::CronPatch,
+            &owner.agent_alias,
+            false,
+            &config_writer_guard,
+        )?;
+        self.authorize_cron_agent_execution(Method::CronPatch, &owner)?;
+        let config = self.ctx.config.read().clone();
+        // Repeat the authority and row checks under the SQLite writer, so a
+        // change to the stored row's owner or type cannot land between them.
         let command = patch.command.clone();
         let denied = parking_lot::Mutex::new(None);
         let job = crate::cron::update_job_authorized(&config, &req.id, None, patch, |job| {
@@ -12032,7 +11950,7 @@ impl RpcDispatcher {
                     .as_deref()
                     .filter(|command| !command.trim().is_empty())
                 {
-                    crate::cron::validate_shell_command(&live, &job.agent_alias, command, true)
+                    crate::cron::validate_shell_command(&live, &job.agent_alias, command, false)
                         .map_err(|error| {
                             rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {error}"))
                         })?;
@@ -12050,6 +11968,7 @@ impl RpcDispatcher {
         }
         let job =
             job.map_err(|error| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {error}")))?;
+        drop(config_writer_guard);
         to_result(job)
     }
 
@@ -13398,6 +13317,11 @@ impl RpcDispatcher {
                 )
                 .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
                 for path in &report.dirty_paths {
+                    self.recheck_config_write_authority(
+                        Method::ConfigMapKeyRename,
+                        Some(path),
+                        &config_commit,
+                    )?;
                     working.mark_dirty(path);
                 }
                 report.dirty_paths.len()
@@ -13414,6 +13338,7 @@ impl RpcDispatcher {
                 // control all live in a task that request cancellation
                 // cannot abort.
                 let cleanup_sessions = Arc::clone(&self.ctx.sessions);
+                let cleanup_auth = Arc::clone(&self.ctx.auth);
                 let cleanup_reload_tx = self.ctx.reload_tx.clone();
                 let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
                 let from = req.from.clone();
@@ -13452,6 +13377,10 @@ impl RpcDispatcher {
                                 working.clone(),
                             )
                             .await?;
+                            publish_accepted_config_policy(
+                                &cleanup_auth,
+                                &config_commit.current_config(),
+                            );
                         }
                         // Committed: advance both alias generations exactly
                         // once — synchronous, no await since the publication.
@@ -14291,7 +14220,7 @@ impl RpcDispatcher {
                                             && grants.may_use_agent(&session.agent_alias)
                                     })
                                     && (self.access_policy == RpcAccessPolicy::TrustedLocal
-                                        || session.owner_tui_id.as_deref().is_some_and(|owner| {
+                                        || session.owner_tui_id().is_some_and(|owner| {
                                             self.tui_id.as_deref() == Some(owner)
                                         }))
                             })
@@ -14624,11 +14553,11 @@ impl RpcDispatcher {
             .upload_target(Method::FileAttach, &req.session_id)
             .await?;
 
-        let is_wss = self.peer_label.starts_with("wss:");
+        let is_remote = self.is_remote_caller();
         // Resolve + authorize once; the returned slots are index-aligned with
-        // req.files and carry the exact canonical target each read binds to. On
-        // WSS, path sources are rejected in load_file_entry.
-        let attachment_sources = if is_wss {
+        // req.files and carry the exact canonical target each read binds to.
+        // For a remote caller, path sources are rejected in load_file_entry.
+        let attachment_sources = if is_remote {
             Vec::new()
         } else {
             self.authorize_attachment_sources(
@@ -14644,7 +14573,7 @@ impl RpcDispatcher {
 
         for (idx, entry) in req.files.iter().enumerate() {
             let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
-            let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+            let (bytes, filename) = load_file_entry(entry, is_remote, source).await?;
             total_bytes += bytes.len() as u64;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
@@ -15368,7 +15297,7 @@ impl RpcDispatcher {
         // itself, which is the entitlement this method relies on. Lift the
         // refusal once there is a principal to authorize run contents against,
         // and replace it with that check rather than simply removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/run-detail is not served over remote WSS: the transport has no \
@@ -15663,7 +15592,7 @@ impl RpcDispatcher {
         // socket itself. Checked before the params are parsed so a refused
         // caller learns nothing about which SOPs exist. Replace this with a
         // principal check once there is one, rather than removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/rename is not served over remote WSS: the transport has no \
@@ -18510,6 +18439,28 @@ mod tests {
         .expect("the fixture job is created")
     }
 
+    /// Seed a low-risk shell job owned by `alias`, for the paths a scoped
+    /// principal may still change.
+    fn seed_shell_cron_job(
+        config: &zeroclaw_config::schema::Config,
+        alias: &str,
+        name: &str,
+    ) -> crate::cron::CronJob {
+        crate::cron::add_shell_job_with_approval(
+            config,
+            alias,
+            Some(name.to_string()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            None,
+            false,
+        )
+        .expect("the fixture shell job is created")
+    }
+
     #[tokio::test]
     async fn cron_list_hides_jobs_owned_by_other_agents() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -18709,16 +18660,7 @@ mod tests {
     async fn cron_patch_rejects_a_command_the_owner_policy_refuses() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = cron_roster_config_in(&tmp, 4242);
-        let job = crate::cron::add_shell_job_with_approval(
-            &config,
-            "alpha",
-            Some("alpha-job".into()),
-            Schedule::Every { every_ms: 3600000 },
-            "echo original",
-            None,
-            true,
-        )
-        .unwrap();
+        let job = seed_shell_cron_job(&config, "alpha", "alpha-job");
         let ctx = enforcement_ctx(config.clone());
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
@@ -18854,15 +18796,27 @@ mod tests {
                     assert!(response.get("error").is_none(), "{scenario}: {response}");
                     assert_eq!(stored.name.as_deref(), Some("patched"));
                 } else {
+                    // The patch holds the config writer gate through its wait
+                    // for the store, so a demotion or revocation cannot publish
+                    // before the write. The patch gives up when the store stays
+                    // busy, and is refused with nothing written; the new policy
+                    // publishes after it.
+                    let queued_behind = matches!(scenario, "agent-demotion" | "shell-revocation");
                     assert_eq!(
                         response["error"]["code"],
-                        json!(if scenario == "owner-change" {
-                            INVALID_PARAMS
-                        } else {
-                            FORBIDDEN
+                        json!(match scenario {
+                            "owner-change" => INVALID_PARAMS,
+                            _ if queued_behind => INTERNAL_ERROR,
+                            _ => FORBIDDEN,
                         }),
                         "{scenario}: {response}"
                     );
+                    if queued_behind {
+                        assert!(
+                            !ctx.config.read().permission_profiles["cron-alpha"].admin,
+                            "{scenario}: the queued publication lands after the patch"
+                        );
+                    }
                     assert_eq!(stored.name.as_deref(), Some("original"), "{scenario}");
                     assert_eq!(stored.command, job.command);
                     assert_eq!(stored.next_run, job.next_run);
@@ -18874,6 +18828,664 @@ mod tests {
                         .is_empty()
                 );
             }
+        });
+    }
+
+    /// The fixture's agents run supervised with medium-risk approval required,
+    /// and `touch` is allowlisted but medium-risk, so only the approval gate
+    /// stands between it and the store.
+    fn cron_supervised_touch_config_in(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = cron_roster_config_in(tmp, uid);
+        let profile = config
+            .risk_profiles
+            .get_mut("cron-profile")
+            .expect("the cron fixture defines its risk profile");
+        profile.allowed_commands = vec!["echo".into(), "touch".into()];
+        assert_eq!(
+            profile.level,
+            zeroclaw_config::autonomy::AutonomyLevel::Supervised
+        );
+        assert!(profile.require_approval_for_medium_risk);
+        config
+    }
+
+    /// An RPC request is not an operator approval: a medium-risk shell job
+    /// added over RPC must meet the same supervised gate as the CLI and the
+    /// gateway, and must not be stored as pre-approved.
+    #[tokio::test]
+    async fn cron_add_does_not_pre_approve_a_medium_risk_shell_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_supervised_touch_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "touch marker"}),
+        )
+        .await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("requires explicit approval")),
+            "a medium-risk command must hit the approval gate: {response}"
+        );
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "an unapproved medium-risk command must not be stored"
+        );
+
+        // A low-risk command on the same agent is still accepted.
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["agent_alias"],
+            json!("alpha"),
+            "{response}"
+        );
+    }
+
+    /// The patch path must not pre-approve a replacement command either.
+    #[tokio::test]
+    async fn cron_patch_does_not_pre_approve_a_medium_risk_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_supervised_touch_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        let id = response["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a low-risk job is added: {response}"))
+            .to_string();
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/patch",
+            json!({"id": id, "agent": "alpha", "command": "touch marker"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "an unapproved medium-risk command must not patch the job: {response}"
+        );
+        let reread = crate::cron::get_job(&config, &id).expect("the job still exists");
+        assert_eq!(reread.command, "echo hi");
+    }
+
+    /// A connection authenticated by a paired token, as a remote client binds
+    /// over WSS. The daemon's pairing guard is the one the gateway revokes on.
+    async fn paired_token_peer(
+        ctx: &Arc<RpcContext>,
+        token: &str,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({"auth_token": token}))
+            .await
+            .expect("the paired token authenticates");
+        (dispatcher, rx)
+    }
+
+    fn native_token_hash(dispatcher: &RpcDispatcher) -> String {
+        dispatcher
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.native_token_hash.clone())
+            .expect("a paired-token connection records its token hash")
+    }
+
+    /// A device revocation that arrives while a cron write waits on a busy
+    /// database. The revocation takes the path the gateway's device revoke,
+    /// rotate and revoke-all use, so it queues on the config write lock the
+    /// write holds, and the token stays paired while it waits. The write the
+    /// token was checked for commits first; the revocation then lands and
+    /// refuses the connection's next write.
+    #[test]
+    fn a_token_revocation_waits_for_a_cron_write_blocked_on_a_busy_store() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = cron_roster_config_in(&tmp, 4242);
+            config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+            // Creates jobs.db, so the competing writer has a database to hold.
+            seed_shell_cron_job(&config, "alpha", "alpha-shell");
+            let ctx = enforcement_ctx(config.clone());
+            let (client, _rx) = paired_token_peer(&ctx, "zc_tok").await;
+            let token_hash = native_token_hash(&client);
+            let pairing = Arc::clone(ctx.auth.pairing());
+
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db"))
+                .expect("the competing writer opens jobs.db");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the competing writer takes the write lock");
+
+            let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+            let add = zeroclaw_spawn::spawn!(async move {
+                let result = client.handle_cron_add(&params).await;
+                (client, result)
+            });
+
+            // The handler takes the lock once its gate has passed, and holds
+            // it until the store returns, which the busy database prevents.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !ctx.config_authority.config_write_lock_is_held() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cron write must hold the config write lock while the store is busy"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            let mut revoke = Box::pin(pairing.revoke_token_hash_ordered(
+                ctx.config_authority.begin_config_commit(),
+                &token_hash,
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(revoke.as_mut(), &mut cx).is_pending(),
+                "the revocation must queue behind the cron write"
+            );
+            assert!(
+                pairing.token_hash_is_paired(&token_hash),
+                "the token stays paired while the revocation waits"
+            );
+
+            writer
+                .execute_batch("ROLLBACK")
+                .expect("the competing writer releases jobs.db");
+            let (client, result) = add.await.expect("the add task must not panic");
+            let added = result.expect("the write checked before the revocation commits");
+            assert_eq!(added["agent_alias"], json!("alpha"), "{added}");
+            let (revoked, guard) = revoke.await.expect("the revocation's commit is admitted");
+            assert!(revoked, "the revocation removes the token");
+            drop(guard);
+            assert!(!pairing.token_hash_is_paired(&token_hash));
+
+            let refused = client
+                .handle_cron_add(&json!({
+                    "agent": "alpha",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo again",
+                }))
+                .await
+                .expect_err("the revoked token cannot write");
+            assert_eq!(refused.code, AUTH_REQUIRED, "{refused:?}");
+            assert_eq!(
+                crate::cron::list_jobs(&config)
+                    .expect("the store is readable")
+                    .len(),
+                2,
+                "only the seeded job and the write checked before the revocation"
+            );
+        });
+    }
+
+    /// The other order: a device revocation queued on the config write lock
+    /// ahead of a cron write that has already passed its gate. The lock is
+    /// fair, so the revocation removes the token first, and the write's
+    /// recheck under the lock refuses it without storing anything.
+    #[tokio::test]
+    async fn a_cron_write_queued_behind_a_token_revocation_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = cron_roster_config_in(&tmp, 4242);
+        config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+        let ctx = enforcement_ctx(config.clone());
+        let (client, _rx) = paired_token_peer(&ctx, "zc_tok").await;
+        let token_hash = native_token_hash(&client);
+        let pairing = Arc::clone(ctx.auth.pairing());
+
+        // An unrelated config writer holds the lock while both queue.
+        let in_flight = ctx.config_authority.lock_config_writer().await;
+        let mut revoke = Box::pin(
+            pairing
+                .revoke_token_hash_ordered(ctx.config_authority.begin_config_commit(), &token_hash),
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(revoke.as_mut(), &mut cx).is_pending());
+
+        let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+        let add = zeroclaw_spawn::spawn!(async move { client.handle_cron_add(&params).await });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(
+                !add.is_finished(),
+                "the add must pass its gate and queue on the config write lock"
+            );
+        }
+        assert!(pairing.token_hash_is_paired(&token_hash));
+
+        drop(in_flight);
+        let (revoked, guard) = revoke.await.expect("the revocation's commit is admitted");
+        assert!(revoked, "the revocation reaches the lock first");
+        drop(guard);
+
+        let err = add
+            .await
+            .expect("the add task must not panic")
+            .expect_err("a write whose token was revoked while it queued must be refused");
+        assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "the refused write must not store a job"
+        );
+    }
+
+    /// A non-admin's change to an agent job is refused under the config
+    /// writer gate, before the patch waits for the cron store's writer. With
+    /// that writer held elsewhere the refusal still arrives, and the job is
+    /// left as it was. Without the check under the gate, only the one under
+    /// the store's writer refuses it, after the store's busy wait.
+    #[tokio::test]
+    async fn cron_patch_refuses_an_agent_job_change_before_waiting_on_the_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-agent");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let writer = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": job.id, "agent": "alpha", "prompt": "say goodbye"}),
+        )
+        .await;
+        writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            refused["error"]["message"],
+            json!(crate::i18n::get_required_cli_string(
+                "rpc-cron-agent-principal-required"
+            )),
+            "{refused}"
+        );
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(
+            stored.prompt, job.prompt,
+            "a refused patch must not change the prompt"
+        );
+    }
+
+    /// Republish the accepted policy with alice's entitlement to `alpha` gone.
+    fn revoke_alice_cron_agent(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .allowed_agents
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// Republish the accepted policy with alice's cron grant gone.
+    fn revoke_alice_cron_grant(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// The selector passes and the call parks on the publication lock; alice's
+    /// entitlement to `alpha` is revoked while it waits. The insert must be
+    /// refused and nothing stored.
+    #[tokio::test]
+    async fn cron_add_revoked_while_queued_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+        let result = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move { alice.handle_cron_add(&params).await },
+            revoke_alice_cron_agent,
+        )
+        .await;
+
+        let err = result.expect_err("a principal revoked while queued must not add a job");
+        assert_eq!(err.code, FORBIDDEN, "{err:?}");
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "the refused add must not store a job"
+        );
+    }
+
+    /// Control for the recheck: a republication that leaves alice's authority
+    /// as it was does not refuse the parked add.
+    #[tokio::test]
+    async fn cron_add_survives_an_unrelated_republication_while_queued() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+        let republish_unchanged = |ctx: &Arc<RpcContext>| {
+            let same = ctx.config.read().clone();
+            ctx.auth
+                .refresh_from_config(&same)
+                .expect("republishing the same policy compiles");
+        };
+        let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+        let result = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move { alice.handle_cron_add(&params).await },
+            republish_unchanged,
+        )
+        .await;
+
+        let job = result.expect("unchanged authority must not be refused at the recheck");
+        assert_eq!(job["agent_alias"], json!("alpha"), "{job}");
+    }
+
+    /// The patch path rechecks too: alice's cron grant is revoked while the
+    /// call is parked, so the patch is refused and the row is unchanged.
+    #[tokio::test]
+    async fn cron_patch_revoked_while_queued_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_shell_cron_job(&config, "alpha", "alpha-shell");
+        let ctx = enforcement_ctx(config.clone());
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+        let params =
+            json!({"id": job.id, "agent": "alpha", "command": "echo changed", "name": "changed"});
+        let result = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move { alice.handle_cron_patch(&params).await },
+            revoke_alice_cron_grant,
+        )
+        .await;
+
+        let err = result.expect_err("a principal revoked while queued must not patch a job");
+        assert_eq!(err.code, FORBIDDEN, "{err:?}");
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(stored.command, "echo hi");
+        assert_eq!(stored.name.as_deref(), Some("alpha-shell"));
+    }
+
+    /// `cron/add` takes the alias reservation before the config writer gate,
+    /// the order `config/set` takes them, and holds both through the insert.
+    /// While it queues on the gate it already holds the reservation, so a
+    /// lifecycle delete or rename of the alias is refused; while the store is
+    /// busy it holds both; once the row is written it holds neither.
+    #[test]
+    fn cron_add_reserves_the_alias_before_the_writer_gate_and_holds_both_through_the_insert() {
+        use crate::live_config_authority::AgentDeleteBlocker;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = cron_roster_config_in(&tmp, 4242);
+            // Creates jobs.db, so the competing writer has a database to hold.
+            seed_shell_cron_job(&config, "alpha", "alpha-shell");
+            let ctx = enforcement_ctx(config.clone());
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let reserved = |ctx: &Arc<RpcContext>| {
+                matches!(
+                    ctx.agent_lifecycle.delete_blocker("alpha"),
+                    Some(AgentDeleteBlocker::Reservations { count: 1, .. })
+                )
+            };
+            assert!(
+                ctx.agent_lifecycle.delete_blocker("alpha").is_none(),
+                "nothing holds alpha before the add"
+            );
+
+            // An unrelated writer holds the gate, so the add queues on it.
+            let in_flight = ctx.config_authority.lock_config_writer().await;
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db"))
+                .expect("the competing writer opens jobs.db");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the competing writer takes the write lock");
+            let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+            let add = zeroclaw_spawn::spawn!(async move { alice.handle_cron_add(&params).await });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !reserved(&ctx) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the add must reserve alpha before it waits for the writer gate"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(!add.is_finished(), "the add is still queued on the gate");
+
+            // The gate frees and passes to the add, which then blocks in the
+            // busy store. The handoff alone shows nothing about the wait, so
+            // give the add time to reach the store and check again there: for
+            // as long as the competing writer holds jobs.db, the add must keep
+            // both the gate and the reservation.
+            drop(in_flight);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !ctx.config_authority.config_write_lock_is_held() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the add must take the writer gate once it frees"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(!add.is_finished(), "the add is still waiting for the store");
+            assert!(
+                ctx.config_authority.config_write_lock_is_held(),
+                "the add holds the writer gate while the store is busy"
+            );
+            assert!(reserved(&ctx), "the reservation is held through the insert");
+
+            writer
+                .execute_batch("ROLLBACK")
+                .expect("the competing writer releases jobs.db");
+            let added = add
+                .await
+                .expect("the add task must not panic")
+                .expect("the add commits");
+            assert_eq!(added["agent_alias"], json!("alpha"), "{added}");
+            assert!(
+                ctx.agent_lifecycle.delete_blocker("alpha").is_none(),
+                "the add releases the reservation once the row is written"
+            );
+            assert!(!ctx.config_authority.config_write_lock_is_held());
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_add_rechecks_credential_deadlines_after_the_sqlite_writer_wait() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        for (expires, due) in [(true, false), (false, true), (false, false)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = cron_roster_config_in(&tmp, 4242);
+            seed_shell_cron_job(&config, "alpha", "existing");
+            let ctx = enforcement_ctx(config.clone());
+            let (mut caller, _rx) = roster_peer(&ctx, 4242).await;
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            crate::cron::reset_write_connection_count_for_tests(&config);
+
+            let deadline = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 2;
+            let principal = &mut caller.auth.as_mut().unwrap().principal;
+            principal.expires_at = Some(if expires { deadline } else { deadline + 60 });
+            principal.revalidate_by = Some(if due { deadline } else { deadline + 60 });
+            let add = zeroclaw_spawn::spawn!(async move {
+                caller
+                    .handle_cron_add(&json!({
+                        "agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"
+                    }))
+                    .await
+            });
+            // This connection is opened only after the RPC has passed its initial
+            // authorization. The competing IMMEDIATE writer prevents insertion.
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while crate::cron::write_connection_count_for_tests(&config) == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the admitted add must reach the store");
+            if expires || due {
+                let until_deadline = (UNIX_EPOCH + Duration::from_secs(deadline))
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default();
+                tokio::time::sleep(until_deadline + Duration::from_millis(10)).await;
+            }
+            assert!(!add.is_finished());
+            writer.execute_batch("ROLLBACK").unwrap();
+            let result = add.await.unwrap();
+            let rows = crate::cron::list_jobs(&config).unwrap();
+            if expires || due {
+                assert_eq!(result.unwrap_err().code, AUTH_REQUIRED);
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "the refused insert must leave only the seed row"
+                );
+            } else {
+                let row = result.expect("a live credential may commit");
+                assert!(rows.iter().any(|job| row["id"] == job.id));
+                assert_eq!(rows.len(), 2);
+            }
+        }
+    }
+
+    /// The store's write is synchronous and can wait out SQLite's busy
+    /// timeout. While a competing writer holds `jobs.db`, the cron write must
+    /// already hold the publication lock, so a revocation published meanwhile
+    /// queues behind it: the add admitted before the revocation commits, and
+    /// the revocation binds alice's next add.
+    #[test]
+    fn cron_add_holds_the_publication_lock_while_the_store_is_busy() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = cron_roster_config_in(&tmp, 4242);
+            // Creates jobs.db, so the competing writer has a database to hold.
+            seed_shell_cron_job(&config, "alpha", "alpha-shell");
+            let ctx = enforcement_ctx(config.clone());
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db"))
+                .expect("the competing writer opens jobs.db");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the competing writer takes the write lock");
+
+            let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+            let add = zeroclaw_spawn::spawn!(async move {
+                let result = alice.handle_cron_add(&params).await;
+                (alice, result)
+            });
+
+            // The handler takes the lock only once its selector has passed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !ctx.config_authority.config_write_lock_is_held() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cron write must hold the publication lock while the store is busy"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            let publisher_ctx = Arc::clone(&ctx);
+            let mut publish = Box::pin(async move {
+                let _publication = publisher_ctx.config_authority.lock_config_writer().await;
+                revoke_alice_cron_agent(&publisher_ctx);
+            });
+            // One poll queues the publication on the lock; it cannot pass it
+            // while the cron write holds it.
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(publish.as_mut(), &mut cx).is_pending(),
+                "a publication must queue behind the cron write"
+            );
+
+            writer
+                .execute_batch("ROLLBACK")
+                .expect("the competing writer releases jobs.db");
+            let (alice, result) = add.await.expect("the add task must not panic");
+            let added = result.expect("the add admitted before the revocation commits");
+            assert_eq!(added["agent_alias"], json!("alpha"), "{added}");
+            publish.await;
+
+            let refused = alice
+                .handle_cron_add(&json!({
+                    "agent": "alpha",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo again",
+                }))
+                .await
+                .expect_err("the revocation binds the next add");
+            assert_eq!(refused.code, FORBIDDEN, "{refused:?}");
+            assert_eq!(
+                crate::cron::list_jobs(&config)
+                    .expect("the store is readable")
+                    .len(),
+                2,
+                "only the seeded job and the add admitted before the revocation"
+            );
         });
     }
 
@@ -19300,6 +19912,69 @@ mod tests {
             json!("s-root"),
             "allowed_roots is the operator's escape hatch: {response}"
         );
+    }
+
+    /// A workspace and an allowed root configured through a symlink, as a
+    /// macOS temp path is (`/var` and `/tmp` link into `/private`), admit a
+    /// scoped principal's sessions, and those sessions stay usable: each
+    /// holds the resolved directory, which a resume and a steer accept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_sessions_accept_a_workspace_and_allowed_root_configured_through_a_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("agent-workspace")).unwrap();
+        std::fs::create_dir_all(real.join("project")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, Some(link.join("project")));
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists")
+            .workspace
+            .path = Some(link.join("agent-workspace"));
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let workspace = real.join("agent-workspace").canonicalize().unwrap();
+        let root = real.join("project").canonicalize().unwrap();
+
+        // No cwd selects the configured workspace. The allowed root is
+        // selected by its configured spelling and by its resolved one.
+        for (id, sid, cwd, held) in [
+            (1, "s-workspace", None, &workspace),
+            (4, "s-root-link", Some(link.join("project")), &root),
+            (7, "s-root-real", Some(root.clone()), &root),
+        ] {
+            let mut params = json!({"agent_alias": "test-agent", "session_id": sid});
+            if let Some(cwd) = cwd {
+                params["cwd"] = json!(cwd.to_string_lossy());
+            }
+            let created = rpc(&mut alice, &mut rx, id, "session/new", params.clone()).await;
+            assert_eq!(created["result"]["session_id"], json!(sid), "{created}");
+            assert_eq!(
+                ctx.sessions.get_workspace_dir(sid).await.as_deref(),
+                Some(&*held.to_string_lossy()),
+                "{sid} must hold the resolved directory, not the link"
+            );
+            // A resume re-checks the held workspace, and a steer reaches the
+            // handler, which finds no running turn.
+            let resumed = rpc(&mut alice, &mut rx, id + 1, "session/new", params).await;
+            assert_eq!(resumed["result"]["session_id"], json!(sid), "{resumed}");
+            let steer = rpc(
+                &mut alice,
+                &mut rx,
+                id + 2,
+                "session/steer",
+                json!({"session_id": sid, "content": "x"}),
+            )
+            .await;
+            assert_eq!(
+                steer["error"]["code"],
+                json!(SESSION_NOT_FOUND),
+                "{sid}: {steer}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -22870,6 +23545,115 @@ mod tests {
                     .success
             );
         }
+    }
+
+    /// The agent-facing cron tools install or run work that executes later
+    /// under the agent's policy and the job's stored tool list, not under the
+    /// calling principal's grants. A session with no principal applied keeps
+    /// them and can edit the job through `cron_update`. A non-admin
+    /// principal's session does not have them, with wildcard tools and agents
+    /// or narrowed to `cron_update` and `file_read`, so it cannot hand an agent
+    /// job that keeps `file_write` a new prompt. The calls go through the
+    /// production tool dispatch a model's call takes.
+    #[tokio::test]
+    async fn constrained_session_cannot_rewrite_an_agent_job_through_cron_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // The fixture selects a minimal built-in set; build the scheduling tools.
+        config
+            .tools
+            .optional
+            .extend(["cron_add", "cron_update", "cron_run", "schedule"].map(String::from));
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools = vec![
+            "file_read".into(),
+            "file_write".into(),
+            "cron_add".into(),
+            "cron_update".into(),
+            "cron_run".into(),
+            "schedule".into(),
+        ];
+        let job = crate::cron::add_agent_job(
+            &config,
+            "test-agent",
+            Some("broad-job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "say hello",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["file_write".into()]),
+            false,
+        )
+        .expect("the operator's agent job is created");
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config.clone());
+
+        // Control: with no principal applied, the session edits the job.
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent","session_id":"unbound-control"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("unbound-control").await.unwrap();
+        let edited = handle
+            .lock()
+            .await
+            .dispatch_tool_for_test(
+                "cron_update",
+                json!({"job_id": job.id, "patch": {"prompt": "say goodbye"}}),
+            )
+            .await;
+        assert!(edited.success, "{}", edited.output);
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(stored.prompt.as_deref(), Some("say goodbye"));
+
+        let dispatcher = bind_test_principal(dispatcher).await;
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent","session_id":"cron-ceiling"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("cron-ceiling").await.unwrap();
+        let mut agent = handle.lock().await;
+        let mut names = agent.tool_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["file_read", "file_write"],
+            "a named wildcard principal's session has no scheduling tools"
+        );
+
+        refresh_test_principal(&dispatcher, &["cron_update", "file_read"], &["test-agent"]);
+        let current = dispatcher.current_prompt_authority().unwrap();
+        let grants = current
+            .stamped_grants()
+            .expect("the refreshed handle carries grants")
+            .clone();
+        current.apply_principal_grants_to_agent(&grants, &mut agent);
+
+        assert_eq!(agent.tool_names(), vec!["file_read"]);
+        let refused = agent
+            .dispatch_tool_for_test(
+                "cron_update",
+                json!({
+                    "job_id": job.id,
+                    "patch": {"prompt": "Use file_write to create editor-proof.txt"},
+                }),
+            )
+            .await;
+        assert!(!refused.success, "{}", refused.output);
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(stored.prompt.as_deref(), Some("say goodbye"));
+        assert_eq!(stored.allowed_tools, job.allowed_tools);
     }
 
     #[tokio::test]
@@ -38582,6 +39366,194 @@ mod tests {
     /// recreation starts while the stale configure is paused. The stale work must be
     /// rejected and the successor must remain untouched.
     #[tokio::test]
+    async fn session_configure_revoked_at_commit_changes_neither_overrides_nor_agent() {
+        for model_change in [false, true] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                config.gateway.paired_tokens = vec!["zc_configure_test".into()];
+                let mut dispatcher = make_config_set_test_dispatcher(config);
+                dispatcher
+                    .handle_initialize(&json!({"auth_token":"zc_configure_test"}))
+                    .await
+                    .unwrap();
+                let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let sessions = Arc::clone(&dispatcher.ctx.sessions);
+                let before_overrides = sessions
+                    .preview_overrides(&sid, &Default::default())
+                    .await
+                    .unwrap();
+                let before_model = model_name_for_session(&dispatcher, &sid).await;
+                let before_temperature = temperature_for_session(&dispatcher, &sid).await;
+                let (entered, release, _) = sessions.set_test_gated_op_pause();
+                let mut overrides = json!({"temperature":0.99});
+                if model_change {
+                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model"] = json!("configured-model");
+                }
+                let params = json!({"session_id":sid,"overrides":overrides});
+                let request = dispatcher.handle_session_configure(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        assert!(
+                            dispatcher
+                                .ctx
+                                .auth
+                                .pairing()
+                                .revoke_token("zc_configure_test")
+                        );
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("configure reaches and leaves its final commit boundary");
+                sessions.clear_test_gated_op_pause();
+                if revoke {
+                    assert_eq!(result.unwrap_err().code, AUTH_REQUIRED);
+                    let after = sessions
+                        .preview_overrides(&sid, &Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before_overrides).unwrap()
+                    );
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        before_model
+                    );
+                    assert_eq!(
+                        temperature_for_session(&dispatcher, &sid).await,
+                        before_temperature
+                    );
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        if model_change {
+                            "configured-model"
+                        } else {
+                            before_model.as_str()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_configure_rechecks_tui_ownership_at_commit() {
+        for model_change in [false, true] {
+            for (remote, transfer) in [(true, true), (true, false), (false, true)] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                config.gateway.paired_tokens = vec!["zc_configure_transport_test".into()];
+                let mut dispatcher = make_config_set_test_dispatcher(config);
+                dispatcher
+                    .handle_initialize(&json!({"auth_token":"zc_configure_transport_test"}))
+                    .await
+                    .unwrap();
+                dispatcher.tui_id = Some("original-owner".into());
+                if remote {
+                    dispatcher.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+                }
+                let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let sessions = Arc::clone(&dispatcher.ctx.sessions);
+                let generation = sessions.get_generation(&sid).await.unwrap();
+                let before_overrides = sessions
+                    .preview_overrides(&sid, &Default::default())
+                    .await
+                    .unwrap();
+                let before_model = model_name_for_session(&dispatcher, &sid).await;
+                let before_temperature = temperature_for_session(&dispatcher, &sid).await;
+                let (entered, release, _) = sessions.set_test_gated_op_pause();
+                let mut overrides = json!({"temperature":0.99});
+                if model_change {
+                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model"] = json!("configured-model");
+                }
+                let params = json!({"session_id":sid,"overrides":overrides});
+                let request = dispatcher.handle_session_configure(&params);
+                let resume = async {
+                    entered.notified().await;
+                    // A same-mode resume can rebind this incarnation while
+                    // configure holds its config-writer and provider locks.
+                    sessions
+                        .resume_existing(
+                            &sid,
+                            "test-agent",
+                            &ChatMode::Chat,
+                            Some(
+                                if transfer {
+                                    "successor-owner"
+                                } else {
+                                    "original-owner"
+                                }
+                                .into(),
+                            ),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(sessions.get_generation(&sid).await, Some(generation));
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, resume)
+                })
+                .await
+                .expect("configure reaches and leaves its final commit boundary");
+                sessions.clear_test_gated_op_pause();
+                if remote && transfer {
+                    assert_eq!(result.unwrap_err().code, SESSION_NOT_OWNED);
+                    let after = sessions
+                        .preview_overrides(&sid, &Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before_overrides).unwrap()
+                    );
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        before_model
+                    );
+                    assert_eq!(
+                        temperature_for_session(&dispatcher, &sid).await,
+                        before_temperature
+                    );
+                    assert_eq!(
+                        dispatcher
+                            .handle_session_configure(&params)
+                            .await
+                            .unwrap_err()
+                            .code,
+                        SESSION_NOT_OWNED,
+                        "the queued request must obey the same ownership rule as a fresh one"
+                    );
+                } else {
+                    result.expect("same-TUI reconnect and trusted-local configure remain allowed");
+                    assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        if model_change {
+                            "configured-model"
+                        } else {
+                            before_model.as_str()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn session_configure_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
@@ -38599,7 +39571,7 @@ mod tests {
 
         // Spawn the configure handler — it will capture the generation,
         // acquire the per-session lock, build the provider, then block at
-        // the gate inside set_overrides_gated.
+        // the gate inside configure_authorized.
         let handle = zeroclaw_spawn::spawn!(async move {
             dispatcher
                 .handle_session_configure(&json!({
