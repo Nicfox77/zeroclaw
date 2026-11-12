@@ -42,7 +42,9 @@ use zeroclaw_api::jsonrpc::error_codes::{
     AUTH_REQUIRED, FORBIDDEN, SESSION_NOT_FOUND, SESSION_NOT_OWNED,
 };
 use zeroclaw_rpc_client::{ClientError, ConnectOptions, ConnectionState, Method, RpcClient};
-use zeroclaw_rpc_proto::types::{AgentsListResult, SessionCancelResult, SessionNewResult};
+use zeroclaw_rpc_proto::types::{
+    AgentsListResult, InitializeResult, SessionCancelResult, SessionNewResult,
+};
 use zeroclaw_runtime::rpc::inproc::Served;
 
 use crate::AppState;
@@ -870,6 +872,7 @@ impl CoreChat {
         if self.ended().is_cancelled() {
             return Err(CoreFailure::SessionEnded);
         }
+        self.refresh_turn_binding(method).await?;
         match self.client.call::<T>(method, params).await {
             Ok(result) => Ok(Sent::Answered(result)),
             Err(ClientError::Rpc(error)) if error.code == AUTH_REQUIRED => {
@@ -890,10 +893,57 @@ impl CoreChat {
         if self.ended().is_cancelled() {
             return Err(CoreFailure::SessionEnded);
         }
+        self.refresh_turn_binding(method).await?;
         self.client
             .call::<T>(method, params)
             .await
             .map_err(|error| self.caller.failure(error))
+    }
+
+    async fn refresh_turn_binding(&self, method: Method) -> Result<(), CoreFailure> {
+        // A pending turn still runs on `bound`. Renewal of the request client
+        // alone does not refresh that turn's native persistence authority.
+        if matches!(
+            method,
+            Method::SessionApprove
+                | Method::SessionAbort
+                | Method::SessionCancel
+                | Method::SessionSteer
+        ) && !Arc::ptr_eq(&self.client, &self.bound)
+            && self.bound.state() == ConnectionState::Connected
+        {
+            let options = ConnectOptions {
+                auth_token: Some(self.credential.bearer.to_string()),
+                auth_provider: Some(format!("oidc.{}", self.caller.session.alias)),
+                tui_id: Some(self.identity.id.clone()),
+                tui_sig: Some(self.identity.sig.clone()),
+                ..ConnectOptions::default()
+            };
+            let params = serde_json::to_value(options.initialize_params())
+                .map_err(|error| CoreFailure::Lost(error.to_string()))?;
+            let result = self
+                .bound
+                .request_with_timeout(
+                    Method::Initialize.wire_name(),
+                    params,
+                    zeroclaw_rpc_client::DEFAULT_HANDSHAKE_TIMEOUT,
+                )
+                .await
+                .map_err(|error| self.caller.failure(error))?;
+            let renewed: InitializeResult = serde_json::from_value(result)
+                .map_err(|error| CoreFailure::Lost(error.to_string()))?;
+            if renewed.principal_id.as_deref()
+                != Some(self.credential.binding.principal_id.as_str())
+                || renewed.tui_id.as_deref() != Some(self.identity.id.as_str())
+            {
+                self.caller.end_session();
+                return Err(CoreFailure::SessionEnded);
+            }
+            if self.ended().is_cancelled() {
+                return Err(CoreFailure::SessionEnded);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn failure(&self, error: ClientError) -> CoreFailure {
@@ -6695,7 +6745,7 @@ mod tests {
 
         // The chat's connection loses its writer between the close's state
         // check and its send: the outbound lane has closed, and the client
-        // reports the refused send as an RPC error, not as a lost connection.
+        // reports the refused send as a lost connection.
         let client = chat.bound();
         client.shutdown();
         tokio::time::timeout(Duration::from_secs(5), client.closed())
@@ -6705,8 +6755,8 @@ mod tests {
             .call::<Value>(Method::SessionClose, json!({ "session_id": core_id }))
             .await;
         assert!(
-            matches!(&refused, Err(ClientError::Rpc(_))),
-            "the premise: a locally refused send reads as an RPC error: {refused:?}"
+            matches!(&refused, Err(ClientError::Disconnected(_))),
+            "a locally refused send is a transport failure: {refused:?}"
         );
 
         // That is not the core refusing the close: it is tried again.
