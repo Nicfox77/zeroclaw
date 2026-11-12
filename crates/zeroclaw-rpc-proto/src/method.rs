@@ -13,10 +13,6 @@
 // string. `from_wire` is a table scan — no hand-written string
 // matching anywhere in this file.
 
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     // Core
