@@ -473,6 +473,19 @@ impl RpcClient {
                     )));
                 }
             },
+            Ok(Some(Err(error)))
+                if rpc.is_closed()
+                    && error
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data["reason"] == "transport_closed") =>
+            {
+                let reason = match state.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                    ConnectionState::Disconnected(reason) => reason,
+                    ConnectionState::Connected => "connection closed".to_string(),
+                };
+                return Err(ClientError::Disconnected(reason));
+            }
             Ok(Some(Err(error))) => return Err(ClientError::Rpc(error)),
             Ok(None) => {
                 let reason = match state.lock().unwrap_or_else(|e| e.into_inner()).clone() {
@@ -554,6 +567,18 @@ impl RpcClient {
         .await;
         match outcome {
             Ok(Some(Ok(value))) => Ok(value),
+            Ok(Some(Err(error)))
+                if self.rpc.is_closed()
+                    && error
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data["reason"] == "transport_closed") =>
+            {
+                Err(ClientError::Disconnected(match self.state() {
+                    ConnectionState::Disconnected(reason) => reason,
+                    ConnectionState::Connected => "connection closed".to_string(),
+                }))
+            }
             Ok(Some(Err(error))) => Err(ClientError::Rpc(error)),
             Ok(None) => Err(ClientError::Disconnected(match self.state() {
                 ConnectionState::Disconnected(reason) => reason,

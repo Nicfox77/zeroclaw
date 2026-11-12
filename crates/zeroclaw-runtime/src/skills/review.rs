@@ -618,7 +618,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("skill review completes");
         provider.temperatures.lock().unwrap().clone()
     }
 

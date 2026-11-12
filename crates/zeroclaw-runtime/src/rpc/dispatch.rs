@@ -885,8 +885,9 @@ pub struct RpcDispatcher {
     access_policy: RpcAccessPolicy,
     local_session_channel_factory: Option<LocalRpcSessionChannelFactory>,
     /// The connection's authenticated state, bound by `initialize`.
+    /// Shared with spawned handles so verified reauthentication reaches active turns.
     /// `None` = unbound: every non-handshake method is refused.
-    auth: Option<crate::rpc::auth::ConnectionAuth>,
+    auth: Arc<parking_lot::RwLock<Option<crate::rpc::auth::ConnectionAuth>>>,
     /// Which transport class this connection arrived on.
     transport_kind: crate::rpc::transport::TransportKind,
     /// The transport-intrinsic credential (kernel peer uid on local
@@ -1057,7 +1058,7 @@ impl RpcDispatcher {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             access_policy,
             local_session_channel_factory,
-            auth: None,
+            auth: Arc::new(parking_lot::RwLock::new(None)),
             transport_kind: crate::rpc::transport::TransportKind::Local,
             transport_credential: crate::security::auth_provider::Credential::None,
             auth_binding: None,
@@ -1179,7 +1180,7 @@ impl RpcDispatcher {
             .unwrap_or_default()
             .as_secs();
         {
-            let Some(auth) = self.auth.as_ref() else {
+            let Some(auth) = self.bound_auth() else {
                 let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
                     "rpc-auth-first-call-initialize",
                 ));
@@ -1222,15 +1223,19 @@ impl RpcDispatcher {
         // this established connection now, not at reconnect.
         let current_generation = self.ctx.auth.generation();
         let stale_identity = self
-            .auth
+            .bound_auth()
             .as_ref()
             .filter(|auth| auth.generation != current_generation)
             .map(|auth| auth.identity.clone());
         if stale_identity.is_some() {
-            let stale_auth = self.auth.as_ref().expect("stale auth exists").clone();
+            let stale_auth = self
+                .bound_auth()
+                .as_ref()
+                .expect("stale auth exists")
+                .clone();
             match self.ctx.auth.revalidate_and_resolve(&stale_auth) {
                 Ok(resolved) => {
-                    if let Some(auth) = self.auth.as_mut() {
+                    if let Some(auth) = self.auth.write().as_mut() {
                         auth.principal = resolved.principal;
                         auth.grants = resolved.grants;
                         auth.generation = resolved.generation;
@@ -1239,14 +1244,14 @@ impl RpcDispatcher {
                 Err(reason) => {
                     // The current policy grants this identity nothing:
                     // drop the binding entirely.
-                    self.auth = None;
+                    *self.auth.write() = None;
                     let denied = AuthDenied::from_deny_reason(reason);
                     self.audit_auth_denial(method, &denied);
                     return Err(denied);
                 }
             }
         }
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(auth) = self.bound_auth() else {
             let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
                 "rpc-auth-first-call-initialize",
             ));
@@ -1264,8 +1269,14 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// The successful initialize binding is owned by the connection and shared
+    /// with its in-flight work. No read guard crosses an await.
+    fn bound_auth(&self) -> Option<crate::rpc::auth::ConnectionAuth> {
+        self.auth.read().clone()
+    }
+
     fn audit_auth_denial(&self, method: Method, denied: &crate::rpc::auth::AuthDenied) {
-        audit_denial(self.auth.as_ref(), method, denied);
+        audit_denial(self.bound_auth().as_ref(), method, denied);
     }
 }
 
@@ -1354,9 +1365,22 @@ impl PromptAdmission {
         lease: &crate::rpc::auth::AuthorityLease<'_>,
         method: Method,
     ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
-        let grants = self
-            .dispatcher
-            .auth
+        self.check_for_principal_under(lease, method, None)
+    }
+
+    fn check_for_principal_under(
+        &self,
+        lease: &crate::rpc::auth::AuthorityLease<'_>,
+        method: Method,
+        expected: Option<&zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
+        let binding = self.dispatcher.bound_auth();
+        if let Some(expected) = expected
+            && binding.as_ref().map(|auth| &auth.principal.id) != Some(expected)
+        {
+            return Err(rpc_err(FORBIDDEN, "RPC execution principal changed"));
+        }
+        let grants = binding
             .as_ref()
             .map(|auth| {
                 current_authority_under(lease, auth, method).map_err(|denied| {
@@ -1426,7 +1450,7 @@ impl PromptAdmission {
                 let lease = self.dispatcher.ctx.auth.hold_authority();
                 let grants = self
                     .dispatcher
-                    .auth
+                    .bound_auth()
                     .as_ref()
                     .map(|auth| {
                         current_authority_under(&lease, auth, Method::SessionPrompt)
@@ -1560,13 +1584,13 @@ impl RpcHistoryAuthority {
     {
         let grants = self
             .admission
-            .check_for_under(lease, self.method)
+            .check_for_principal_under(lease, self.method, Some(&self.principal))
             .map_err(|error| {
                 zeroclaw_kernel::session::SessionError::PermissionDenied(error.message)
             })?;
         if self.method == Method::SessionCompact {
             self.admission
-                .check_for_under(lease, Method::SessionAppend)
+                .check_for_principal_under(lease, Method::SessionAppend, Some(&self.principal))
                 .map_err(|error| {
                     zeroclaw_kernel::session::SessionError::PermissionDenied(error.message)
                 })?;
@@ -1885,12 +1909,20 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryReader {
                 "RPC history read scope mismatch".into(),
             ));
         }
-        let grants = self
+        let binding = self
             .dispatcher
-            .recheck_authority_after_admission(self.method)
-            .map_err(|error| {
-                zeroclaw_kernel::session::SessionError::PermissionDenied(error.message)
+            .bound_auth()
+            .filter(|auth| auth.principal.id == self.principal)
+            .ok_or_else(|| {
+                zeroclaw_kernel::session::SessionError::PermissionDenied(
+                    "RPC history principal changed".into(),
+                )
             })?;
+        let grants = Some(
+            current_authority(&self.dispatcher.ctx.auth, &binding, self.method).map_err(
+                |error| zeroclaw_kernel::session::SessionError::PermissionDenied(error.message),
+            )?,
+        );
         self.dispatcher
             .require_ownership_under(grants.as_ref(), self.record.as_ref())
             .map_err(|error| {
@@ -1959,7 +1991,7 @@ impl RpcDispatcher {
     /// Fine-grained config-path selector. Composes with the coarse
     /// `Config` grant the gate already enforced: both are required.
     fn selector_config_write(&self, method: Method, path: &str) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(auth) = self.bound_auth() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
         if auth.grants.may_write_config(path) {
@@ -1987,13 +2019,13 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        self.selector_session_agent_with_grants(method, grants, alias)
+        self.selector_session_agent_with_grants(method, &grants, alias)
     }
 
     /// The grants stamped on this connection by the last pass through the
     /// gate, or `None` for an unbound dispatcher.
-    fn stamped_grants(&self) -> Option<&zeroclaw_api::grants::ResolvedGrants> {
-        self.auth.as_ref().map(|auth| &auth.grants)
+    fn stamped_grants(&self) -> Option<zeroclaw_api::grants::ResolvedGrants> {
+        self.bound_auth().map(|auth| auth.grants)
     }
 
     /// [`Self::selector_session_agent`] evaluated against an explicit grant
@@ -2036,7 +2068,7 @@ impl RpcDispatcher {
     /// selector is now composed into the assembled agent instead of
     /// refusing every constrained principal outright.
     fn principal_tool_narrowing(&self) -> Option<Vec<String>> {
-        let auth = self.auth.as_ref()?;
+        let auth = self.bound_auth()?;
         principal_tool_ceiling(&auth.grants)
     }
 
@@ -2059,10 +2091,9 @@ impl RpcDispatcher {
     /// This re-resolves rather than comparing against the grants stamped on
     /// the connection, so a policy change that WIDENS the principal's
     /// authority while it waits is honoured rather than refused. It is
-    /// non-mutating: the handlers take `&self`, and leaving the stamped
-    /// binding alone keeps `authorize` the single place that re-stamps it. A
-    /// spawned prompt handle carries a copy of the stamped binding, which is
-    /// exactly why the fresh grants are returned instead of read back.
+    /// non-mutating: handlers resolve the connection's shared binding and return
+    /// fresh grants for the effect. A successful reinitialize refreshes that
+    /// same binding for spawned prompt handles.
     ///
     /// A publication that lands between the resolution and the generation
     /// read fails the operation closed. The config path holds the lock that
@@ -2075,10 +2106,10 @@ impl RpcDispatcher {
         &self,
         method: Method,
     ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(auth) = self.bound_auth() else {
             return Ok(None);
         };
-        current_authority(&self.ctx.auth, auth, method)
+        current_authority(&self.ctx.auth, &auth, method)
             .map(Some)
             .map_err(|denied| {
                 self.audit_auth_denial(method, &denied);
@@ -2161,7 +2192,7 @@ impl RpcDispatcher {
         alias: &str,
         require_configured: bool,
     ) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(auth) = self.bound_auth() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
         self.check_agent_selector_with_grants(method, &auth.grants, alias, require_configured)
@@ -2212,7 +2243,7 @@ impl RpcDispatcher {
         config: &Config,
         id: &str,
     ) -> Result<crate::cron::CronJob, JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(auth) = self.bound_auth() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
         let job = crate::cron::get_job(config, id)
@@ -2440,7 +2471,7 @@ impl RpcDispatcher {
                 .map(super::fs::ListingAuthorization::Unconfined)
         } else if plain {
             let config = self.ctx.config.read();
-            super::fs::authorize_listing(&config, grants, requested)
+            super::fs::authorize_listing(&config, &grants, requested)
         } else {
             None
         };
@@ -2565,7 +2596,9 @@ impl RpcDispatcher {
     /// unauthenticated dispatcher (the direct unit-test handlers, which never
     /// reach a gated method through `process_line`) is not admin.
     fn has_admin_grants(&self) -> bool {
-        self.auth.as_ref().is_some_and(|auth| auth.grants.admin)
+        self.bound_auth()
+            .as_ref()
+            .is_some_and(|auth| auth.grants.admin)
     }
 
     /// The forwarded shell environment this connection may keep.
@@ -2707,7 +2740,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read();
         let lease = self.session_effect_lease(Method::SessionNew, owner)?;
         let grants = self
-            .auth
+            .bound_auth()
             .as_ref()
             .map(|auth| current_authority_under(&lease, auth, Method::SessionNew))
             .transpose()
@@ -2748,12 +2781,18 @@ impl RpcDispatcher {
         grants: &zeroclaw_api::grants::ResolvedGrants,
         agent: &mut crate::agent::agent::Agent,
     ) {
-        if let Some(auth) = self.auth.clone() {
+        if let Some(auth) = self.bound_auth() {
+            let principal = auth.principal.id;
+            let binding = Arc::clone(&self.auth);
             let inbound = Arc::clone(&self.ctx.auth);
             agent.bind_principal_admission(Arc::new(move || {
-                inbound
-                    .current_grants(&auth)
-                    .is_ok_and(|grants| grants.admin)
+                let current = binding.read().clone();
+                current.as_ref().is_some_and(|auth| {
+                    auth.principal.id == principal
+                        && inbound
+                            .current_grants(auth)
+                            .is_ok_and(|grants| grants.admin)
+                })
             }));
         }
         agent.apply_principal_tool_posture(principal_tool_posture(grants));
@@ -2769,7 +2808,7 @@ impl RpcDispatcher {
     #[cfg(test)]
     fn current_prompt_authority(&self) -> Result<Self, JsonRpcError> {
         let mut current = self.spawn_handle();
-        if current.auth.is_some() {
+        if current.bound_auth().is_some() {
             current
                 .authorize(
                     Method::SessionPrompt,
@@ -2791,7 +2830,7 @@ impl RpcDispatcher {
     /// a check made before the handler waits. After waiting for admission or
     /// a lock, derive the scope with [`Self::scoped_principal_id_from`].
     fn scoped_principal_id(&self) -> Option<String> {
-        self.scoped_principal_id_from(self.stamped_grants())
+        self.scoped_principal_id_from(self.stamped_grants().as_ref())
     }
 
     /// [`Self::scoped_principal_id`] judged by `grants`: after a wait, the
@@ -2804,7 +2843,7 @@ impl RpcDispatcher {
         &self,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
     ) -> Option<String> {
-        let auth = self.auth.as_ref()?;
+        let auth = self.bound_auth()?;
         if grants.is_some_and(|grants| grants.admin) || !auth.principal.is_authenticated() {
             return None;
         }
@@ -2819,7 +2858,7 @@ impl RpcDispatcher {
     /// the grant is later removed, and an administrator touching another
     /// principal's session never re-labels it.
     fn owner_principal_id(&self) -> Option<String> {
-        let auth = self.auth.as_ref()?;
+        let auth = self.bound_auth()?;
         if !auth.principal.is_authenticated() {
             return None;
         }
@@ -3098,7 +3137,7 @@ impl RpcDispatcher {
             None => {
                 if let Some(other) = record.as_ref().and_then(|rec| rec.owner.as_deref()) {
                     let actor = self
-                        .auth
+                        .bound_auth()
                         .as_ref()
                         .map(|auth| auth.principal.id.as_str().to_owned())
                         .unwrap_or_default();
@@ -3259,7 +3298,7 @@ impl RpcDispatcher {
 
     #[cfg(test)]
     pub fn expire_credential_for_test(&mut self) {
-        if let Some(auth) = self.auth.as_mut() {
+        if let Some(auth) = self.auth.write().as_mut() {
             auth.principal.expires_at = Some(0);
         }
     }
@@ -3492,7 +3531,7 @@ impl RpcDispatcher {
             .auth
             .resolve(&identity)
             .expect("the test identity resolves");
-        self.auth = Some(crate::rpc::auth::ConnectionAuth {
+        *self.auth.write() = Some(crate::rpc::auth::ConnectionAuth {
             identity,
             principal: resolved.principal,
             grants: resolved.grants,
@@ -3514,7 +3553,7 @@ impl RpcDispatcher {
             .auth
             .resolve(&identity)
             .expect("the shared operator always resolves");
-        self.auth = Some(crate::rpc::auth::ConnectionAuth {
+        *self.auth.write() = Some(crate::rpc::auth::ConnectionAuth {
             identity,
             principal: resolved.principal,
             grants: resolved.grants,
@@ -3537,7 +3576,7 @@ impl RpcDispatcher {
             rpc: Arc::clone(&self.rpc),
             access_policy: self.access_policy,
             local_session_channel_factory: self.local_session_channel_factory.clone(),
-            auth: self.auth.clone(),
+            auth: Arc::clone(&self.auth),
             transport_kind: self.transport_kind,
             transport_credential: self.transport_credential.clone(),
             auth_binding: self.auth_binding.clone(),
@@ -3800,7 +3839,7 @@ impl RpcDispatcher {
     pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
         loop {
             let frame = match self.initialize_deadline {
-                Some(deadline) if self.auth.is_none() => {
+                Some(deadline) if self.bound_auth().is_none() => {
                     match tokio::time::timeout_at(deadline, transport.next_frame()).await {
                         Ok(frame) => frame,
                         Err(_) => {
@@ -3825,7 +3864,7 @@ impl RpcDispatcher {
                 // completing late. Nothing is registered before the
                 // authentication await, and teardown unregisters anything
                 // registered after it.
-                Some(deadline) if self.auth.is_none() => {
+                Some(deadline) if self.bound_auth().is_none() => {
                     if tokio::time::timeout_at(deadline, self.process_line(trimmed))
                         .await
                         .is_err()
@@ -3836,7 +3875,7 @@ impl RpcDispatcher {
                 }
                 _ => self.process_line(trimmed).await,
             }
-            if self.auth.is_some() {
+            if self.bound_auth().is_some() {
                 self.initialize_deadline = None;
             }
         }
@@ -4352,7 +4391,7 @@ impl RpcDispatcher {
 
         let principal_id = connection_auth.principal.id.as_str().to_owned();
         let auth_provider_label = connection_auth.principal.auth_provider_label();
-        self.auth = Some(connection_auth);
+        *self.auth.write() = Some(connection_auth);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4734,7 +4773,7 @@ impl RpcDispatcher {
     ) -> Result<crate::rpc::auth::AuthorityLease<'_>, JsonRpcError> {
         let lease = self.ctx.auth.hold_authority();
         let grants = self
-            .auth
+            .bound_auth()
             .as_ref()
             .map(|auth| current_authority_under(&lease, auth, method))
             .transpose()
@@ -4779,7 +4818,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read();
         let lease = self.session_effect_lease(method, session.owner_principal_id.as_deref())?;
         let grants = self
-            .auth
+            .bound_auth()
             .as_ref()
             .map(|auth| current_authority_under(&lease, auth, method))
             .transpose()
@@ -5701,7 +5740,7 @@ impl RpcDispatcher {
 
         let native_restore = if let Some(source) = &self.ctx.native_sessions {
             let principal = self
-                .auth
+                .bound_auth()
                 .as_ref()
                 .map(|auth| auth.principal.id.clone())
                 .ok_or_else(|| {
@@ -6985,7 +7024,7 @@ impl RpcDispatcher {
         self.ctx.sessions.wait_test_rehydrate_seed_pause().await;
         let native_restore = if let Some(source) = &self.ctx.native_sessions {
             let principal = self
-                .auth
+                .bound_auth()
                 .as_ref()
                 .map(|auth| auth.principal.id.clone())
                 .ok_or_else(|| {
@@ -7860,7 +7899,7 @@ impl RpcDispatcher {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let native_session = if let Some(source) = &self.ctx.native_sessions {
             let principal = self
-                .auth
+                .bound_auth()
                 .as_ref()
                 .map(|auth| auth.principal.id.clone())
                 .ok_or_else(|| {
@@ -9259,9 +9298,7 @@ impl RpcDispatcher {
                 .with_category(::zeroclaw_log::EventCategory::Agent)
                 .with_attrs(::serde_json::json!({
                     "session_id": req.session_id,
-                    "principal_id": self
-                        .auth
-                        .as_ref()
+                    "principal_id": self.bound_auth().as_ref()
                         .map(|auth| auth.principal.id.as_str().to_owned()),
                     "caller_tui_id": self.tui_id.as_deref(),
                     "peer_label": &self.peer_label,
@@ -9339,7 +9376,7 @@ impl RpcDispatcher {
         session_id: &str,
         record: Option<&crate::rpc::session::SessionRecord>,
     ) -> Result<Option<crate::agent::SteeringAdmit>, JsonRpcError> {
-        let binding = self.auth.clone();
+        let binding = self.bound_auth();
         if binding.is_none() && self.access_policy == RpcAccessPolicy::TrustedLocal {
             return Ok(None);
         }
@@ -9358,15 +9395,20 @@ impl RpcDispatcher {
             )
             .await
             .ok_or_else(|| self.stale_session_incarnation_error())?;
+        let expected_principal = binding.as_ref().map(|auth| auth.principal.id.clone());
         let dispatcher = self.spawn_handle();
         let admitted = record.cloned();
         Ok(Some(Box::new(move || {
             use crate::agent::{SteeringAdmission, SteeringPosture};
+            let binding = dispatcher.bound_auth();
             let refuse = |message: String| {
                 let denied = crate::rpc::auth::AuthDenied::forbidden(message.clone());
                 audit_denial(binding.as_ref(), Method::SessionSteer, &denied);
                 SteeringAdmission::Refused(message)
             };
+            if binding.as_ref().map(|auth| &auth.principal.id) != expected_principal.as_ref() {
+                return refuse("RPC steering principal changed".into());
+            }
             if dispatcher.access_policy == RpcAccessPolicy::RemoteSessionOwner
                 && owner_revoked.is_cancelled()
             {
@@ -10149,7 +10191,7 @@ impl RpcDispatcher {
             return Ok(None);
         };
         let principal = self
-            .auth
+            .bound_auth()
             .as_ref()
             .map(|auth| auth.principal.id.clone())
             .ok_or_else(|| {
@@ -10207,7 +10249,7 @@ impl RpcDispatcher {
             return Ok(None);
         };
         let principal = self
-            .auth
+            .bound_auth()
             .as_ref()
             .map(|auth| auth.principal.id.clone())
             .ok_or_else(|| {
@@ -11453,7 +11495,7 @@ impl RpcDispatcher {
             ) {
                 Ok(tx) if tx.is_closed() => ApprovalResolution::ReceiverClosed,
                 Ok(tx) => {
-                    let actor = self.auth.as_ref().map_or_else(
+                    let actor = self.bound_auth().as_ref().map_or_else(
                         || zeroclaw_api::session_events::EventActor::System {
                             component: "approval_identity_unavailable".into(),
                         },
@@ -11463,7 +11505,7 @@ impl RpcDispatcher {
                     );
                     let reply_event_id = match registration.record_reply(actor, response.clone(), serde_json::json!({
                         "transport":"rpc", "request_id":p.request_id,
-                        "identity_unavailable_reason":self.auth.is_none().then_some("rpc_principal_not_bound"),
+                        "identity_unavailable_reason":self.bound_auth().is_none().then_some("rpc_principal_not_bound"),
                     })).await {
                         Ok(reply_event_id) => reply_event_id,
                         Err(error) => {
@@ -11483,7 +11525,7 @@ impl RpcDispatcher {
                             .await?;
                         let lease = self.ctx.auth.hold_authority();
                         let grants = self
-                            .auth
+                            .bound_auth()
                             .as_ref()
                             .map(|auth| {
                                 current_authority_under(&lease, auth, Method::SessionApprove)
@@ -11795,7 +11837,7 @@ impl RpcDispatcher {
         // One query, then drop what this principal is not entitled to see.
         // An operator-level principal keeps the whole list; a scoped one sees
         // only its own agents' rows, and legacy ownerless rows are nobody's.
-        if let Some(auth) = self.auth.as_ref() {
+        if let Some(auth) = self.bound_auth() {
             jobs.retain(|job| auth.grants.may_use_agent(&job.agent_alias));
         }
         to_result(CronListResult { jobs })
@@ -11832,7 +11874,7 @@ impl RpcDispatcher {
         // supervised-autonomy gate as the CLI and the gateway, so a medium- or
         // high-risk command is refused here instead of being stored as though
         // an operator had approved it.
-        let auth = self.auth.as_ref().ok_or_else(|| {
+        let auth = self.bound_auth().ok_or_else(|| {
             rpc_err(
                 AUTH_REQUIRED,
                 crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
@@ -11852,7 +11894,7 @@ impl RpcDispatcher {
                 // The config writer serializes policy changes, but a credential
                 // can expire or reach its revalidation deadline while SQLite waits.
                 let authority = self.ctx.auth.hold_authority();
-                current_authority_under(&authority, auth, Method::CronAdd)
+                current_authority_under(&authority, &auth, Method::CronAdd)
                     .map(|_| authority)
                     .map_err(|error| {
                         self.audit_auth_denial(Method::CronAdd, &error);
@@ -11918,10 +11960,9 @@ impl RpcDispatcher {
                 let live = self.ctx.config.read();
                 let lease = self.ctx.auth.hold_authority();
                 let auth = self
-                    .auth
-                    .as_ref()
+                    .bound_auth()
                     .ok_or_else(|| rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"))?;
-                let grants = current_authority_under(&lease, auth, Method::CronPatch)
+                let grants = current_authority_under(&lease, &auth, Method::CronPatch)
                     .map_err(|error| rpc_err(error.code, error.message))?;
                 if !grants.may_use_agent(&req.agent)
                     || (!grants.admin && !live.agents.contains_key(&req.agent))
@@ -14191,7 +14232,7 @@ impl RpcDispatcher {
             .sessions
             .with_current_sessions(|sessions| {
                 let grants = self.recheck_authority_after_admission(Method::ConfigStatus)?;
-                let scoped_principal = self.auth.as_ref().filter(|auth| {
+                let scoped_principal = self.bound_auth().filter(|auth| {
                     auth.principal.is_authenticated()
                         && grants.as_ref().is_some_and(|grants| !grants.admin)
                 });
@@ -14211,7 +14252,7 @@ impl RpcDispatcher {
                         ConfigApplicationTarget::Session { id, generation } => {
                             sessions.get(id).is_some_and(|session| {
                                 session.generation == *generation
-                                    && scoped_principal.is_none_or(|auth| {
+                                    && scoped_principal.as_ref().is_none_or(|auth| {
                                         session.owner_principal_id.as_deref()
                                             == Some(auth.principal.id.as_str())
                                     })
@@ -14324,15 +14365,15 @@ impl RpcDispatcher {
     /// [`sees_every_principal`]. An unbound dispatcher (the direct unit-test
     /// handlers) is not checked.
     fn require_global_stream_access(&self, method: Method) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(auth) = self.bound_auth() else {
             return Ok(());
         };
-        let denied = match current_authority(&self.ctx.auth, auth, method) {
-            Ok(grants) if sees_every_principal(auth, &grants) => return Ok(()),
+        let denied = match current_authority(&self.ctx.auth, &auth, method) {
+            Ok(grants) if sees_every_principal(&auth, &grants) => return Ok(()),
             Ok(_) => crate::rpc::auth::AuthDenied::forbidden(GLOBAL_STREAM_SCOPED_DENIAL),
             Err(denied) => denied,
         };
-        audit_denial(Some(auth), method, &denied);
+        audit_denial(Some(&auth), method, &denied);
         Err(rpc_err(denied.code, denied.message))
     }
 
@@ -14404,7 +14445,7 @@ impl RpcDispatcher {
             notification_method,
             method,
             inbound: Arc::clone(&self.ctx.auth),
-            binding: self.auth.clone(),
+            binding: self.bound_auth(),
             registry: Arc::clone(&self.subscriptions),
         };
         zeroclaw_spawn::spawn!(deliver_subscription(delivery));
@@ -14562,7 +14603,7 @@ impl RpcDispatcher {
         } else {
             self.authorize_attachment_sources(
                 Method::FileAttach,
-                self.stamped_grants(),
+                self.stamped_grants().as_ref(),
                 &target.agent_alias,
                 &req.files,
             )?
@@ -14739,10 +14780,10 @@ impl RpcDispatcher {
         lease: &crate::rpc::auth::AuthorityLease<'_>,
     ) -> Result<(), JsonRpcError> {
         // Only the direct unit-test handlers run unbound.
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(auth) = self.bound_auth() else {
             return Ok(());
         };
-        let grants = current_authority_under(lease, auth, method).map_err(|denied| {
+        let grants = current_authority_under(lease, &auth, method).map_err(|denied| {
             self.audit_auth_denial(method, &denied);
             rpc_err(denied.code, denied.message)
         })?;
@@ -14940,7 +14981,7 @@ impl RpcDispatcher {
             return Ok(());
         };
         if executes {
-            self.refuse_constrained_principal_for_sop(method, grants)?;
+            self.refuse_constrained_principal_for_sop(method, &grants)?;
         }
         let agents = {
             let config = self.ctx.config.read();
@@ -14948,7 +14989,7 @@ impl RpcDispatcher {
         };
         for alias in &agents {
             if executes {
-                self.selector_session_agent_with_grants(method, grants, alias)?;
+                self.selector_session_agent_with_grants(method, &grants, alias)?;
             } else {
                 self.selector_agent(method, alias)?;
             }
@@ -15013,8 +15054,8 @@ impl RpcDispatcher {
         // Callers use a nonblocking store and drop this before any await.
         let config = self.ctx.config.read();
         let lease = self.ctx.auth.hold_authority();
-        if let Some(auth) = self.auth.as_ref() {
-            let grants = current_authority_under(&lease, auth, method)
+        if let Some(auth) = self.bound_auth() {
+            let grants = current_authority_under(&lease, &auth, method)
                 .map_err(|denied| rpc_err(denied.code, denied.message))?;
             self.refuse_constrained_principal_for_sop(method, &grants)?;
         }
@@ -15376,7 +15417,7 @@ impl RpcDispatcher {
         let _guard = span.enter();
 
         if let Some(grants) = self.stamped_grants() {
-            self.refuse_constrained_principal_for_sop(Method::SopsDecide, grants)?;
+            self.refuse_constrained_principal_for_sop(Method::SopsDecide, &grants)?;
         }
 
         let mut resolved_outcome = None;
@@ -18958,8 +18999,7 @@ mod tests {
 
     fn native_token_hash(dispatcher: &RpcDispatcher) -> String {
         dispatcher
-            .auth
-            .as_ref()
+            .bound_auth()
             .and_then(|auth| auth.native_token_hash.clone())
             .expect("a paired-token connection records its token hash")
     }
@@ -19353,7 +19393,7 @@ mod tests {
             let config = cron_roster_config_in(&tmp, 4242);
             seed_shell_cron_job(&config, "alpha", "existing");
             let ctx = enforcement_ctx(config.clone());
-            let (mut caller, _rx) = roster_peer(&ctx, 4242).await;
+            let (caller, _rx) = roster_peer(&ctx, 4242).await;
             let writer = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
             writer.execute_batch("BEGIN IMMEDIATE").unwrap();
             crate::cron::reset_write_connection_count_for_tests(&config);
@@ -19363,9 +19403,12 @@ mod tests {
                 .unwrap()
                 .as_secs()
                 + 2;
-            let principal = &mut caller.auth.as_mut().unwrap().principal;
-            principal.expires_at = Some(if expires { deadline } else { deadline + 60 });
-            principal.revalidate_by = Some(if due { deadline } else { deadline + 60 });
+            {
+                let mut binding = caller.auth.write();
+                let principal = &mut binding.as_mut().unwrap().principal;
+                principal.expires_at = Some(if expires { deadline } else { deadline + 60 });
+                principal.revalidate_by = Some(if due { deadline } else { deadline + 60 });
+            }
             let add = zeroclaw_spawn::spawn!(async move {
                 caller
                     .handle_cron_add(&json!({
@@ -19806,7 +19849,7 @@ mod tests {
         let _ = session_new_with_cwd(&mut alice, &mut rx, "s-bind", &inside).await;
         let grants = alice.stamped_grants();
         assert!(
-            grants.is_some_and(|grants| !grants.admin),
+            grants.as_ref().is_some_and(|grants| !grants.admin),
             "alice is scoped"
         );
 
@@ -19814,7 +19857,7 @@ mod tests {
         alice
             .authorize_live_session_binding(
                 Method::SessionNew,
-                grants,
+                grants.as_ref(),
                 &alice.ctx.config.read(),
                 "test-agent",
                 &canonical_inside.to_string_lossy(),
@@ -19824,7 +19867,7 @@ mod tests {
         let held_alias = alice
             .authorize_live_session_binding(
                 Method::SessionNew,
-                grants,
+                grants.as_ref(),
                 &alice.ctx.config.read(),
                 "test-agent",
                 &link.to_string_lossy(),
@@ -19833,7 +19876,7 @@ mod tests {
         let held_outside = alice
             .authorize_live_session_binding(
                 Method::SessionNew,
-                grants,
+                grants.as_ref(),
                 &alice.ctx.config.read(),
                 "test-agent",
                 &outside.path().canonicalize().unwrap().to_string_lossy(),
@@ -21154,7 +21197,7 @@ mod tests {
                 );
                 let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
                 if change == "expiry" {
-                    alice.auth.as_mut().unwrap().principal.expires_at = Some(
+                    alice.auth.write().as_mut().unwrap().principal.expires_at = Some(
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
@@ -22248,8 +22291,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            local.auth.as_ref().unwrap().principal.id,
-            remote.auth.as_ref().unwrap().principal.id
+            local.bound_auth().as_ref().unwrap().principal.id,
+            remote.bound_auth().as_ref().unwrap().principal.id
         );
 
         // A held Agent represents the execution lock of an in-flight turn.
@@ -31148,8 +31191,7 @@ mod tests {
             method: Method::SessionPrompt,
             target_agent: None,
             principal: dispatcher
-                .auth
-                .as_ref()
+                .bound_auth()
                 .expect("binding")
                 .principal
                 .id
@@ -31201,8 +31243,7 @@ mod tests {
             let config_revision = dispatcher.ctx.config.revision();
             let generation = dispatcher.ctx.auth.generation();
             let principal = dispatcher
-                .auth
-                .as_ref()
+                .bound_auth()
                 .expect("binding")
                 .principal
                 .id
@@ -32029,7 +32070,7 @@ mod tests {
 
         assert!(sessions.remove(current).await);
         dispatcher
-            .rehydrate_reaped_session(current, dispatcher.stamped_grants())
+            .rehydrate_reaped_session(current, dispatcher.stamped_grants().as_ref())
             .await
             .expect("an operator's rehydration is never refused")
             .expect("real RPC rehydration should rebuild the ACP agent");
@@ -32188,7 +32229,7 @@ mod tests {
 
         assert!(sessions.remove("alice-acp").await);
         let rehydrated = alice
-            .rehydrate_reaped_session("alice-acp", alice.stamped_grants())
+            .rehydrate_reaped_session("alice-acp", alice.stamped_grants().as_ref())
             .await
             .expect("alice may rehydrate her own session")
             .expect("the reaped session rehydrates");
@@ -40478,5 +40519,38 @@ mod tests {
             assert_eq!(sessions.list_ids().await, vec![session]);
             assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn native_spawned_authority_uses_current_credential_and_pins_its_principal() {
+        let (mut dispatcher, _) = make_acp_test_dispatcher(Default::default());
+        dispatcher.set_authenticated_for_test();
+        let handle = dispatcher.spawn_handle();
+        dispatcher.expire_credential_for_test();
+        assert!(
+            handle
+                .recheck_authority_after_admission(Method::SessionPrompt)
+                .is_err()
+        );
+        dispatcher.set_authenticated_for_test();
+        assert!(
+            handle
+                .recheck_authority_after_admission(Method::SessionPrompt)
+                .is_ok()
+        );
+        let admission = PromptAdmission {
+            dispatcher: handle,
+            admitted: None,
+            agent_alias: "test-agent".into(),
+            workspace: None,
+            has_environment: false,
+        };
+        let lease = admission.dispatcher.ctx.auth.hold_authority();
+        let foreign = zeroclaw_api::principal::PrincipalId("different-principal".into());
+        assert!(
+            admission
+                .check_for_principal_under(&lease, Method::SessionPrompt, Some(&foreign))
+                .is_err()
+        );
     }
 }

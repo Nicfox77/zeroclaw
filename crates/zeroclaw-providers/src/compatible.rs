@@ -18135,7 +18135,8 @@ mod tests {
                 target: "data:image/png;base64,QUJD".into(),
             }]),
         ];
-        let provider = make_model_provider("test", "https://example.com", None);
+        let mut provider = make_model_provider("test", "https://example.com", None);
+        provider.tool_result_image_policy = ToolResultImagePolicy::ImageUrl;
         let converted = provider.convert_messages_for_native(&input, true);
         let value =
             serde_json::to_value(converted[0].content.as_ref().expect("tool content")).unwrap();

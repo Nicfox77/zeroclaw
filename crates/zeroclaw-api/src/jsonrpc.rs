@@ -354,6 +354,11 @@ impl RpcOutbound {
         self.writer_tx.closed().await;
     }
 
+    /// Whether the canonical writer queue has closed.
+    pub fn is_closed(&self) -> bool {
+        self.writer_tx.is_closed()
+    }
+
     /// Send a JSON-RPC notification (no `id`, no response expected).
     pub async fn notify(&self, method: &'static str, params: Value) {
         let n = JsonRpcNotification::new(method, params);
@@ -416,7 +421,7 @@ impl RpcOutbound {
             return Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
                 message: "Writer task closed".to_string(),
-                data: None,
+                data: Some(serde_json::json!({"reason":"transport_closed"})),
             });
         }
         tokio::select! {
@@ -433,7 +438,7 @@ impl RpcOutbound {
                 rx.try_recv().unwrap_or_else(|_| Err(JsonRpcError {
                     code: error_codes::INTERNAL_ERROR,
                     message: "Writer task closed".to_string(),
-                    data: None,
+                    data: Some(serde_json::json!({"reason":"transport_closed"})),
                 }))
             }
         }
@@ -682,6 +687,8 @@ mod tests {
             .expect_err("closed writer is a transport failure");
         assert_eq!(error.code, error_codes::INTERNAL_ERROR);
         assert_eq!(error.message, "Writer task closed");
+        assert_eq!(error.data.unwrap()["reason"], "transport_closed");
+        assert!(rpc.is_closed());
         assert_eq!(rpc.pending_count(), 0);
         assert!(
             !rpc.dispatch_validated_response(

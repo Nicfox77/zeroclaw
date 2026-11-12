@@ -182,11 +182,7 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
         let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
             return false;
         };
-        let messages: Vec<_> = agent
-            .history()
-            .iter()
-            .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
-            .collect();
+        let messages = agent.history().to_vec();
         let live = match zeroclaw_api::session_events::canonical_json(&messages) {
             Ok(live) => live,
             Err(_) => return false,
