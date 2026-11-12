@@ -20545,6 +20545,7 @@ Let me check the result."#;
                     &provider,
                     "ollama.default",
                     "mock-model",
+                    None,
                     &NoopObserver,
                     &zeroclaw_config::schema::MultimodalConfig::default(),
                     &zeroclaw_config::schema::PacingConfig::default(),

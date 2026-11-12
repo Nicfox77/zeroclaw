@@ -6651,6 +6651,8 @@ mod tests {
         );
 
         let result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "tc-replay".into(),
             content: " M acp_server.rs".into(),
             tool_name: "shell".into(),
@@ -7682,7 +7684,8 @@ mod tests {
                 attachments: vec![reference.clone()],
             }]),
         ] {
-            let notifications = history_notifications_for_message("session", &message);
+            let notifications =
+                history_notifications_for_message("session", &message, &mut HashMap::new());
             let serialized = serde_json::to_value(&notifications).unwrap();
             let encoded = serialized.to_string();
             assert!(encoded.contains("literal [IMAGE:/example]"));

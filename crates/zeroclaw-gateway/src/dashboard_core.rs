@@ -1848,7 +1848,6 @@ mod tests {
         AliasedAgentConfig, Config, OidcConfig, OidcValidation, PermissionProfileConfig,
         RiskProfileConfig, RuntimeProfileConfig, WireApi,
     };
-    use zeroclaw_infra::session_backend::SessionBackend as _;
     use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
     use zeroclaw_runtime::rpc::context::RpcContext;
     use zeroclaw_runtime::rpc::inproc::InprocConnector;
@@ -2215,10 +2214,12 @@ mod tests {
             ctx.tui_registry = Arc::new(zeroclaw_runtime::rpc::tui_identity::TuiRegistry::new(
                 &key_dir,
             ));
-            ctx.session_backend = Some(Arc::new(
-                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
-                    .expect("sqlite session backend"),
+            ctx.session_repository = Some(Arc::new(
+                zeroclaw_session_host::open_repository(config).expect("native session repository"),
             ));
+            ctx.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                ctx.config.clone(),
+            )));
             let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
             hooks.register(Box::new(GatedHooks {
                 start: Arc::clone(gates.0),
@@ -2767,9 +2768,15 @@ mod tests {
         .await
         .expect("the conversation is closed");
         let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
-        let transcript = durable.load(&format!("rpc_{core_id}"));
+            zeroclaw_infra::session_repository::SessionRepository::new(&fixture.config.data_dir)
+                .expect("native session repository");
+        let transcript = zeroclaw_providers::durable_chat_messages(
+            &durable
+                .load_session(core_id)
+                .unwrap()
+                .expect("retained session")
+                .messages,
+        );
         assert!(
             transcript
                 .iter()
@@ -2801,11 +2808,12 @@ mod tests {
         // The core ran the chat as alice: on disk, where it outlives every
         // connection, the conversation is hers.
         let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
+            zeroclaw_infra::session_repository::SessionRepository::new(&fixture.config.data_dir)
+                .expect("native session repository");
         assert_eq!(
             durable
-                .get_session_metadata(&format!("rpc_{core_id}"))
+                .load_session(&core_id)
+                .expect("native session metadata")
                 .and_then(|metadata| metadata.principal_id)
                 .as_deref(),
             Some(alice_session.principal().id.as_str()),
@@ -3684,9 +3692,15 @@ mod tests {
             "{frames:?}"
         );
         let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
-        let transcript = durable.load(&format!("rpc_{core_id}"));
+            zeroclaw_infra::session_repository::SessionRepository::new(&fixture.config.data_dir)
+                .expect("native session repository");
+        let transcript = zeroclaw_providers::durable_chat_messages(
+            &durable
+                .load_session(&core_id)
+                .unwrap()
+                .expect("retained session")
+                .messages,
+        );
         assert!(
             !transcript
                 .iter()
@@ -3719,9 +3733,15 @@ mod tests {
         );
         assert_closed_not_deleted(&fixture, &core_id).await;
         let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
-        let transcript = durable.load(&format!("rpc_{core_id}"));
+            zeroclaw_infra::session_repository::SessionRepository::new(&fixture.config.data_dir)
+                .expect("native session repository");
+        let transcript = zeroclaw_providers::durable_chat_messages(
+            &durable
+                .load_session(&core_id)
+                .unwrap()
+                .expect("retained session")
+                .messages,
+        );
         assert!(
             !transcript
                 .iter()

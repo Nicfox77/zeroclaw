@@ -558,6 +558,7 @@ mod tests {
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             self.temperatures.lock().unwrap().push(temperature);
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("Nothing to save.".into()),
                 tool_calls: Vec::new(),
                 usage: None,

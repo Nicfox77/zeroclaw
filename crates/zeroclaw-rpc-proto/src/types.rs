@@ -2433,4 +2433,50 @@ mod tests {
         let wire = serde_json::to_value(params).unwrap();
         assert!(wire.get("cursor").is_none());
     }
+
+    #[test]
+    fn native_session_fields_survive_the_extracted_wire_contract() {
+        let wire = json!({
+            "session_id": "main-session-fixture",
+            "created_at": "2026-11-12T00:00:00Z",
+            "last_activity": "2026-11-12T00:00:00Z",
+            "message_count": 2,
+            "title": "Retained conversation",
+            "creation_source": "gateway"
+        });
+        let entry: SessionEntry = serde_json::from_value(wire.clone()).unwrap();
+        let encoded = serde_json::to_value(entry).unwrap();
+        assert_eq!(encoded["title"], wire["title"]);
+        assert_eq!(encoded["creation_source"], wire["creation_source"]);
+        let rename: SessionRenameParams = serde_json::from_value(json!({
+            "session_id": "main-session-fixture", "title": "New title"
+        }))
+        .unwrap();
+        assert_eq!(rename.title, "New title");
+        let deletion: SessionDeleteResult = serde_json::from_value(json!({
+            "session_id": "main-session-fixture", "deleted": true,
+            "history_retained": true
+        }))
+        .unwrap();
+        assert!(deletion.history_retained);
+    }
+
+    #[test]
+    fn native_message_identity_round_trips_and_legacy_rows_still_decode() {
+        let wire = json!({
+            "role": "assistant", "content": "Retained response",
+            "message_id": "message-fixture", "file_ids": ["file-fixture"]
+        });
+        let row: MessageEntry = serde_json::from_value(wire.clone()).unwrap();
+        let encoded = serde_json::to_value(row).unwrap();
+        assert_eq!(encoded["message_id"], wire["message_id"]);
+        assert_eq!(encoded["file_ids"], wire["file_ids"]);
+        let legacy: MessageEntry = serde_json::from_value(json!({
+            "role": "user", "content": "Older response"
+        }))
+        .unwrap();
+        assert!(legacy.message_id.is_none());
+        assert!(legacy.file_ids.is_empty());
+        assert!(legacy.unavailable_parts.is_empty());
+    }
 }
