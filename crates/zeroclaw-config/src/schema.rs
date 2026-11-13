@@ -10573,7 +10573,7 @@ impl OpenAIImageProviderConfig {
     ) -> Result<&serde_json::Map<String, serde_json::Value>> {
         let object = value
             .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Image extra_body must be a JSON object"))?;
+            .ok_or_else(|| anyhow::Error::msg("Image extra_body must be a JSON object"))?;
         for key in [
             "model",
             "prompt",
@@ -10632,7 +10632,7 @@ impl Config {
             return Ok(None);
         };
         let profile = reference.strip_prefix("openai.").and_then(|alias| self.providers.image_gen.openai.get(alias))
-            .ok_or_else(|| anyhow::anyhow!("image_gen.provider must reference a configured providers.image_gen.openai alias"))?;
+            .ok_or_else(|| anyhow::Error::msg("image_gen.provider must reference a configured providers.image_gen.openai alias"))?;
         profile.validate()?;
         Ok(Some(profile))
     }

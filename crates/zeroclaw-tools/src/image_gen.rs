@@ -60,11 +60,13 @@ async fn read_openai_image_body(response: reqwest::Response) -> anyhow::Result<V
         .get("data")
         .and_then(serde_json::Value::as_array)
         .filter(|images| images.len() == 1)
-        .ok_or_else(|| anyhow::anyhow!(get_required_tool_string("image-gen-error-single-image")))?;
+        .ok_or_else(|| {
+            anyhow::Error::msg(get_required_tool_string("image-gen-error-single-image"))
+        })?;
     let encoded = images[0]
         .get("b64_json")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!(get_required_tool_string("image-gen-error-base64")))?;
+        .ok_or_else(|| anyhow::Error::msg(get_required_tool_string("image-gen-error-base64")))?;
     anyhow::ensure!(
         encoded.len() <= GENERATED_IMAGE_LIMIT_BYTES.div_ceil(3) * 4,
         get_required_tool_string("image-gen-error-json-limit")
@@ -360,7 +362,7 @@ impl ImageGenTool {
         extra_body: Option<&serde_json::Value>,
     ) -> anyhow::Result<Vec<u8>> {
         let size = openai_image_size(size)
-            .ok_or_else(|| anyhow::anyhow!(get_required_tool_string("image-gen-error-size")))?;
+            .ok_or_else(|| anyhow::Error::msg(get_required_tool_string("image-gen-error-size")))?;
         let mut body = backend.extra_body.clone();
         if let Some(extra) = extra_body {
             body.extend(
