@@ -1,6 +1,8 @@
 use crate::helpers::{domain_guard, response_body};
+use crate::i18n::{get_required_tool_string, get_required_tool_string_with_args};
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine;
 use reqwest::header::LOCATION;
 use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
@@ -10,11 +12,76 @@ use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_config::schema::OpenAIImageProviderConfig;
 
 const FAL_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const FAL_ERROR_LIMIT_BYTES: usize = 16 * 1024;
 const GENERATED_IMAGE_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_IMAGE_REDIRECTS: usize = 10;
+const OPENAI_RESPONSE_LIMIT_BYTES: usize = GENERATED_IMAGE_LIMIT_BYTES.div_ceil(3) * 4 + 64 * 1024;
+
+struct OpenAIImageBackend {
+    endpoint: reqwest::Url,
+    extra_body: serde_json::Map<String, serde_json::Value>,
+}
+
+fn openai_image_size(size: &str) -> Option<String> {
+    let size = match size {
+        "square_hd" => "1024x1024",
+        "landscape_4_3" => "1024x768",
+        "portrait_4_3" => "768x1024",
+        "landscape_16_9" => "1024x576",
+        "portrait_16_9" => "576x1024",
+        "auto" => return Some("auto".into()),
+        value => value,
+    };
+    let (width, height) = size.split_once('x')?;
+    if !width.bytes().all(|c| c.is_ascii_digit()) || !height.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (width, height) = (width.parse::<u32>().ok()?, height.parse::<u32>().ok()?);
+    (width > 0 && height > 0).then(|| format!("{width}x{height}"))
+}
+
+async fn read_openai_image_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    let payload = response_body::read_bounded(response, Some(OPENAI_RESPONSE_LIMIT_BYTES))
+        .await
+        .context(get_required_tool_string(
+            "image-gen-error-endpoint-response",
+        ))?;
+    anyhow::ensure!(
+        !payload.overflowed,
+        get_required_tool_string("image-gen-error-json-limit")
+    );
+    let value: serde_json::Value = serde_json::from_slice(&payload.bytes).context(
+        get_required_tool_string("image-gen-error-endpoint-response"),
+    )?;
+    let images = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .filter(|images| images.len() == 1)
+        .ok_or_else(|| anyhow::anyhow!(get_required_tool_string("image-gen-error-single-image")))?;
+    let encoded = images[0]
+        .get("b64_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!(get_required_tool_string("image-gen-error-base64")))?;
+    anyhow::ensure!(
+        encoded.len() <= GENERATED_IMAGE_LIMIT_BYTES.div_ceil(3) * 4,
+        get_required_tool_string("image-gen-error-json-limit")
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context(get_required_tool_string("image-gen-error-base64"))?;
+    anyhow::ensure!(
+        bytes.len() <= GENERATED_IMAGE_LIMIT_BYTES,
+        get_required_tool_string("image-gen-error-json-limit")
+    );
+    anyhow::ensure!(
+        bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        get_required_tool_string("image-gen-error-endpoint-png")
+    );
+    Ok(bytes)
+}
 
 struct ValidatedImageTarget {
     url: reqwest::Url,
@@ -195,6 +262,8 @@ pub struct ImageGenTool {
     workspace_dir: PathBuf,
     default_model: String,
     api_key_env: String,
+    openai: Option<OpenAIImageBackend>,
+    api_key_file: Option<PathBuf>,
     persistent_writes: bool,
     nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
 }
@@ -233,12 +302,98 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
+            openai: None,
+            api_key_file: None,
             persistent_writes,
             nat64_prefixes: domain_guard::parse_nat64_prefixes(
                 &nat64_prefixes,
                 "security.nat64_prefixes",
             )?,
         })
+    }
+
+    /// Materialize the selected operator-owned provider profile. Neither the URI
+    /// nor the credential source is accepted from model/tool arguments.
+    pub fn with_openai_profile(
+        mut self,
+        profile: &OpenAIImageProviderConfig,
+    ) -> anyhow::Result<Self> {
+        profile.validate()?;
+        let extra_body = profile
+            .extra_body
+            .as_ref()
+            .map(OpenAIImageProviderConfig::validate_extra_body)
+            .transpose()?
+            .cloned()
+            .unwrap_or_default();
+        self.openai = Some(OpenAIImageBackend {
+            endpoint: profile.generation_url()?,
+            extra_body,
+        });
+        self.default_model = profile.model.clone();
+        self.api_key_env = profile.api_key_env.clone();
+        self.api_key_file = profile.api_key_file.clone();
+        Ok(self)
+    }
+
+    async fn configured_api_key(&self) -> Result<String, String> {
+        let Some(path) = &self.api_key_file else {
+            return Self::read_api_key(&self.api_key_env);
+        };
+        let key = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|_| get_required_tool_string("image-gen-error-key-read"))?;
+        let key = key.trim();
+        if key.is_empty() || key.len() > 16384 || key.chars().any(char::is_control) {
+            return Err(get_required_tool_string("image-gen-error-key-invalid"));
+        }
+        Ok(key.to_owned())
+    }
+
+    async fn generate_openai(
+        &self,
+        backend: &OpenAIImageBackend,
+        api_key: &str,
+        model: &str,
+        prompt: &str,
+        size: &str,
+        extra_body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let size = openai_image_size(size)
+            .ok_or_else(|| anyhow::anyhow!(get_required_tool_string("image-gen-error-size")))?;
+        let mut body = backend.extra_body.clone();
+        if let Some(extra) = extra_body {
+            body.extend(
+                OpenAIImageProviderConfig::validate_extra_body(extra)
+                    .context(get_required_tool_string("image-gen-error-extras"))?
+                    .clone(),
+            );
+        }
+        body.extend(serde_json::from_value::<
+            serde_json::Map<String, serde_json::Value>,
+        >(
+            json!({"model":model,"prompt":prompt,"size":size,"n":1})
+        )?);
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()?
+            .post(backend.endpoint.clone())
+            .bearer_auth(api_key)
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context(get_required_tool_string("image-gen-error-endpoint-request"))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            get_required_tool_string_with_args(
+                "image-gen-error-endpoint-status",
+                &[("status", &response.status().to_string())]
+            )
+        );
+        read_openai_image_body(response).await
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -339,7 +494,7 @@ impl ImageGenTool {
             "landscape_16_9",
             "portrait_16_9",
         ];
-        if !VALID_SIZES.contains(&size) {
+        if self.openai.is_none() && !VALID_SIZES.contains(&size) {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -359,11 +514,12 @@ impl ImageGenTool {
         // Validate model identifier: must look like a fal.ai model path
         // (e.g. "fal-ai/flux/schnell"). Reject values with "..", query
         // strings, or fragments that could redirect the HTTP request.
-        if model.contains("..")
-            || model.contains('?')
-            || model.contains('#')
-            || model.contains('\\')
-            || model.starts_with('/')
+        if self.openai.is_none()
+            && (model.contains("..")
+                || model.contains('?')
+                || model.contains('#')
+                || model.contains('\\')
+                || model.starts_with('/'))
         {
             return Ok(ToolResult {
                 success: false,
@@ -376,7 +532,7 @@ impl ImageGenTool {
         }
 
         // ── Read API key ───────────────────────────────────────────
-        let api_key = match Self::read_api_key(&self.api_key_env) {
+        let api_key = match self.configured_api_key().await {
             Ok(k) => k,
             Err(msg) => {
                 return Ok(ToolResult {
@@ -387,61 +543,73 @@ impl ImageGenTool {
             }
         };
 
-        // ── Call fal.ai ────────────────────────────────────────────
-        let client = Self::http_client()?;
-        let url = format!("https://fal.run/{model}");
+        let bytes = if let Some(backend) = &self.openai {
+            self.generate_openai(
+                backend,
+                &api_key,
+                model,
+                &prompt,
+                size,
+                args.get("extra_body"),
+            )
+            .await?
+        } else {
+            // ── Call fal.ai ────────────────────────────────────────────
+            let client = Self::http_client()?;
+            let url = format!("https://fal.run/{model}");
 
-        let body = json!({
-            "prompt": prompt,
-            "image_size": size,
-            "num_images": 1
-        });
-
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Key {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("fal.ai request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = read_fal_error_text(resp).await.unwrap_or_default();
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("fal.ai API error ({status}): {body_text}")),
+            let body = json!({
+                "prompt": prompt,
+                "image_size": size,
+                "num_images": 1
             });
-        }
 
-        let fal_body = read_fal_success_body(resp).await?;
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&fal_body).context("Failed to parse fal.ai response as JSON")?;
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Key {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .context("fal.ai request failed")?;
 
-        let image_url = resp_json
-            .pointer("/images/0/url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "image_gen: fal.ai response missing image URL"
-                );
-                anyhow::Error::msg("No image URL in fal.ai response")
-            })?;
-
-        // ── Download image ─────────────────────────────────────────
-        let bytes = match Self::download_generated_image(image_url, &self.nat64_prefixes).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = read_fal_error_text(resp).await.unwrap_or_default();
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(error.to_string()),
+                    error: Some(format!("fal.ai API error ({status}): {body_text}")),
                 });
+            }
+
+            let fal_body = read_fal_success_body(resp).await?;
+            let resp_json: serde_json::Value = serde_json::from_slice(&fal_body)
+                .context("Failed to parse fal.ai response as JSON")?;
+
+            let image_url = resp_json
+                .pointer("/images/0/url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "image_gen: fal.ai response missing image URL"
+                    );
+                    anyhow::Error::msg("No image URL in fal.ai response")
+                })?;
+
+            // ── Download image ─────────────────────────────────────────
+            match Self::download_generated_image(image_url, &self.nat64_prefixes).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error.to_string()),
+                    });
+                }
             }
         };
 
@@ -483,12 +651,12 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate an image from a text prompt using fal.ai (Flux models). \
+        "Generate an image from a text prompt using the configured image model. \
          Saves the result to the workspace images directory and returns the file path."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "required": ["prompt"],
             "properties": {
@@ -507,10 +675,15 @@ impl Tool for ImageGenTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "fal.ai model identifier (default: 'fal-ai/flux/schnell')."
+                    "description": get_required_tool_string("image-gen-model-description")
                 }
             }
-        })
+        });
+        if self.openai.is_some() {
+            schema["properties"]["size"] = json!({"type":"string", "description":get_required_tool_string("image-gen-size-description")});
+            schema["properties"]["extra_body"] = json!({"type":"object", "description":get_required_tool_string("image-gen-extras-description")});
+        }
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -547,6 +720,215 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
+
+    fn openai_profile(uri: &str, key_file: Option<PathBuf>) -> OpenAIImageProviderConfig {
+        OpenAIImageProviderConfig {
+            uri: uri.into(),
+            model: "example/image-model".into(),
+            api_key_file: key_file,
+            ..Default::default()
+        }
+    }
+    fn png_fixture() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a0qkAAAAASUVORK5CYII=").unwrap()
+    }
+    #[test]
+    fn openai_image_provider_rejects_unsafe_transport_and_embedded_credentials() {
+        for uri in [
+            "http://example.invalid/v1",
+            "ftp://127.0.0.1/v1",
+            "https://user:password@example.invalid/v1",
+            "https://example.invalid/v1?key=value",
+            "https://example.invalid/v1#fragment",
+            " http://127.0.0.1/v1",
+        ] {
+            assert!(
+                test_tool()
+                    .with_openai_profile(&openai_profile(uri, None))
+                    .is_err(),
+                "{uri}"
+            );
+        }
+        for uri in [
+            "http://127.0.0.1:1234/v1",
+            "http://[::1]:1234/v1",
+            "https://example.invalid/prefix/v1/",
+        ] {
+            let tool = test_tool()
+                .with_openai_profile(&openai_profile(uri, None))
+                .unwrap();
+            assert!(
+                tool.openai
+                    .as_ref()
+                    .unwrap()
+                    .endpoint
+                    .path()
+                    .ends_with("/v1/images/generations")
+            );
+        }
+        assert!(
+            test_tool()
+                .with_openai_profile(&openai_profile(
+                    "http://127.0.0.1/v1",
+                    Some("relative.key".into())
+                ))
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn openai_image_provider_generates_attachment_rereads_key_and_merges_extras() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_json, header, method, path},
+        };
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let key_file = workspace.path().join("api.key");
+        let mut profile = openai_profile(&format!("{}/v1", server.uri()), Some(key_file.clone()));
+        profile.extra_body = Some(json!({"seed":7,"steps":4}));
+        let mut tool = test_tool();
+        tool.workspace_dir = workspace.path().into();
+        let tool = tool.with_openai_profile(&profile).unwrap();
+        let bytes = png_fixture();
+        for (index, key) in ["fixture-key-one", "fixture-key-two"].iter().enumerate() {
+            tokio::fs::write(&key_file, format!("{key}\n"))
+                .await
+                .unwrap();
+            Mock::given(method("POST")).and(path("/v1/images/generations"))
+                .and(header("authorization", format!("Bearer {key}")))
+                .and(body_json(json!({"model":"example/image-model", "prompt":"A blue circle", "n":1,
+                    "size":"768x1024", "seed":index, "steps":4, "negative_prompt":"text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode(&bytes)}]})))
+                .expect(1).mount(&server).await;
+            let result = tool.execute(json!({"prompt":"A blue circle", "size":"768x1024", "filename":format!("fixture-{index}"),
+                "extra_body":{"seed":index,"negative_prompt":"text"}})).await.unwrap();
+            assert!(result.success);
+            assert_eq!(result.output.attachments().len(), 1);
+            let file = workspace.path().join(format!("images/fixture-{index}.png"));
+            assert_eq!(tokio::fs::read(&file).await.unwrap(), bytes);
+            assert_eq!(
+                result.output.attachments()[0].target,
+                file.display().to_string()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn openai_image_provider_rejects_redirects_error_bodies_and_malformed_results() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let workspace = tempfile::tempdir().unwrap();
+        let key = workspace.path().join("api.key");
+        tokio::fs::write(&key, "fixture-private-key").await.unwrap();
+        let valid =
+            json!({"b64_json":base64::engine::general_purpose::STANDARD.encode(png_fixture())});
+        for (status, body) in [(302, "redirect".into()), (401, "fixture-private-key".into()),
+            (200, "not JSON".into()), (200, json!({"data":[]}).to_string()),
+            (200, json!({"data":[{"url":"http://127.0.0.1:1/must-not-fetch"}]}).to_string()),
+            (200, json!({"data":[{"b64_json":"not-base64!"}]}).to_string()),
+            (200, json!({"data":[valid.clone(),valid]}).to_string()),
+            (200, json!({"data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode("not PNG")}]}).to_string())] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(status)
+                .insert_header("Location", "http://127.0.0.1:1/must-not-follow").set_body_string(body))
+                .expect(1).mount(&server).await;
+            let mut tool = test_tool(); tool.workspace_dir = workspace.path().into();
+            let tool = tool.with_openai_profile(&openai_profile(&server.uri(), Some(key.clone()))).unwrap();
+            let error = tool.execute(json!({"prompt":"A blue circle"})).await.unwrap_err();
+            assert!(!error.to_string().contains("fixture-private-key"));
+            assert!(!workspace.path().join("images").exists());
+        }
+    }
+    #[tokio::test]
+    async fn openai_image_provider_rejects_reserved_extras_before_request() {
+        use wiremock::MockServer;
+        let workspace = tempfile::tempdir().unwrap();
+        let key = workspace.path().join("api.key");
+        tokio::fs::write(&key, "fixture-key").await.unwrap();
+        let server = MockServer::start().await;
+        let profile = openai_profile(&server.uri(), Some(key));
+        let tool = test_tool().with_openai_profile(&profile).unwrap();
+        for extra in [
+            json!({"model":"other"}),
+            json!({"n":2}),
+            json!({"stream":true}),
+            json!({"size":"512x512"}),
+            json!({"api_key":"other"}),
+            json!({"response_format":"url"}),
+            json!({"output_format":"jpeg"}),
+            json!("invalid"),
+        ] {
+            assert!(
+                tool.execute(json!({"prompt":"A circle","extra_body":extra}))
+                    .await
+                    .is_err()
+            );
+            let mut invalid = profile.clone();
+            invalid.extra_body = Some(extra);
+            assert!(test_tool().with_openai_profile(&invalid).is_err());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn openai_image_key_file_failure_does_not_fall_back_to_environment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let key = workspace.path().join("missing.key");
+        let tool = test_tool()
+            .with_openai_profile(&openai_profile("http://127.0.0.1:1/v1", Some(key.clone())))
+            .unwrap();
+        assert!(
+            tool.configured_api_key()
+                .await
+                .unwrap_err()
+                .contains("read")
+        );
+        tokio::fs::write(&key, "\n").await.unwrap();
+        assert!(
+            tool.configured_api_key()
+                .await
+                .unwrap_err()
+                .contains("empty")
+        );
+    }
+    #[test]
+    fn openai_image_sizes_preserve_rectangles_and_validate_dimensions() {
+        assert_eq!(openai_image_size("512x512").as_deref(), Some("512x512"));
+        assert_eq!(openai_image_size("1280x720").as_deref(), Some("1280x720"));
+        assert_eq!(
+            openai_image_size("landscape_16_9").as_deref(),
+            Some("1024x576")
+        );
+        assert_eq!(openai_image_size("auto").as_deref(), Some("auto"));
+        for invalid in [
+            "0x512",
+            "512x0",
+            "-1x512",
+            "+1x512",
+            "512X512",
+            "512x512x2",
+            "invalid",
+            "4294967296x1",
+        ] {
+            assert!(openai_image_size(invalid).is_none());
+        }
+    }
+    #[tokio::test]
+    async fn openai_image_response_is_bounded_without_waiting_for_eof() {
+        let (response, release, server) =
+            held_open_chunked_response(OPENAI_RESPONSE_LIMIT_BYTES + 1).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_openai_image_body(response),
+        )
+        .await;
+        finish_held_open_response(release, server).await;
+        assert!(
+            result
+                .expect("reader waited for EOF")
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+    }
 
     async fn held_open_chunked_response(
         byte_count: usize,

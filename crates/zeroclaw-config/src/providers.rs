@@ -832,11 +832,26 @@ mod tests {
     }
 }
 
+/// Provider profiles for the optional image-generation tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.image_gen"]
+pub struct ImageGenProviders {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub openai: HashMap<String, super::schema::OpenAIImageProviderConfig>,
+}
+
 /// Top-level wrapper for every configured provider category.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers"]
 pub struct Providers {
+    /// Image-generation profiles, separate from chat and speech.
+    #[serde(default)]
+    #[nested]
+    pub image_gen: ImageGenProviders,
+
     /// Model providers — `[providers.models.<type>.<alias>]`.
     #[serde(default)]
     #[nested]

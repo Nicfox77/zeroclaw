@@ -278,3 +278,20 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+# Configured image generation backend
+tool-image-gen = Generate an image from a text prompt using the configured image model. Saves the result to the workspace images directory and returns the file path.
+image-gen-model-description = Model identifier; omit to use the configured default image model.
+image-gen-size-description = Image size as WIDTHxHEIGHT (for example 512x512 or 1024x768), auto, or an existing aspect-ratio preset. The provider validates supported dimensions.
+image-gen-extras-description = Optional provider-specific generation parameters such as seed or steps. Cannot override model, prompt, size, image count, streaming, endpoint, or authentication.
+image-gen-error-size = Image size must be a preset, auto, or positive WIDTHxHEIGHT dimensions
+image-gen-error-extras = Invalid image generation extra_body parameters
+image-gen-error-key-read = Failed to read image generation API key file
+image-gen-error-key-invalid = Image generation API key file contains an empty or invalid key
+image-gen-error-endpoint-request = Image endpoint request failed
+image-gen-error-endpoint-png = Image endpoint did not return PNG image bytes
+image-gen-error-endpoint-status = Image endpoint returned HTTP { $status }
+image-gen-error-endpoint-response = Image endpoint did not return a valid image-generation JSON response
+image-gen-error-single-image = Image endpoint must return exactly one image in data
+image-gen-error-base64 = Image endpoint must return valid base64 image data in data[0].b64_json; URL responses are not supported
+image-gen-error-json-limit = Image response exceeds the 20 MiB decoded image size limit

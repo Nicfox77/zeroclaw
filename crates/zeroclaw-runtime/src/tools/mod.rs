@@ -3394,7 +3394,11 @@ fn all_tools_with_runtime_on_thread(
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
             root_config.security.nat64_prefixes.clone(),
-        ) {
+        )
+        .and_then(|tool| match root_config.resolve_image_gen_provider()? {
+            Some(profile) => tool.with_openai_profile(profile),
+            None => Ok(tool),
+        }) {
             Ok(tool) => tool_arcs.push(Arc::new(tool)),
             Err(e) => {
                 ::zeroclaw_log::record!(

@@ -10453,8 +10453,8 @@ impl Default for ImageProviderFluxConfig {
 /// Standalone image generation tool configuration (`[image_gen]`).
 ///
 /// When enabled, registers an `image_gen` tool that generates images via
-/// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
-/// to the workspace `images/` directory.
+/// fal.ai or a named OpenAI-compatible image provider and saves them to the
+/// workspace `images/` directory.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "image_gen"]
@@ -10471,6 +10471,10 @@ pub struct ImageGenConfig {
     #[serde(default = "default_image_gen_api_key_env")]
     #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
+
+    /// Optional named image provider (`openai.<alias>`). Unset retains fal.ai.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 fn default_image_gen_model() -> String {
@@ -10487,7 +10491,195 @@ impl Default for ImageGenConfig {
             enabled: false,
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
+            provider: None,
         }
+    }
+}
+
+/// OpenAI-compatible Images API profile, scoped separately from chat providers.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.image_gen.openai"]
+pub struct OpenAIImageProviderConfig {
+    /// API base URI; `/images/generations` is appended. HTTPS or literal-loopback HTTP.
+    #[serde(default = "default_image_openai_uri")]
+    pub uri: String,
+    /// Image model identifier. Required when this provider is selected.
+    #[serde(default)]
+    pub model: String,
+    /// Environment variable containing the Bearer token when no key file is used.
+    #[serde(default = "default_image_openai_key_env")]
+    #[credential_class = "legacy_env_path"]
+    pub api_key_env: String,
+    /// Absolute path to a key file, read per call; takes precedence over the environment.
+    #[serde(default)]
+    #[credential_class = "path_only_reference"]
+    pub api_key_file: Option<PathBuf>,
+    /// Optional provider-specific JSON request defaults. Core request fields cannot be overridden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Value>,
+}
+fn default_image_openai_uri() -> String {
+    "https://api.openai.com/v1".into()
+}
+fn default_image_openai_key_env() -> String {
+    "OPENAI_API_KEY".into()
+}
+impl Default for OpenAIImageProviderConfig {
+    fn default() -> Self {
+        Self {
+            uri: default_image_openai_uri(),
+            model: String::new(),
+            api_key_env: default_image_openai_key_env(),
+            api_key_file: None,
+            extra_body: None,
+        }
+    }
+}
+impl OpenAIImageProviderConfig {
+    pub fn generation_url(&self) -> Result<url::Url> {
+        anyhow::ensure!(
+            !self.uri.chars().any(char::is_whitespace),
+            "Image provider URI must not contain whitespace"
+        );
+        let base = url::Url::parse(&self.uri)?;
+        let loopback = base
+            .host_str()
+            .and_then(|host| {
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback());
+        anyhow::ensure!(
+            base.host_str().is_some()
+                && (base.scheme() == "https" || (base.scheme() == "http" && loopback)),
+            "Image provider URI requires HTTPS or literal-loopback HTTP"
+        );
+        anyhow::ensure!(
+            base.username().is_empty()
+                && base.password().is_none()
+                && base.query().is_none()
+                && base.fragment().is_none(),
+            "Image provider URI must not contain credentials, query parameters or a fragment"
+        );
+        Ok(url::Url::parse(&format!(
+            "{}/images/generations",
+            base.as_str().trim_end_matches('/')
+        ))?)
+    }
+    pub fn validate_extra_body(
+        value: &serde_json::Value,
+    ) -> Result<&serde_json::Map<String, serde_json::Value>> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Image extra_body must be a JSON object"))?;
+        for key in [
+            "model",
+            "prompt",
+            "size",
+            "n",
+            "stream",
+            "endpoint",
+            "base_url",
+            "uri",
+            "api_key",
+            "headers",
+            "authorization",
+        ] {
+            anyhow::ensure!(
+                !object.contains_key(key),
+                "Image extra_body must not override '{key}'"
+            );
+        }
+        for (key, expected) in [("response_format", "b64_json"), ("output_format", "png")] {
+            if let Some(value) = object.get(key) {
+                anyhow::ensure!(
+                    value.as_str() == Some(expected),
+                    "Image {key} must be '{expected}'"
+                );
+            }
+        }
+        Ok(object)
+    }
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.model.trim().is_empty(),
+            "Image provider model must not be empty"
+        );
+        self.generation_url()?;
+        if let Some(path) = &self.api_key_file {
+            anyhow::ensure!(
+                path.is_absolute(),
+                "Image API key file path must be absolute"
+            );
+        } else {
+            anyhow::ensure!(
+                !self.api_key_env.trim().is_empty(),
+                "Image API key environment variable must not be empty"
+            );
+        }
+        if let Some(extra) = &self.extra_body {
+            Self::validate_extra_body(extra)?;
+        }
+        Ok(())
+    }
+}
+impl Config {
+    /// Resolve a selected image profile from the canonical provider map.
+    pub fn resolve_image_gen_provider(&self) -> Result<Option<&OpenAIImageProviderConfig>> {
+        let Some(reference) = &self.image_gen.provider else {
+            return Ok(None);
+        };
+        let profile = reference.strip_prefix("openai.").and_then(|alias| self.providers.image_gen.openai.get(alias))
+            .ok_or_else(|| anyhow::anyhow!("image_gen.provider must reference a configured providers.image_gen.openai alias"))?;
+        profile.validate()?;
+        Ok(Some(profile))
+    }
+}
+#[cfg(test)]
+mod image_gen_config_tests {
+    use super::*;
+    #[test]
+    fn openai_image_generation_settings_round_trip_and_preserve_defaults() {
+        let defaults: ImageGenConfig = toml::from_str("").unwrap();
+        assert!(!defaults.enabled);
+        assert!(defaults.provider.is_none());
+        assert_eq!(defaults.default_model, "fal-ai/flux/schnell");
+        let config: Config = toml::from_str(
+            r#"
+[image_gen]
+enabled = true
+provider = "openai.fixture"
+[providers.image_gen.openai.fixture]
+uri = "http://127.0.0.1:9000/v1"
+model = "example/image-model"
+api_key_file = "/run/secrets/image-api.key"
+extra_body = { seed = 42 }
+"#,
+        )
+        .unwrap();
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let profile = restored.resolve_image_gen_provider().unwrap().unwrap();
+        assert_eq!(profile.model, "example/image-model");
+        assert_eq!(
+            profile.generation_url().unwrap().as_str(),
+            "http://127.0.0.1:9000/v1/images/generations"
+        );
+        assert_eq!(profile.extra_body.as_ref().unwrap()["seed"], 42);
+        let mut invalid = config.clone();
+        invalid.image_gen.provider = Some("openai.missing".into());
+        assert!(invalid.resolve_image_gen_provider().is_err());
+        invalid.image_gen.provider = Some("openai.fixture".into());
+        invalid
+            .providers
+            .image_gen
+            .openai
+            .get_mut("fixture")
+            .unwrap()
+            .model
+            .clear();
+        assert!(invalid.resolve_image_gen_provider().is_err());
     }
 }
 
@@ -23348,6 +23540,7 @@ impl Config {
         let kind_slots: &[(&str, &[&str])] = &[
             ("models", crate::providers::ModelProviders::slot_names()),
             ("tts", crate::providers::TtsProviders::slot_names()),
+            ("image_gen", &["openai"]),
             (
                 "transcription",
                 crate::providers::TranscriptionProviders::slot_names(),
@@ -24637,6 +24830,9 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        if self.image_gen.enabled {
+            self.resolve_image_gen_provider()?;
+        }
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
 
@@ -50987,6 +51183,11 @@ allowed_users = []
     #[test]
     async fn credential_shaped_prop_fields_have_explicit_classification() {
         let mut config = Config::default();
+        config
+            .providers
+            .image_gen
+            .openai
+            .insert("default".into(), OpenAIImageProviderConfig::default());
         config.init_defaults(None);
         config
             .providers

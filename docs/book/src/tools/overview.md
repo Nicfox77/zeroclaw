@@ -248,6 +248,51 @@ If you need finer-grained gating under Full autonomy, put sensitive tools in the
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 
+## OpenAI-compatible image generation
+
+The optional `image_gen` tool uses its existing fal.ai configuration by default.
+To select an OpenAI-compatible Images API, reference a named image provider:
+
+```toml
+[image_gen]
+enabled = true
+provider = "openai.local"
+
+[providers.image_gen.openai.local]
+uri = "http://127.0.0.1:9000/v1"
+model = "example/image-model"
+api_key_file = "/run/secrets/image-api.key"
+
+# Optional provider-specific defaults, only when supported by this service:
+[providers.image_gen.openai.local.extra_body]
+seed = 42
+```
+
+Include `image_gen` in `[tools].optional`, or select `"*"`. Endpoint, image model,
+credentials, and optional request defaults belong to the image provider profile,
+separately from chat and speech providers. The URI is the API base; the client
+appends `/images/generations`. HTTPS or HTTP on a literal loopback IP is required.
+Redirects are refused and the key is sent only to that configured endpoint.
+
+A key file must use an absolute path and is read on each request. If no file is
+configured, `api_key_env` names the token environment variable, defaulting to
+`OPENAI_API_KEY`. Credentials are not exposed as tool arguments. The endpoint
+and selected model must already be ready; this tool does not load models.
+
+The tool sends standard `model`, `prompt`, `size`, and `n = 1` fields. Size can
+be `WIDTHxHEIGHT`, `auto`, or an existing aspect-ratio preset. The provider
+validates supported dimensions. Optional tool `extra_body` parameters override
+provider-specific defaults, allowing settings such as seed, steps, guidance,
+or negative prompt when the service supports them. Extras cannot override
+model, prompt, size, count, streaming, endpoint, or authentication. If supplied,
+`response_format` must be `b64_json` and `output_format` must be `png`.
+
+This implementation supports one base64 PNG in `data[0].b64_json`, decoded to at
+most 20 MiB and saved under the workspace `images/` directory as a declared image
+attachment. JSON is bounded before parsing and decoded bytes are checked before
+writing. URL responses, multiple images, edits, and streaming are not supported.
+Omit `image_gen.provider` to retain existing fal.ai behavior and settings.
+
 ## See also
 
 - [MCP](./mcp.md)
