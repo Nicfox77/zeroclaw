@@ -47,6 +47,7 @@ fn load_openclaw_bootstrap_files(
     workspace_dir: &std::path::Path,
     max_chars_per_file: usize,
     inject_memory: bool,
+    manual_memory_tools: bool,
 ) {
     prompt.push_str(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
@@ -59,6 +60,7 @@ fn load_openclaw_bootstrap_files(
             filename,
             max_chars_per_file,
             inject_memory,
+            manual_memory_tools,
         );
     }
 
@@ -72,11 +74,13 @@ fn load_openclaw_bootstrap_files(
     // Skipped when the agent runs without persistent memory (e.g. ACP sessions)
     // so that stale long-term memory does not leak into isolated contexts.
     if inject_memory {
-        inject_workspace_file(
+        inject_workspace_file_with_policy(
             prompt,
             workspace_dir,
             CONDITIONAL_BOOTSTRAP_FILES[1],
             max_chars_per_file,
+            true,
+            manual_memory_tools,
         );
     }
 }
@@ -87,6 +91,7 @@ fn append_project_context(
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     inject_memory: bool,
+    manual_memory_tools: bool,
 ) {
     prompt.push_str("## Project Context\n\n");
 
@@ -103,19 +108,37 @@ fn append_project_context(
             }
             Ok(None) => {
                 let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
+                load_openclaw_bootstrap_files(
+                    prompt,
+                    workspace_dir,
+                    max_chars,
+                    inject_memory,
+                    manual_memory_tools,
+                );
             }
             Err(e) => {
                 eprintln!("Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format.");
                 let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
+                load_openclaw_bootstrap_files(
+                    prompt,
+                    workspace_dir,
+                    max_chars,
+                    inject_memory,
+                    manual_memory_tools,
+                );
             }
         }
         return;
     }
 
     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-    load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
+    load_openclaw_bootstrap_files(
+        prompt,
+        workspace_dir,
+        max_chars,
+        inject_memory,
+        manual_memory_tools,
+    );
 }
 
 /// Build the default system prompt.
@@ -483,6 +506,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
             identity_config,
             bootstrap_max_chars,
             inject_memory,
+            tools.iter().any(|(name, _)| *name == "memory_store"),
         );
     }
 
@@ -511,6 +535,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
             identity_config,
             bootstrap_max_chars,
             inject_memory,
+            tools.iter().any(|(name, _)| *name == "memory_store"),
         );
     }
 
@@ -761,7 +786,7 @@ fn inject_workspace_file(
     filename: &str,
     max_chars: usize,
 ) {
-    inject_workspace_file_with_policy(prompt, workspace_dir, filename, max_chars, true)
+    inject_workspace_file_with_policy(prompt, workspace_dir, filename, max_chars, true, true)
 }
 
 fn inject_workspace_file_with_policy(
@@ -769,17 +794,20 @@ fn inject_workspace_file_with_policy(
     workspace_dir: &std::path::Path,
     filename: &str,
     max_chars: usize,
-    manual_memory: bool,
+    inject_memory: bool,
+    manual_memory_tools: bool,
 ) {
     use std::fmt::Write;
 
     let path = workspace_dir.join(filename);
     match std::fs::read_to_string(&path) {
         Ok(content) => {
-            let content = if manual_memory {
-                content
-            } else {
+            let content = if !inject_memory {
                 super::personality_templates::without_manual_memory(filename, &content)
+            } else if !manual_memory_tools {
+                super::personality_templates::with_curated_memory(filename, &content)
+            } else {
+                content
             };
             let (text, truncation) = truncate_bootstrap_content(&content, max_chars);
             if text.is_empty() && truncation.is_none() {

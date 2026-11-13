@@ -3963,13 +3963,7 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: prompt_autonomy_level,
-            inject_memory: self.inject_memory
-                && !matches!(
-                    self.memory.role(),
-                    zeroclaw_api::attribution::Role::Memory(
-                        zeroclaw_api::attribution::MemoryKind::Hindsight
-                    )
-                ),
+            inject_memory: self.inject_memory,
             shell_profile: self.shell_profile.clone(),
         };
         let mut prompt = self
@@ -6504,6 +6498,39 @@ mod tests {
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config")
+    }
+
+    #[tokio::test]
+    async fn hindsight_curated_memory_reaches_chat_prompt_but_stays_out_of_isolated_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        cfg.memory.backend = "hindsight".into();
+        cfg.memory.hindsight.mode = zeroclaw_config::hindsight::RuntimeMode::External;
+        cfg.channels.session_persistence = true;
+        cfg.channels.session_backend = "sqlite".into();
+        cfg.agents.insert("fixture".into(), Default::default());
+        cfg.agents.get_mut("fixture").unwrap().memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight;
+        let live = zeroclaw_config::live::LiveConfig::new(cfg);
+        let memory = zeroclaw_memory::create_memory_for_agent_live(&live.handle(), "fixture", None).await.unwrap();
+        let mut agent = blank_input_agent(Box::new(MockModelProvider { responses: Mutex::new(Vec::new()) }));
+        agent.memory = memory;
+        agent.workspace_dir = dir.path().into();
+        agent.agent_workspace_dir = dir.path().into();
+        std::fs::write(dir.path().join("MEMORY.md"), "CURATED_NOTE_SENTINEL_7192").unwrap();
+        let stock = crate::agent::personality_templates::render("AGENTS.md", &Default::default()).unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), stock).unwrap();
+        let prompt = agent.build_system_prompt().unwrap();
+        assert!(prompt.contains("CURATED_NOTE_SENTINEL_7192"));
+        assert!(prompt.contains("editable curated notepad"));
+        assert!(!prompt.contains("memory_store"));
+        assert!(!prompt.contains("memory_recall"));
+        agent.inject_memory = false;
+        let isolated = agent.build_system_prompt().unwrap();
+        assert!(!isolated.contains("CURATED_NOTE_SENTINEL_7192"));
+        assert!(!isolated.contains("editable curated notepad"));
     }
 
     #[tokio::test]

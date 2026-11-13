@@ -352,10 +352,13 @@ impl PromptSection for IdentitySection {
                 &personality::personality_files_without_memory(),
             )
         };
-        if !ctx.inject_memory {
+        if !ctx.inject_memory || !ctx.tools.iter().any(|tool| tool.name() == "memory_store") {
             for file in &mut profile.files {
-                file.content =
-                    super::personality_templates::without_manual_memory(&file.name, &file.content);
+                file.content = if ctx.inject_memory {
+                    super::personality_templates::with_curated_memory(&file.name, &file.content)
+                } else {
+                    super::personality_templates::without_manual_memory(&file.name, &file.content)
+                };
             }
         }
         prompt.push_str(&profile.render());

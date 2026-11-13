@@ -4327,7 +4327,7 @@ fn build_owned_step_system_prompt(
         owned.agent.resolved.prompt_injection_mode,
         owned.agent.resolved.compact_context,
         owned.agent.resolved.max_system_prompt_chars,
-        config.memory.backend != "hindsight",
+        true,
         config.channels.show_tool_calls,
         None,
         owned.shell_profile.as_ref(),

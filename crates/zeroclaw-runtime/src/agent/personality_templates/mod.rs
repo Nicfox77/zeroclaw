@@ -94,6 +94,20 @@ pub fn without_manual_memory(filename: &str, content: &str) -> String {
     content.to_owned()
 }
 
+/// Keep the curated file while removing unavailable backend-tool duties.
+/// As with the isolated policy, custom workspace instructions remain user-owned.
+pub fn with_curated_memory(filename: &str, content: &str) -> String {
+    if filename == "MEMORY.md" && content.trim() == MEMORY.trim() {
+        return include_str!("MEMORY.curated.md").to_owned();
+    }
+    let adapted = without_manual_memory(filename, content);
+    if filename == "AGENTS.md" && adapted != content {
+        return adapted.replace("Persistent memory, when enabled, is handled outside these workspace files.",
+            "When an automatic memory backend is configured, memories form from conversation automatically; no explicit storage action is needed. For particularly important facts, maintain the appropriate workspace files as an additional persistent reference in prompt context. MEMORY.md is your editable curated notepad for critical durable notes that do not belong in identity, soul, user, or structured identity files. Keep it concise and current using available file tools; do not copy raw transcripts or maintain daily conversation logs.");
+    }
+    adapted
+}
+
 /// Render the full default preset for every editable file.
 #[must_use]
 pub fn render_preset_default(ctx: &TemplateContext) -> Vec<(&'static str, String)> {
@@ -118,11 +132,8 @@ pub async fn ensure_personality_preset_for_backend(
 ) -> std::io::Result<Vec<&'static str>> {
     let mut written = Vec::new();
     for (filename, content) in render_preset_default(ctx) {
-        if automatic_memory && filename == "MEMORY.md" {
-            continue;
-        }
         let content = if automatic_memory {
-            without_manual_memory(filename, &content)
+            with_curated_memory(filename, &content)
         } else {
             content
         };
@@ -310,6 +321,21 @@ mod tests {
 #[cfg(test)]
 mod automatic_memory_tests {
     use super::*;
+    #[test]
+    fn curated_file_complements_automatic_memory_without_backend_tool_duties() {
+        let stock = render("AGENTS.md", &TemplateContext::default()).unwrap();
+        let adapted = with_curated_memory("AGENTS.md", &stock);
+        assert!(adapted.contains("MEMORY.md"));
+        assert!(adapted.contains("available file tools"));
+        assert!(!adapted.contains("memory_recall"));
+        assert!(!adapted.contains("update daily file"));
+        let memory = with_curated_memory("MEMORY.md", MEMORY);
+        assert!(memory.contains("Keep this file concise"));
+        assert!(!memory.contains("Daily files"));
+        let custom = "# MEMORY.md\nA custom durable note.";
+        assert_eq!(with_curated_memory("MEMORY.md", custom), custom);
+    }
+
     #[test]
     fn stock_prompts_stop_assigning_manual_memory_work_but_custom_files_are_preserved() {
         let stock = render("AGENTS.md", &TemplateContext::default()).unwrap();

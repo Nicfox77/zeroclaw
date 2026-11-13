@@ -17473,7 +17473,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             config.effective_skills_prompt_mode(agent_alias),
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
-            config.memory.backend != "hindsight",
+            true,
             config.channels.show_tool_calls,
             runtime.shell_profile().as_ref(),
         );

@@ -54,10 +54,20 @@ The private downstream uses this seam to preserve its canonical event capture, o
 
 ## Prompts and migration
 
-Hindsight extraction and identity orientation are supplied to Hindsight's own service configuration and bank mission. The main agent's generated prompt does not assign memory writing duties when no memory-write tool is registered. File-based `MEMORY.md` is excluded from Hindsight prompt construction. Untouched stock workspace instructions are rendered without manual memory duties; customized workspace files remain user-owned and must be reviewed explicitly for old `memory_store`, `memory_recall`, daily-note, and `MEMORY.md` instructions.
+Hindsight extraction and identity orientation are supplied to Hindsight's own service configuration and bank mission. The main agent's generated prompt does not assign memory writing duties when no memory-write tool is registered. File-based `MEMORY.md` remains available in permitted persistent-memory contexts as an editable curated notepad. It complements automatic transcript memory; use file tools to maintain concise important notes rather than manual Hindsight retain calls. Isolated contexts continue to exclude the file. Untouched stock workspace instructions are rendered without manual memory duties; customized workspace files remain user-owned and must be reviewed explicitly for old `memory_store`, `memory_recall`, daily-note, and `MEMORY.md` instructions.
 
 Selecting Hindsight does not import or delete an existing local memory database. There is no public `memory backfill` command because mutable transcripts cannot prove historical completeness. Keep the previous backend and configuration for rollback. Disabling this feature stops new capture; preserve the protected Hindsight directory if outstanding deliveries need reconciliation.
 
 ## Review boundaries
 
 This is a backend proposal, not an implementation or acceptance of the permanent-history RFC. ADR-010 remains proposed; this exclusive remote backend and its explicit completed-turn ingestion need review against that proposal's enrichment and transcript-authority requirements. Runtime changes are composition and existing-agent/tool wiring; the implementation resides in `zeroclaw-memory`, configuration in `zeroclaw-config`, and the strict ownership read in `zeroclaw-infra`. Upstream reviewers must resolve any holding-crate exception needed before merging.
+
+### Curated context alongside automatic memory
+
+Conversation memories form automatically through Hindsight; the main agent does
+not need to issue storage calls. It can still maintain the workspace files for
+particularly important facts that should be available in prompt context without
+a retrieval match. Identity, personality and user facts belong in their selected
+files; `MEMORY.md` holds other concise durable notes, decisions and open loops.
+The file is loaded when persistent-memory prompt context is constructed, within
+normal prompt budgets. Explicitly isolated contexts continue to omit it.
