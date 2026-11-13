@@ -1,4 +1,5 @@
 use crate::helpers::{domain_guard, response_body};
+use crate::i18n::{get_required_tool_string, get_required_tool_string_with_args};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::header::LOCATION;
@@ -195,6 +196,8 @@ pub struct ImageGenTool {
     workspace_dir: PathBuf,
     default_model: String,
     api_key_env: String,
+    endpoint: Option<reqwest::Url>,
+    api_key_file: Option<PathBuf>,
     persistent_writes: bool,
     nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
 }
@@ -233,12 +236,114 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
+            endpoint: None,
+            api_key_file: None,
             persistent_writes,
             nat64_prefixes: domain_guard::parse_nat64_prefixes(
                 &nat64_prefixes,
                 "security.nat64_prefixes",
             )?,
         })
+    }
+
+    /// Operator-configured endpoint and credential source. Neither is accepted
+    /// from tool arguments. Redirects are disabled so the key stays at this URL.
+    pub fn with_endpoint(
+        mut self,
+        endpoint: Option<&str>,
+        api_key_file: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        if let Some(path) = &api_key_file {
+            anyhow::ensure!(
+                path.is_absolute(),
+                get_required_tool_string("image-gen-error-key-path")
+            );
+        }
+        self.endpoint = endpoint
+            .map(|raw| {
+                anyhow::ensure!(
+                    !raw.chars().any(char::is_whitespace),
+                    get_required_tool_string("image-gen-error-endpoint-url")
+                );
+                let url = reqwest::Url::parse(raw)
+                    .context(get_required_tool_string("image-gen-error-endpoint-url"))?;
+                let loopback = url
+                    .host_str()
+                    .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+                    .is_some_and(|ip| ip.is_loopback());
+                anyhow::ensure!(
+                    url.host_str().is_some()
+                        && (url.scheme() == "https" || (url.scheme() == "http" && loopback)),
+                    get_required_tool_string("image-gen-error-endpoint-transport")
+                );
+                anyhow::ensure!(
+                    url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none(),
+                    get_required_tool_string("image-gen-error-endpoint-components")
+                );
+                Ok(url)
+            })
+            .transpose()?;
+        self.api_key_file = api_key_file;
+        Ok(self)
+    }
+
+    async fn configured_api_key(&self) -> Result<String, String> {
+        let Some(path) = &self.api_key_file else {
+            return Self::read_api_key(&self.api_key_env);
+        };
+        let key = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|_| get_required_tool_string("image-gen-error-key-read"))?;
+        let key = key.trim();
+        if key.is_empty() || key.len() > 16384 || key.chars().any(char::is_control) {
+            return Err(get_required_tool_string("image-gen-error-key-invalid"));
+        }
+        Ok(key.to_owned())
+    }
+
+    async fn generate_at_endpoint(
+        &self,
+        endpoint: &reqwest::Url,
+        api_key: &str,
+        model: &str,
+        prompt: &str,
+        size: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (width, height) = match size {
+            "landscape_4_3" => (1024, 768),
+            "portrait_4_3" => (768, 1024),
+            "landscape_16_9" => (1344, 768),
+            "portrait_16_9" => (768, 1344),
+            _ => (1024, 1024),
+        };
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()?
+            .post(endpoint.clone())
+            .bearer_auth(api_key)
+            .header("Accept", "image/png")
+            .json(&json!({"model":model,"prompt":prompt,"width":width,"height":height}))
+            .send()
+            .await
+            .context(get_required_tool_string("image-gen-error-endpoint-request"))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            get_required_tool_string_with_args(
+                "image-gen-error-endpoint-status",
+                &[("status", &response.status().to_string())]
+            )
+        );
+        let bytes = read_generated_image_body(response).await?;
+        anyhow::ensure!(
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            get_required_tool_string("image-gen-error-endpoint-png")
+        );
+        Ok(bytes)
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -376,7 +481,7 @@ impl ImageGenTool {
         }
 
         // ── Read API key ───────────────────────────────────────────
-        let api_key = match Self::read_api_key(&self.api_key_env) {
+        let api_key = match self.configured_api_key().await {
             Ok(k) => k,
             Err(msg) => {
                 return Ok(ToolResult {
@@ -387,61 +492,66 @@ impl ImageGenTool {
             }
         };
 
-        // ── Call fal.ai ────────────────────────────────────────────
-        let client = Self::http_client()?;
-        let url = format!("https://fal.run/{model}");
+        let bytes = if let Some(endpoint) = &self.endpoint {
+            self.generate_at_endpoint(endpoint, &api_key, model, &prompt, size)
+                .await?
+        } else {
+            // ── Call fal.ai ────────────────────────────────────────────
+            let client = Self::http_client()?;
+            let url = format!("https://fal.run/{model}");
 
-        let body = json!({
-            "prompt": prompt,
-            "image_size": size,
-            "num_images": 1
-        });
-
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Key {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("fal.ai request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = read_fal_error_text(resp).await.unwrap_or_default();
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("fal.ai API error ({status}): {body_text}")),
+            let body = json!({
+                "prompt": prompt,
+                "image_size": size,
+                "num_images": 1
             });
-        }
 
-        let fal_body = read_fal_success_body(resp).await?;
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&fal_body).context("Failed to parse fal.ai response as JSON")?;
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Key {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .context("fal.ai request failed")?;
 
-        let image_url = resp_json
-            .pointer("/images/0/url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "image_gen: fal.ai response missing image URL"
-                );
-                anyhow::Error::msg("No image URL in fal.ai response")
-            })?;
-
-        // ── Download image ─────────────────────────────────────────
-        let bytes = match Self::download_generated_image(image_url, &self.nat64_prefixes).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = read_fal_error_text(resp).await.unwrap_or_default();
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(error.to_string()),
+                    error: Some(format!("fal.ai API error ({status}): {body_text}")),
                 });
+            }
+
+            let fal_body = read_fal_success_body(resp).await?;
+            let resp_json: serde_json::Value = serde_json::from_slice(&fal_body)
+                .context("Failed to parse fal.ai response as JSON")?;
+
+            let image_url = resp_json
+                .pointer("/images/0/url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "image_gen: fal.ai response missing image URL"
+                    );
+                    anyhow::Error::msg("No image URL in fal.ai response")
+                })?;
+
+            // ── Download image ─────────────────────────────────────────
+            match Self::download_generated_image(image_url, &self.nat64_prefixes).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error.to_string()),
+                    });
+                }
             }
         };
 
@@ -483,7 +593,7 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate an image from a text prompt using fal.ai (Flux models). \
+        "Generate an image from a text prompt using the configured image model. \
          Saves the result to the workspace images directory and returns the file path."
     }
 
@@ -507,7 +617,7 @@ impl Tool for ImageGenTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "fal.ai model identifier (default: 'fal-ai/flux/schnell')."
+                    "description": get_required_tool_string("image-gen-model-description")
                 }
             }
         })
@@ -547,6 +657,159 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
+
+    #[test]
+    fn custom_image_endpoint_rejects_unsafe_transport_and_embedded_credentials() {
+        for endpoint in [
+            "http://example.invalid/image",
+            "ftp://127.0.0.1/image",
+            "https://user:password@example.invalid/image",
+            "https://example.invalid/image?key=value",
+            "https://example.invalid/image#fragment",
+            " http://127.0.0.1/image",
+        ] {
+            assert!(
+                test_tool().with_endpoint(Some(endpoint), None).is_err(),
+                "{endpoint}"
+            );
+        }
+        assert!(
+            test_tool()
+                .with_endpoint(Some("http://127.0.0.1:1234/image"), None)
+                .is_ok()
+        );
+        assert!(
+            test_tool()
+                .with_endpoint(Some("http://[::1]:1234/image"), None)
+                .is_ok()
+        );
+        assert!(
+            test_tool()
+                .with_endpoint(Some("https://example.invalid/image"), None)
+                .is_ok()
+        );
+        assert!(
+            test_tool()
+                .with_endpoint(None, Some("relative.key".into()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_image_endpoint_generates_attachment_and_rereads_key_file() {
+        use base64::Engine;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_json, header, method, path},
+        };
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let key_file = workspace.path().join("api.key");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a0qkAAAAASUVORK5CYII="
+        ).unwrap();
+        let tool = ImageGenTool::new(
+            test_security(),
+            workspace.path().into(),
+            "example/image-model".into(),
+            "UNUSED_IMAGE_KEY_ENV".into(),
+            vec![],
+        )
+        .unwrap()
+        .with_endpoint(
+            Some(&format!("{}/v1/image/generate", server.uri())),
+            Some(key_file.clone()),
+        )
+        .unwrap();
+        for (index, key) in ["fixture-key-one", "fixture-key-two"].iter().enumerate() {
+            tokio::fs::write(&key_file, format!("{key}\n"))
+                .await
+                .unwrap();
+            Mock::given(method("POST"))
+                .and(path("/v1/image/generate"))
+                .and(header("authorization", format!("Bearer {key}")))
+                .and(body_json(
+                    json!({"model":"example/image-model", "prompt":"A blue circle",
+                    "width":768,"height":1024}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(bytes.clone(), "image/png"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = tool
+                .execute(json!({"prompt":"A blue circle","size":"portrait_4_3",
+                "filename":format!("fixture-{index}")}))
+                .await
+                .unwrap();
+            assert!(result.success);
+            assert_eq!(result.output.attachments().len(), 1);
+            let file = workspace.path().join(format!("images/fixture-{index}.png"));
+            assert_eq!(tokio::fs::read(&file).await.unwrap(), bytes);
+            assert_eq!(
+                result.output.attachments()[0].target,
+                file.display().to_string()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_image_endpoint_rejects_redirects_non_images_and_error_bodies() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let workspace = tempfile::tempdir().unwrap();
+        let key = workspace.path().join("api.key");
+        tokio::fs::write(&key, "fixture-private-key").await.unwrap();
+        for (status, body) in [
+            (302, "redirect"),
+            (200, "not a PNG"),
+            (401, "fixture-private-key"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("Location", "http://127.0.0.1:1/must-not-follow")
+                        .set_body_string(body),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let tool = test_tool()
+                .with_endpoint(Some(&server.uri()), Some(key.clone()))
+                .unwrap();
+            let error = tool
+                .execute(json!({"prompt":"A blue circle"}))
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("fixture-private-key"));
+            if status == 200 {
+                assert!(error.to_string().contains("PNG"));
+            } else {
+                assert!(error.to_string().contains(&status.to_string()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_image_key_file_failure_does_not_fall_back_to_environment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let key = workspace.path().join("missing.key");
+        let tool = test_tool()
+            .with_endpoint(Some("http://127.0.0.1:1/image"), Some(key.clone()))
+            .unwrap();
+        assert!(
+            tool.configured_api_key()
+                .await
+                .unwrap_err()
+                .contains("read")
+        );
+        tokio::fs::write(&key, "\n").await.unwrap();
+        assert!(
+            tool.configured_api_key()
+                .await
+                .unwrap_err()
+                .contains("empty")
+        );
+    }
 
     async fn held_open_chunked_response(
         byte_count: usize,

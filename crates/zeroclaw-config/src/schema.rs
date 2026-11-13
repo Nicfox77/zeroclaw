@@ -10453,8 +10453,8 @@ impl Default for ImageProviderFluxConfig {
 /// Standalone image generation tool configuration (`[image_gen]`).
 ///
 /// When enabled, registers an `image_gen` tool that generates images via
-/// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
-/// to the workspace `images/` directory.
+/// fal.ai or an operator-configured HTTP endpoint and saves them to the
+/// workspace `images/` directory.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "image_gen"]
@@ -10471,6 +10471,18 @@ pub struct ImageGenConfig {
     #[serde(default = "default_image_gen_api_key_env")]
     #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
+
+    /// Optional HTTP image endpoint accepting model, prompt, width and height
+    /// as JSON and returning PNG bytes. Uses Bearer authentication. HTTPS or
+    /// HTTP on a loopback IP is required; unset retains the fal.ai backend.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Optional absolute path to an API key file, read on each generation.
+    /// Takes precedence over api_key_env; only the path is stored in config.
+    #[serde(default)]
+    #[credential_class = "path_only_reference"]
+    pub api_key_file: Option<PathBuf>,
 }
 
 fn default_image_gen_model() -> String {
@@ -10487,7 +10499,38 @@ impl Default for ImageGenConfig {
             enabled: false,
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
+            endpoint: None,
+            api_key_file: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod image_gen_config_tests {
+    use super::ImageGenConfig;
+
+    #[test]
+    fn http_image_generation_settings_round_trip_and_preserve_defaults() {
+        let defaults: ImageGenConfig = toml::from_str("").unwrap();
+        assert!(!defaults.enabled);
+        assert!(defaults.endpoint.is_none());
+        assert!(defaults.api_key_file.is_none());
+        assert_eq!(defaults.default_model, "fal-ai/flux/schnell");
+        let configured: ImageGenConfig = toml::from_str(
+            r#"
+enabled = true
+default_model = "example/image-model"
+endpoint = "http://127.0.0.1:9000/v1/image/generate"
+api_key_file = "/run/secrets/image-api.key"
+"#,
+        )
+        .unwrap();
+        let restored: ImageGenConfig =
+            toml::from_str(&toml::to_string(&configured).unwrap()).unwrap();
+        assert!(restored.enabled);
+        assert_eq!(restored.default_model, configured.default_model);
+        assert_eq!(restored.endpoint, configured.endpoint);
+        assert_eq!(restored.api_key_file, configured.api_key_file);
     }
 }
 

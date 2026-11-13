@@ -248,6 +248,34 @@ If you need finer-grained gating under Full autonomy, put sensitive tools in the
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 
+## Image generation endpoints
+
+The optional `image_gen` tool uses fal.ai by default. To use an image service
+that accepts JSON with `model`, `prompt`, `width`, and `height` and returns PNG
+bytes, configure its complete endpoint URL:
+
+```toml
+[image_gen]
+enabled = true
+default_model = "example/image-model"
+endpoint = "http://127.0.0.1:9000/v1/image/generate"
+api_key_file = "/run/secrets/image-api.key"
+```
+
+Include `image_gen` in `[tools].optional`, or select `"*"`. The endpoint uses
+Bearer authentication and requires HTTPS or HTTP on a literal loopback IP.
+Redirects are refused. The operator configures the URL and key path; tool
+arguments cannot replace them. The key file must use an absolute path and is
+read on each request, so key rotation does not require copying a secret into
+the configuration. If no file is configured, `api_key_env` supplies the key.
+
+The existing size presets map to pixel dimensions: square is 1024 by 1024,
+4:3 is 1024 by 768, and 16:9 is 1344 by 768; portrait presets swap the axes.
+Responses are limited to 20 MiB and must have a PNG signature. Generated files
+are saved under the agent workspace's `images/` directory and returned as
+image attachments. The service must make the selected model ready before use;
+this tool does not load models. Omit `endpoint` to keep the fal.ai protocol.
+
 ## See also
 
 - [MCP](./mcp.md)

@@ -3394,7 +3394,13 @@ fn all_tools_with_runtime_on_thread(
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
             root_config.security.nat64_prefixes.clone(),
-        ) {
+        )
+        .and_then(|tool| {
+            tool.with_endpoint(
+                root_config.image_gen.endpoint.as_deref(),
+                root_config.image_gen.api_key_file.clone(),
+            )
+        }) {
             Ok(tool) => tool_arcs.push(Arc::new(tool)),
             Err(e) => {
                 ::zeroclaw_log::record!(

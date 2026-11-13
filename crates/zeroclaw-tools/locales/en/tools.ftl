@@ -278,3 +278,16 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+# Configured image generation backend
+tool-image-gen = Generate an image from a text prompt using the configured image model. Saves the result to the workspace images directory and returns the file path.
+image-gen-model-description = Model identifier; omit to use the configured default image model.
+image-gen-error-key-path = Image API key file path must be absolute
+image-gen-error-endpoint-url = Invalid image endpoint URL
+image-gen-error-endpoint-transport = Image endpoint requires HTTPS or HTTP on a loopback IP
+image-gen-error-endpoint-components = Image endpoint must not contain credentials, query parameters or a fragment
+image-gen-error-key-read = Failed to read image generation API key file
+image-gen-error-key-invalid = Image generation API key file contains an empty or invalid key
+image-gen-error-endpoint-request = Image endpoint request failed
+image-gen-error-endpoint-png = Image endpoint did not return PNG image bytes
+image-gen-error-endpoint-status = Image endpoint returned HTTP { $status }
