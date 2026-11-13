@@ -7480,30 +7480,45 @@ impl RpcDispatcher {
                     // already trimmed underneath it.
                     let agent = agent.lock().await;
                     let durable = zeroclaw_providers::durable_chat_messages(agent.history());
-                    let persisted = replace_rpc_chat_conversation_state(
-                        backend.as_ref(),
-                        sid,
-                        &key,
-                        &durable,
-                        agent.history_has_trim_breadcrumb(),
-                    );
-                    if persisted
+                    let capture_enabled = {
+                        let cfg = self.ctx.config.read();
+                        cfg.memory.backend == "hindsight" && cfg.memory.hindsight.auto_retain
+                            && cfg.agent(&agent_alias).is_some_and(|a| a.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight)
+                    };
+                    if capture_enabled
                         && let Ok(TurnOutcome::Completed { text, .. }) = &outcome
                         && let Some(scope) = hindsight_scope.as_ref()
-                        && zeroclaw_memory::hindsight::upstream::capture_completed_turn(
+                    {
+                        if zeroclaw_memory::hindsight::upstream::commit_completed_turn(
                             &self.ctx.config,
                             scope,
                             &key,
                             &turn_id,
                             &req.prompt,
                             text,
+                            zeroclaw_infra::session_sqlite::CompletedSessionWrite::Replace {
+                                messages: &durable,
+                                breadcrumb_present: agent.history_has_trim_breadcrumb(),
+                            },
                         )
                         .is_err()
-                    {
-                        zeroclaw_log::record!(
-                            WARN,
-                            zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Note),
-                            "hindsight_turn_capture_failed"
+                        {
+                            zeroclaw_log::record!(
+                                WARN,
+                                zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    zeroclaw_log::Action::Note
+                                ),
+                                "hindsight_turn_commit_failed"
+                            );
+                        }
+                    } else {
+                        replace_rpc_chat_conversation_state(
+                            backend.as_ref(),
+                            sid,
+                            &key,
+                            &durable,
+                            agent.history_has_trim_breadcrumb(),
                         );
                     }
                 }

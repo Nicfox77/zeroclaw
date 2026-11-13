@@ -4112,6 +4112,22 @@ fn append_sender_turn(
     sender_key: &str,
     turn: ChatMessage,
 ) -> Option<Vec<ChatMessage>> {
+    append_sender_turn_with(ctx, sender_key, turn, false, |turn| {
+        if let Some(store) = &ctx.session_store {
+            store.append(sender_key, turn)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn append_sender_turn_with(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+    require_commit: bool,
+    persist: impl FnOnce(&ChatMessage) -> std::io::Result<()>,
+) -> Option<Vec<ChatMessage>> {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
     let persist_lock = acquire_persist_lock(ctx, sender_key);
@@ -4122,9 +4138,7 @@ fn append_sender_turn(
     }
 
     // Persist to JSONL before adding to in-memory history.
-    if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.append(sender_key, &turn)
-    {
+    if let Err(e) = persist(&turn) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4132,6 +4146,9 @@ fn append_sender_turn(
                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
             "Failed to persist session turn"
         );
+        if require_commit {
+            return None;
+        }
     }
 
     let max_history = channel_history_cap(ctx);
@@ -10974,30 +10991,48 @@ async fn process_channel_message_body(
             }
 
             if !history_resync_failed {
-                append_sender_turn(
-                    ctx.as_ref(),
-                    &history_key,
-                    ChatMessage::assistant(&history_response),
-                );
-            }
-
-            if !history_resync_failed
-                && let Some(scope) = hindsight_scope.as_ref()
-                && zeroclaw_memory::hindsight::upstream::capture_completed_turn(
-                    &ctx.live_config,
-                    scope,
-                    &history_key,
-                    &turn_id,
-                    &msg.content,
-                    &history_response,
-                )
-                .is_err()
-            {
-                zeroclaw_log::record!(
-                    WARN,
-                    zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Note),
-                    "hindsight_turn_capture_failed"
-                );
+                let capture_enabled = {
+                    let cfg = ctx.live_config.read();
+                    cfg.memory.backend == "hindsight"
+                        && cfg.memory.hindsight.auto_retain
+                        && cfg.agent(&ctx.agent_alias).is_some_and(|a| {
+                            a.memory.backend
+                                == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight
+                        })
+                };
+                if capture_enabled && let Some(scope) = hindsight_scope.as_ref() {
+                    append_sender_turn_with(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant(&history_response),
+                        true,
+                        |reply| {
+                            let committed =
+                                zeroclaw_memory::hindsight::upstream::commit_completed_turn(
+                                    &ctx.live_config,
+                                    scope,
+                                    &history_key,
+                                    &turn_id,
+                                    &msg.content,
+                                    &history_response,
+                                    zeroclaw_infra::session_sqlite::CompletedSessionWrite::Append(
+                                        reply,
+                                    ),
+                                )
+                                .map_err(std::io::Error::other)?;
+                            if !committed {
+                                return Err(std::io::Error::other("hindsight_source_deleted"));
+                            }
+                            Ok(())
+                        },
+                    );
+                } else {
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant(&history_response),
+                    );
+                }
             }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the

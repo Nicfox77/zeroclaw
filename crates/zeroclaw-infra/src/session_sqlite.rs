@@ -21,6 +21,15 @@ pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
 }
 
+/// Final session mutation to commit with a host-owned durable delivery effect.
+pub enum CompletedSessionWrite<'a> {
+    Append(&'a ChatMessage),
+    Replace {
+        messages: &'a [ChatMessage],
+        breadcrumb_present: bool,
+    },
+}
+
 fn committed_jsonl_import_receipts_exist(conn: &Connection) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM jsonl_import_receipts LIMIT 1)",
@@ -106,6 +115,45 @@ impl SqliteSessionBackend {
                 })
             },
         ).optional()
+    }
+
+    /// Commit a completed session mutation and a trusted host's SQL effect in
+    /// this database's single transaction. The callback must not reenter this
+    /// backend or perform network I/O. Missing/deleted sources are never recreated.
+    /// The host owns its effect schema; storage owns the mutation/commit boundary.
+    /// Return true from the effect to commit, false for an already-committed
+    /// idempotency receipt (the tentative mutation is then rolled back).
+    pub fn commit_completed_with(
+        &self,
+        session_key: &str,
+        write: CompletedSessionWrite<'_>,
+        effect: impl FnOnce(&Connection, &SessionMetadata) -> Result<bool>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(metadata) = Self::snapshot_metadata_on(&tx, session_key)? else {
+            return Ok(false);
+        };
+        match write {
+            CompletedSessionWrite::Append(message) => {
+                Self::append_on(&tx, session_key, message, &Utc::now().to_rfc3339())?;
+            }
+            CompletedSessionWrite::Replace {
+                messages,
+                breadcrumb_present,
+            } => {
+                Self::rewrite_messages_on(&tx, session_key, messages)?;
+                Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)?;
+            }
+        }
+        // A proven duplicate effect must not append the final message twice.
+        // Roll back the tentative session mutation while reporting it handled.
+        if !effect(&tx, &metadata)? {
+            return Ok(true);
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Read canonical session ownership, distinguishing deletion from read failure.
@@ -3924,5 +3972,132 @@ mod strict_metadata_tests {
         assert!(store.read_metadata("fixture").is_err());
         store.delete_session("fixture").unwrap();
         assert!(store.read_metadata("fixture").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod completed_effect_tests {
+    use super::*;
+    const CHILD_DIRECTORY: &str = "ZEROCLAW_ATOMIC_COMMIT_CRASH_FIXTURE";
+
+    #[test]
+    fn crash_child() {
+        let Some(directory) = std::env::var_os(CHILD_DIRECTORY) else {
+            return;
+        };
+        let store = SqliteSessionBackend::new(Path::new(&directory)).unwrap();
+        store
+            .commit_completed_with(
+                "fixture",
+                CompletedSessionWrite::Append(&ChatMessage::assistant("uncommitted reply")),
+                |tx, _| {
+                    tx.execute(
+                        "INSERT INTO delivery_fixture(body) VALUES('uncommitted payload')",
+                        [],
+                    )?;
+                    // Real process termination: neither connection nor transaction drops.
+                    std::process::exit(73);
+                },
+            )
+            .unwrap();
+        panic!("crash fixture did not exit");
+    }
+
+    #[test]
+    fn process_death_before_commit_leaves_neither_reply_nor_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteSessionBackend::new(directory.path()).unwrap();
+        store
+            .append("fixture", &ChatMessage::user("original input"))
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute_batch("CREATE TABLE delivery_fixture(body TEXT NOT NULL)")
+            .unwrap();
+        drop(store);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_sqlite::completed_effect_tests::crash_child",
+            ])
+            .env(CHILD_DIRECTORY, directory.path())
+            .output()
+            .unwrap()
+            .status;
+        assert_eq!(status.code(), Some(73));
+        let store = SqliteSessionBackend::new(directory.path()).unwrap();
+        assert_eq!(store.load("fixture").len(), 1);
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .query_row("SELECT count(*) FROM delivery_fixture", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .commit_completed_with(
+                    "fixture",
+                    CompletedSessionWrite::Append(&ChatMessage::assistant("committed reply")),
+                    |tx, _| {
+                        tx.execute(
+                            "INSERT INTO delivery_fixture(body) VALUES('committed payload')",
+                            [],
+                        )?;
+                        Ok(true)
+                    }
+                )
+                .unwrap()
+        );
+        drop(store);
+        let store = SqliteSessionBackend::new(directory.path()).unwrap();
+        assert_eq!(
+            store.load("fixture").last().unwrap().content,
+            "committed reply"
+        );
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .query_row("SELECT count(*) FROM delivery_fixture", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_effect_rolls_back_replacement_and_breadcrumb() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteSessionBackend::new(directory.path()).unwrap();
+        store
+            .append("fixture", &ChatMessage::user("original input"))
+            .unwrap();
+        assert!(
+            store
+                .commit_completed_with(
+                    "fixture",
+                    CompletedSessionWrite::Replace {
+                        messages: &[ChatMessage::assistant("uncommitted")],
+                        breadcrumb_present: true
+                    },
+                    |tx, _| {
+                        tx.execute("INSERT INTO nonexistent_fixture_table VALUES(1)", [])?;
+                        Ok(true)
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.load("fixture").last().unwrap().content,
+            "original input"
+        );
+        assert_ne!(
+            store.get_session_trim_breadcrumb("fixture").unwrap(),
+            Some(true)
+        );
     }
 }
