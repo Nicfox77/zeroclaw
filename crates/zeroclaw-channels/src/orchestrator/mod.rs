@@ -6297,7 +6297,7 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
 ///     reason or provider footer appended after streaming): only the unsent
 ///     canonical tail follows the prefix;
 ///   * final sanitization dropped an already-delivered leading paragraph (e.g.
-///     `strip_tool_narration`): the confirmed prefix stays, and the canonical
+///     an outbound hook rewrite): the confirmed prefix stays, and the canonical
 ///     response is aligned past any confirmed paragraphs it still contains so
 ///     none of them is re-sent;
 ///   * final sanitization rewrote the unsent tail (credential redaction, a
@@ -6735,10 +6735,10 @@ fn sanitize_channel_response_for_format_with_leak_detection(
         strip_fenced_tool_protocol_artifacts(&stripped_results, &known_tool_names);
     let stripped_json =
         strip_isolated_tool_json_artifacts(&stripped_fenced_json, &known_tool_names);
-    // Strip leading narration lines that announce tool usage
-    let sanitized = strip_tool_narration(&stripped_json);
-
-    redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
+    // Ordinary prose is part of the accepted answer. Prefixes such as "I'll"
+    // cannot establish that a line is tool narration; removing them only at
+    // finalization makes a live draft lose legitimate opening paragraphs.
+    redact_channel_outbound_leaks(&stripped_json, leak_detection, content_format)
 }
 
 /// Apply the same outbound security/operator boundary the final reply crosses to
@@ -6747,10 +6747,8 @@ fn sanitize_channel_response_for_format_with_leak_detection(
 /// warning and length cap) followed by credential leak-detection. Returns `None`
 /// when a hook cancels the send; otherwise the guarded narration text.
 ///
-/// Unlike the final reply this deliberately does NOT run the tool-protocol
-/// sanitizer: that path's `strip_tool_narration` would delete the pre-tool
-/// narration this feature exists to deliver. Only the hook and
-/// `redact_channel_outbound_leaks` apply to intermediate narration, so a
+/// Permanent narration uses its streaming protocol guard before this boundary.
+/// Only the hook and `redact_channel_outbound_leaks` apply here, so a
 /// credential can never leave the process ahead of the guarded final reply and a
 /// hook that cancels/rewrites the send is honored before anything is posted.
 async fn apply_multi_message_narration_policy(
@@ -7243,61 +7241,6 @@ fn ensure_nonempty_channel_reply(
         "channel_reply_empty; substituting fallback"
     );
     EMPTY_CHANNEL_REPLY_FALLBACK.to_string()
-}
-
-/// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
-/// Only strips lines from the very beginning of the message that match common
-/// narration patterns, so genuine content is preserved.
-fn strip_tool_narration(message: &str) -> String {
-    let narration_prefixes: &[&str] = &[
-        "let me ",
-        "i'll ",
-        "i will ",
-        "i am going to ",
-        "i'm going to ",
-        "searching ",
-        "looking up ",
-        "fetching ",
-        "checking ",
-        "using the ",
-        "using my ",
-        "one moment",
-        "hold on",
-        "just a moment",
-        "give me a moment",
-        "allow me to ",
-    ];
-
-    let mut result_lines: Vec<&str> = Vec::new();
-    let mut past_narration = false;
-
-    for line in message.lines() {
-        if past_narration {
-            result_lines.push(line);
-            continue;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        if narration_prefixes.iter().any(|p| lower.starts_with(p)) {
-            // Skip this narration line
-            continue;
-        }
-        // First non-narration, non-empty line — keep everything from here
-        past_narration = true;
-        result_lines.push(line);
-    }
-
-    let joined = result_lines.join("\n");
-    let trimmed = joined.trim();
-    if trimmed.is_empty() && !message.trim().is_empty() {
-        // If stripping removed everything, return original to avoid empty reply
-        message.to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -55063,6 +55006,58 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
+    fn sanitize_channel_response_preserves_ordinary_opening_prose() {
+        for opening in [
+            "I'll maintain the project notes.",
+            "I will keep the decision here.",
+            "Let me know if this changes.",
+            "Checking these details regularly is useful.",
+            "Using the workspace files keeps this explicit.",
+        ] {
+            let response = format!("{opening}\n\nThe rest of the answer remains available.");
+            assert_eq!(sanitize_channel_response(&response, &[]), response);
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_finalization_preserves_the_opening_paragraph() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let recording = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = recording.clone();
+        let opening = "I'll maintain the workspace notes as we go.";
+        let remainder = "\n\nImportant facts stay in the appropriate files.";
+        let response = format!("{opening}{remainder}");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(opening.into())).await.unwrap();
+        tx.send(StreamDelta::Text(remainder.into())).await.unwrap();
+        drop(tx);
+        run_draft_updater_with_leak_detection(
+            channel.clone(),
+            "fixture-chat".into(),
+            "fixture-draft".into(),
+            no_tools(),
+            Arc::new(Mutex::new(String::new())),
+            Default::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+        let final_text = sanitize_channel_response(&response, &[]);
+        channel
+            .finalize_draft("fixture-chat", "fixture-draft", &final_text, false)
+            .await
+            .unwrap();
+        assert_eq!(recording.draft_updates.lock().await.last(), Some(&response));
+        assert_eq!(
+            recording.finalized_messages.lock().await.as_slice(),
+            [format!("fixture-chat:fixture-draft:{response}")]
+        );
+    }
+
+    #[test]
     fn sanitize_channel_response_passes_clean_text() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let clean_text = "This is a normal message with no credentials.";
@@ -55963,7 +55958,7 @@ Done."#;
     /// Feeding the canonical (narration-stripped) response directly would
     /// slice past the stop reason and drop it.
     #[tokio::test]
-    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_discord()
+    async fn multi_message_finalization_delivers_stop_reason_when_final_rewrite_drops_narration_discord()
      {
         use zeroclaw_runtime::agent::loop_::StreamDelta;
 
@@ -55974,8 +55969,8 @@ Done."#;
         let answer = "Here is the best partial answer I have.";
         let stop_reason = "Stopped after reaching the tool-call limit.";
         let body = format!("{answer}\n\n{stop_reason}");
-        // The final sanitizer keeps only the body after dropping the leading
-        // narration line that was already streamed live.
+        // An outbound rewrite can keep only the body after dropping leading
+        // narration that was already streamed live.
         let delivered_response = body.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -56036,7 +56031,7 @@ Done."#;
     /// streamed leading narration from the canonical response must not strand
     /// the trailing stop reason.
     #[tokio::test]
-    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_matrix()
+    async fn multi_message_finalization_delivers_stop_reason_when_final_rewrite_drops_narration_matrix()
      {
         use zeroclaw_runtime::agent::loop_::StreamDelta;
 
