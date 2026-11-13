@@ -30,6 +30,15 @@ Use the normal secret configuration mechanism for service credentials. Never com
 
 Hindsight reflection is an optional built-in: full tool selection includes it; minimal selection can add `hindsight_reflect` to `[tools].optional`. Permission policy still controls its availability. Turning off automatic recall does not restore manual recall or write tools.
 
+## Conversation perspective
+
+Transcript context identifies the assistant as the memory owner: "This is your
+conversation history. You are [assistant]; [user] is the user." Extraction is
+asked to use "I" and "my" for the assistant's actions and experiences, while
+keeping the user's actions and preferences attributed to the user. Speaker names
+come from the existing speaker resolver. This changes extraction guidance for
+new delivery; it does not rewrite stored memories or source conversations.
+
 ## Recall dates
 
 Automatic recall date stamps use the host system timezone, matching live message
