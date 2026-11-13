@@ -388,6 +388,14 @@ impl HindsightMemory {
             timestamp: fact
                 .occurred_start
                 .or(fact.mentioned_at)
+                .map(|timestamp| {
+                    // Prompt date stamps use the timestamp's calendar date.
+                    // Match live message timestamps using the system timezone,
+                    // including the offset at the event's date (not today's).
+                    chrono::DateTime::parse_from_rfc3339(&timestamp).map_or(timestamp, |time| {
+                        time.with_timezone(&chrono::Local).to_rfc3339()
+                    })
+                })
                 .unwrap_or_default(),
             session_id: fact
                 .metadata
@@ -847,6 +855,64 @@ impl Memory for HindsightMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recalled_timestamps_use_system_timezone_and_preserve_the_instant() {
+        let directory = tempfile::tempdir().unwrap();
+        let memory =
+            HindsightMemory::new(&HindsightConfig::default(), directory.path(), None, None)
+                .unwrap();
+        let scope = PrincipalScope::new("fixture-owner");
+        // UTC midnight boundaries, year rollover, and both sides of DST changes.
+        for timestamp in [
+            "2026-01-01T01:30:00Z",
+            "2026-07-01T01:30:00Z",
+            "2026-03-08T09:30:00Z",
+            "2026-03-08T10:30:00Z",
+            "2026-11-01T08:30:00Z",
+            "2026-11-01T09:30:00Z",
+            "2026-11-13T00:30:00+05:30",
+        ] {
+            for use_event_time in [true, false] {
+                let fact: Fact = serde_json::from_value(serde_json::json!({
+                    "id": "fixture-fact", "text": "A project decision.",
+                    "occurred_start": use_event_time.then_some(timestamp),
+                    "mentioned_at": if use_event_time { "2027-01-01T12:00:00Z" } else { timestamp },
+                }))
+                .unwrap();
+                let entry = memory.entry(&scope, fact);
+                let source = chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+                let local = source.with_timezone(&chrono::Local);
+                assert_eq!(entry.timestamp, local.to_rfc3339());
+                assert_eq!(
+                    chrono::DateTime::parse_from_rfc3339(&entry.timestamp).unwrap(),
+                    source
+                );
+                // This is the date consumed by the runtime's recall renderer.
+                assert_eq!(&entry.timestamp[..10], local.format("%Y-%m-%d").to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn recalled_timestamps_preserve_missing_or_non_rfc3339_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let memory =
+            HindsightMemory::new(&HindsightConfig::default(), directory.path(), None, None)
+                .unwrap();
+        let scope = PrincipalScope::new("fixture-owner");
+        for timestamp in [None, Some(""), Some("unknown"), Some("2026-11-12")] {
+            let fact: Fact = serde_json::from_value(serde_json::json!({
+                "id": "fixture-fact", "text": "A project decision.",
+                "mentioned_at": timestamp,
+            }))
+            .unwrap();
+            assert_eq!(
+                memory.entry(&scope, fact).timestamp,
+                timestamp.unwrap_or_default()
+            );
+        }
+    }
+
     #[test]
     fn identity_reference_preserves_ui_missions_and_can_be_updated_or_disabled() {
         let mission = "Focus on architectural decisions.";

@@ -30,6 +30,16 @@ Use the normal secret configuration mechanism for service credentials. Never com
 
 Hindsight reflection is an optional built-in: full tool selection includes it; minimal selection can add `hindsight_reflect` to `[tools].optional`. Permission policy still controls its availability. Turning off automatic recall does not restore manual recall or write tools.
 
+## Recall dates
+
+Automatic recall date stamps use the host system timezone, matching live message
+timestamps. The backend converts the event timestamp (`occurred_start`), or the
+mention timestamp (`mentioned_at`) when no event timestamp is supplied, before
+rendering its calendar date. Timezone rules apply at the event's date, including
+daylight saving time. Hindsight's stored timestamps and original transcripts are
+unchanged; existing memories are localized when read. Missing timestamps remain
+unstamped, and non-RFC3339 values retain their existing rendering behavior.
+
 ## Public source adapter
 
 The public adapter accepts completed, successful turns from authenticated RPC Chat sessions and sender-scoped channels. Capture checks the admitted agent/principal against current session ownership and live channel admission policy. Anonymous legacy WebSocket sessions, unowned RPC sessions, ACP/Code, cron, nested work, and shared-room channel sessions are not automatic retention sources. Shared-room metadata currently records the latest sender, which is insufficient authority for a private memory bank.
