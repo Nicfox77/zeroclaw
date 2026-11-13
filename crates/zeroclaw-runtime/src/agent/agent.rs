@@ -6512,15 +6512,21 @@ mod tests {
         cfg.channels.session_persistence = true;
         cfg.channels.session_backend = "sqlite".into();
         cfg.agents.insert("fixture".into(), Default::default());
-        cfg.agents.get_mut("fixture").unwrap().memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight;
+        cfg.agents.get_mut("fixture").unwrap().memory.backend =
+            zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight;
         let live = zeroclaw_config::live::LiveConfig::new(cfg);
-        let memory = zeroclaw_memory::create_memory_for_agent_live(&live.handle(), "fixture", None).await.unwrap();
-        let mut agent = blank_input_agent(Box::new(MockModelProvider { responses: Mutex::new(Vec::new()) }));
+        let memory = zeroclaw_memory::create_memory_for_agent_live(&live.handle(), "fixture", None)
+            .await
+            .unwrap();
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        }));
         agent.memory = memory;
         agent.workspace_dir = dir.path().into();
         agent.agent_workspace_dir = dir.path().into();
         std::fs::write(dir.path().join("MEMORY.md"), "CURATED_NOTE_SENTINEL_7192").unwrap();
-        let stock = crate::agent::personality_templates::render("AGENTS.md", &Default::default()).unwrap();
+        let stock =
+            crate::agent::personality_templates::render("AGENTS.md", &Default::default()).unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), stock).unwrap();
         let prompt = agent.build_system_prompt().unwrap();
         assert!(prompt.contains("CURATED_NOTE_SENTINEL_7192"));
