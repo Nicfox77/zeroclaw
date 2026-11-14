@@ -142,6 +142,12 @@ Transport failures and cancellation preserve accumulated replayable reasoning
 with an interruption marker, even when no answer text was emitted. Transient
 thinking projections are not fabricated into finalized signed replay blocks.
 
+Canonical assistant content stores reasoning as `assistant.reasoning` opaque
+parts pointing to captured reasoning leaves. Transcript and memory ingestion
+keep reading the visible text parts; context restores reasoning separately.
+These parts require the updated context reader. Keep that reader when reverting
+other changes after new reasoning-bearing content has been recorded.
+
 Native streamed text and display reasoning are coalesced before capture, within
 the same protocol position and component, into batches of at most 4 KiB or
 100 ms. A provider's already larger fragment is preserved as received. The

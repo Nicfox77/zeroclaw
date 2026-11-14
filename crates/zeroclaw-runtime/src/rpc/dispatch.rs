@@ -30804,7 +30804,8 @@ mod tests {
                         agent.lock().await.history()
                     )
                     .iter()
-                    .any(|message| message.content.contains("fixture answer"))
+                    .any(|message| message.content.contains("fixture answer")
+                        && message.reasoning_content.as_deref() == Some("fixture durable thought"))
                 );
                 assert_eq!(
                     server.received_requests().await.expect("requests").len(),

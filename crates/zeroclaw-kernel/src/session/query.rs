@@ -924,6 +924,12 @@ impl SessionQuery {
                 zeroclaw_api::session_events::RecordedContentPart::File { file_id } => {
                     files.push(file_id.clone())
                 }
+                zeroclaw_api::session_events::RecordedContentPart::Opaque { type_name, .. }
+                    if type_name == "assistant.reasoning" =>
+                {
+                    // Known replay-only content remains outside visible text.
+                    reference += 1;
+                }
                 zeroclaw_api::session_events::RecordedContentPart::Opaque { .. } => {
                     unresolved_parts.push(part_index);
                     // Preserve the payload in the event graph while omitting

@@ -1023,7 +1023,19 @@ impl Recorder {
             }
             StreamEvent::TextDelta(chunk) => {
                 if let Some(reasoning) = &chunk.reasoning {
-                    blocks.push(self.reasoning(reasoning, false, &mut payloads)?);
+                    let mut block = self.reasoning(reasoning, false, &mut payloads)?;
+                    // Preserve the distinction from transient ThinkingDelta
+                    // projections when recovering replayable plain reasoning.
+                    if let ResponseBlock::Reasoning {
+                        representation_kind,
+                        replay_requirement,
+                        ..
+                    } = &mut block
+                    {
+                        *representation_kind = "plain_text_delta".into();
+                        *replay_requirement = "provider_defined".into();
+                    }
+                    blocks.push(block);
                 }
                 if !chunk.delta.is_empty() {
                     blocks.push(self.text(&chunk.delta, &mut payloads)?);

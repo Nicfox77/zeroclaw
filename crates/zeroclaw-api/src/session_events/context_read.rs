@@ -252,12 +252,25 @@ fn resolve_source(
                 ));
             }
             let mut text = String::new();
+            let mut reasoning = String::new();
             for part in content.parts {
                 match part {
                     RecordedContentPart::Text { text_ref } => text.push_str(
                         std::str::from_utf8(&present(store, &text_ref)?.body)
                             .map_err(|e| ReadError::Corrupt(e.to_string()))?,
                     ),
+                    RecordedContentPart::Opaque {
+                        type_name,
+                        body_ref,
+                    } if role == "assistant"
+                        && type_name == "assistant.reasoning"
+                        && body_ref.codec == "session.reasoning/v1" =>
+                    {
+                        reasoning.push_str(
+                            std::str::from_utf8(&present(store, &body_ref)?.body)
+                                .map_err(|e| ReadError::Corrupt(e.to_string()))?,
+                        );
+                    }
                     _ => {
                         return Err(ReadError::Corrupt(
                             "content source requires a complete chat representation".into(),
@@ -269,6 +282,9 @@ fn resolve_source(
             let is_user = role == "user";
             fields.insert("role".into(), role.into());
             fields.insert("content".into(), text.into());
+            if !reasoning.is_empty() {
+                fields.insert("reasoning_content".into(), reasoning.into());
+            }
             fields.insert("attachments".into(), serde_json::json!(attachments));
             let timestamp = if matches!(event.body.data, EventData::ContextProjectionCreated { .. })
             {
@@ -344,12 +360,23 @@ pub fn message_available(
                 ));
             }
             for part in content.parts {
-                let RecordedContentPart::Text { text_ref } = part else {
-                    return Err(ReadError::Corrupt(
-                        "content source requires a complete chat representation".into(),
-                    ));
+                let reference = match part {
+                    RecordedContentPart::Text { text_ref } => text_ref,
+                    RecordedContentPart::Opaque {
+                        type_name,
+                        body_ref,
+                    } if type_name == "assistant.reasoning"
+                        && body_ref.codec == "session.reasoning/v1" =>
+                    {
+                        body_ref
+                    }
+                    _ => {
+                        return Err(ReadError::Corrupt(
+                            "content source requires a complete chat representation".into(),
+                        ));
+                    }
                 };
-                if store.read_payload_disposition(&text_ref)? != PayloadDisposition::Present {
+                if store.read_payload_disposition(&reference)? != PayloadDisposition::Present {
                     return Ok(false);
                 }
             }

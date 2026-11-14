@@ -27,6 +27,23 @@ pub(super) fn resolve_message(
 }
 use zeroclaw_api::session_events::*;
 
+pub(super) fn replayable_reasoning(block: &ResponseBlock) -> Option<&StoredPayloadRef> {
+    match block {
+        ResponseBlock::Reasoning {
+            representation_kind,
+            payload_ref,
+            completion,
+            replay_requirement,
+        } if replay_requirement == "provider_defined"
+            && (representation_kind == "plain_text_delta"
+                || *completion == ContentCompletion::Complete) =>
+        {
+            Some(payload_ref)
+        }
+        _ => None,
+    }
+}
+
 fn present(
     store: &dyn SessionEventStore,
     reference: &StoredPayloadRef,
@@ -71,32 +88,75 @@ impl SessionCoordinator {
         let mut provenance_refs = Vec::new();
         let mut provider_parts = Vec::new();
         let mut provider_text = String::new();
-        if let Some(event) = self.store.read_latest_event(
-            stream,
-            branch,
-            Some(turn),
-            &EventKind::ProviderAttemptCompleted,
-        )? {
-            let EventData::ProviderAttemptCompleted { response_ref, .. } = &event.body.data else {
-                return Err(SessionError::InvocationMismatch);
-            };
-            let response: ProviderResponsePayload =
-                serde_json::from_slice(&present(self.store.as_ref(), response_ref)?.body)
-                    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
-            for (block_index, block) in response.blocks.iter().enumerate() {
-                if let ResponseBlock::Text { text_ref } = block {
-                    provider_text.push_str(
-                        std::str::from_utf8(&present(self.store.as_ref(), text_ref)?.body)
-                            .map_err(|error| ReadError::Corrupt(error.to_string()))?,
-                    );
-                    provider_parts.push(RecordedContentPart::Text {
-                        text_ref: text_ref.clone(),
-                    });
+        let mut provider_reasoning = String::new();
+        let mut provider_reasoning_parts = Vec::new();
+        let mut latest: Option<SessionEvent> = None;
+        for kind in [
+            EventKind::ProviderAttemptCompleted,
+            EventKind::ProviderAttemptFailed,
+            EventKind::InvocationOutcomeUnknown,
+            EventKind::InvocationCancelled,
+        ] {
+            if let Some(event) = self
+                .store
+                .read_latest_event(stream, branch, Some(turn), &kind)?
+                && latest
+                    .as_ref()
+                    .is_none_or(|previous| event.sequence > previous.sequence)
+            {
+                latest = Some(event);
+            }
+        }
+        if let Some(event) = latest {
+            let reference = match &event.body.data {
+                EventData::ProviderAttemptCompleted { response_ref, .. } => Some(response_ref),
+                EventData::ProviderAttemptFailed {
+                    partial_response_ref,
+                    ..
+                } => partial_response_ref.as_ref(),
+                EventData::InvocationOutcomeUnknown {
+                    observed_partial_ref,
+                    ..
                 }
-                provenance_refs.push(ProviderBlockRef {
-                    result_event_id: event.event_id.clone(),
-                    block_index,
-                });
+                | EventData::InvocationCancelled {
+                    observed_partial_ref,
+                    ..
+                } => observed_partial_ref.as_ref(),
+                _ => None,
+            };
+            if let Some(response_ref) = reference {
+                let completed =
+                    matches!(&event.body.data, EventData::ProviderAttemptCompleted { .. });
+                let response: ProviderResponsePayload =
+                    serde_json::from_slice(&present(self.store.as_ref(), response_ref)?.body)
+                        .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                for (block_index, block) in response.blocks.iter().enumerate() {
+                    if let Some(body_ref) = replayable_reasoning(block) {
+                        provider_reasoning.push_str(
+                            std::str::from_utf8(&present(self.store.as_ref(), body_ref)?.body)
+                                .map_err(|e| ReadError::Corrupt(e.to_string()))?,
+                        );
+                        provider_reasoning_parts.push(RecordedContentPart::Opaque {
+                            type_name: "assistant.reasoning".into(),
+                            body_ref: body_ref.clone(),
+                        });
+                    }
+                    if let ResponseBlock::Text { text_ref } = block {
+                        provider_text.push_str(
+                            std::str::from_utf8(&present(self.store.as_ref(), text_ref)?.body)
+                                .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                        );
+                        provider_parts.push(RecordedContentPart::Text {
+                            text_ref: text_ref.clone(),
+                        });
+                    }
+                    if completed {
+                        provenance_refs.push(ProviderBlockRef {
+                            result_event_id: event.event_id.clone(),
+                            block_index,
+                        });
+                    }
+                }
             }
         }
         let mut events = Vec::new();
@@ -127,7 +187,13 @@ impl SessionCoordinator {
             else {
                 continue;
             };
-            if chat.role != "assistant" || !chat.attachments.is_empty() {
+            if chat.role != "assistant"
+                || !chat.attachments.is_empty()
+                || !chat.tool_calls.is_empty()
+                || chat.tool_result.is_some()
+                || chat.timestamp.is_some()
+                || chat.recalled_memory.is_some()
+            {
                 continue;
             }
             let matching_provider = chat.content == provider_text;
@@ -149,6 +215,29 @@ impl SessionCoordinator {
                     text_ref: StoredPayloadRef::from(&leaf),
                 }];
                 plan.payloads.push(leaf);
+            }
+            if let Some(reasoning) = &chat.reasoning_content {
+                if reasoning == &provider_reasoning && !provider_reasoning_parts.is_empty() {
+                    parts.extend(provider_reasoning_parts.clone());
+                } else {
+                    let identity =
+                        canonical_json(&(creation, index, reasoning)).map_err(AppendError::from)?;
+                    let leaf = PayloadRecord::new(
+                        PayloadId::parse(format!(
+                            "context-reasoning-{}",
+                            Digest::from_bytes(&identity).as_str()
+                        ))
+                        .map_err(AppendError::from)?,
+                        "session.reasoning/v1".into(),
+                        reasoning.as_bytes().to_vec(),
+                    )
+                    .map_err(AppendError::from)?;
+                    parts.push(RecordedContentPart::Opaque {
+                        type_name: "assistant.reasoning".into(),
+                        body_ref: StoredPayloadRef::from(&leaf),
+                    });
+                    plan.payloads.push(leaf);
+                }
             }
             let content = super::retry::payload(
                 creation,
@@ -255,29 +344,44 @@ impl SessionCoordinator {
             let content: ContentPayload = serde_json::from_slice(&record.body)
                 .map_err(|e| ReadError::Corrupt(e.to_string()))?;
             let mut text = String::new();
+            let mut reasoning = String::new();
             let mut supported = true;
             for part in &content.parts {
-                if let RecordedContentPart::Text { text_ref } = part {
-                    let leaf = match extra_payloads
-                        .iter()
-                        .find(|p| p.payload_id == text_ref.payload_id)
+                let (text_ref, is_reasoning) = match part {
+                    RecordedContentPart::Text { text_ref } => (text_ref, false),
+                    RecordedContentPart::Opaque {
+                        type_name,
+                        body_ref,
+                    } if role == "assistant"
+                        && type_name == "assistant.reasoning"
+                        && body_ref.codec == "session.reasoning/v1" =>
                     {
-                        Some(p) => p.clone(),
-                        None => match self.store.read_payload(&text_ref.payload_id)? {
-                            PayloadRead::Present(p) => p,
-                            _ => {
-                                supported = false;
-                                break;
-                            }
-                        },
-                    };
-                    text.push_str(
-                        std::str::from_utf8(&leaf.body)
-                            .map_err(|e| ReadError::Corrupt(e.to_string()))?,
-                    );
+                        (body_ref, true)
+                    }
+                    _ => {
+                        supported = false;
+                        break;
+                    }
+                };
+                let leaf = match extra_payloads
+                    .iter()
+                    .find(|p| p.payload_id == text_ref.payload_id)
+                {
+                    Some(p) => p.clone(),
+                    None => match self.store.read_payload(&text_ref.payload_id)? {
+                        PayloadRead::Present(p) => p,
+                        _ => {
+                            supported = false;
+                            break;
+                        }
+                    },
+                };
+                let value = std::str::from_utf8(&leaf.body)
+                    .map_err(|e| ReadError::Corrupt(e.to_string()))?;
+                if is_reasoning {
+                    reasoning.push_str(value);
                 } else {
-                    supported = false;
-                    break;
+                    text.push_str(value);
                 }
             }
             if supported {
@@ -286,7 +390,7 @@ impl SessionCoordinator {
                     timestamp: (role == "user").then_some(event.occurred_at),
                     tool_calls: Vec::new(),
                     tool_result: None,
-                    reasoning_content: None,
+                    reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                     role: role.into(),
                     content: text,
 
