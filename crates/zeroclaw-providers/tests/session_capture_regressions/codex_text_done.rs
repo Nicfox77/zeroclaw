@@ -519,8 +519,17 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
             other => panic!("unexpected block: {other:?}"),
         })
         .collect();
+    // The delta and done suffix at this one position may now share a batch.
+    // Preserve all other part boundaries and their ordering in this assertion.
+    let text_parts: Vec<_> = texts
+        .iter()
+        .flat_map(|part| match (mode, part.as_str()) {
+            ("mixed_suffix", "中🙂") => vec!["中", "🙂"],
+            _ => vec![part.as_str()],
+        })
+        .collect();
     assert_eq!(
-        texts, expected,
+        text_parts, expected,
         "{backend} {mode} {ending} streaming={streaming}"
     );
     let mut offsets = std::collections::HashMap::new();
@@ -548,7 +557,7 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
             }
         }
     }
-    assert_eq!(segments, if mode == "legacy" { 0 } else { expected.len() });
+    assert_eq!(segments, if mode == "legacy" { 0 } else { texts.len() });
     if let Some(error_ref) = error_ref {
         let diagnostic: ProviderDiagnostic = h.payload(error_ref);
         assert_eq!(

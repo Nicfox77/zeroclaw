@@ -133,6 +133,15 @@ effect has one initial outcome: completed, failed, verified cancelled or unknown
 Progress checkpoints preserve durable partial text, reasoning, media and tool
 output. Content still in an uncommitted memory buffer cannot survive a crash.
 
+Native streamed text and display reasoning are coalesced before capture, within
+the same protocol position and component, into batches of at most 4 KiB or
+100 ms. A provider's already larger fragment is preserved as received. The
+deadline does not move as tokens arrive. Each batch commits before delivery;
+only the small, not-yet-delivered buffer can be lost on interruption. Tool calls,
+signed/finalized reasoning, metadata, position changes and terminal events remain
+boundaries. Errors and EOF flush preceding fragments before capture settles the
+partial outcome. The existing byte and retained-block limits remain enforced.
+
 Live conversation messages and tool results carry media references in their
 `attachments` fields, with an explicit kind and target. Channel ingress,
 uploads, steering, context transforms, recovery and provider preparation keep

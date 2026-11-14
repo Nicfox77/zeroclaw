@@ -6,6 +6,8 @@ use zeroclaw_api::session_events::capture::{
 };
 use zeroclaw_api::session_events::*;
 
+mod coalesce;
+
 // A synchronous response API can consume an asynchronous wire protocol. The
 // existing dispatch owns the sole recorder; the adapter only lends observed
 // observations to it. Nested composite dispatches mask their parent's scope.
@@ -1234,7 +1236,7 @@ pub(super) fn stream_events(
         stopped: bool,
     }
     let state = State {
-        inner,
+        inner: coalesce::stream(inner),
         admission: Some((admission, intent)),
         recorder: None,
         stopped: false,

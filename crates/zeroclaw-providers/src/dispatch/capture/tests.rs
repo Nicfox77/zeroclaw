@@ -12,6 +12,106 @@ use zeroclaw_kernel::session::{
 struct Allow;
 
 #[tokio::test]
+async fn tiny_fragment_streams_exceed_the_old_limit_with_durable_batches() {
+    for backend in ["sqlite", "jsonl"] {
+        for interrupted in [false, true] {
+            let h = Harness::new(backend);
+            let provider = Leaf {
+                store: h.store.clone(),
+                stream: h.stream.clone(),
+                error: false,
+            };
+            // More native fragments than the retained block cap. Each pair
+            // has the same protocol coordinate, as chat-completion tokens do.
+            let mut input = Vec::new();
+            for _ in 0..20_000 {
+                input.push(Ok(StreamEvent::ContentPosition(
+                    zeroclaw_api::model_provider::ProviderContentPosition {
+                        output_index: 0,
+                        content_index: None,
+                    },
+                )));
+                input.push(Ok(StreamEvent::ThinkingDelta("α".into())));
+            }
+            if interrupted {
+                input.push(Err(zeroclaw_api::model_provider::StreamError::Http(
+                    "fixture interrupted".into(),
+                )));
+            } else {
+                input.push(Ok(StreamEvent::Final));
+            }
+            scope_provider_capture(h.admission.clone(), async {
+                let mut output = stream_events(
+                    stream::iter(input).boxed(),
+                    &provider,
+                    intent(&provider, "fixture", &[], None, None, None),
+                );
+                let mut displayed = String::new();
+                while let Some(event) = output.next().await {
+                    match event {
+                        Ok(StreamEvent::ThinkingDelta(text)) => {
+                            assert_eq!(
+                                h.events().last().unwrap().body.kind(),
+                                EventKind::ProviderResponseProgressObserved
+                            );
+                            displayed.push_str(&text);
+                        }
+                        Err(error) => {
+                            assert!(interrupted);
+                            assert!(zeroclaw_api::session_events::capture::is_capture_stopped(
+                                &anyhow::Error::new(error)
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(displayed, "α".repeat(20_000));
+            })
+            .await;
+            let events = h.events();
+            let reference = match &events.last().unwrap().body.data {
+                EventData::ProviderAttemptCompleted { response_ref, .. } => {
+                    assert!(!interrupted);
+                    response_ref
+                }
+                EventData::InvocationOutcomeUnknown {
+                    observed_partial_ref: Some(response_ref),
+                    error_ref: Some(error_ref),
+                    ..
+                } => {
+                    assert!(interrupted);
+                    let diagnostic: ProviderDiagnostic = h.payload(error_ref);
+                    let DiagnosticDetail::Available { detail_ref } = diagnostic.detail else {
+                        panic!("diagnostic detail")
+                    };
+                    assert!(
+                        String::from_utf8(h.bytes(&detail_ref))
+                            .unwrap()
+                            .contains("fixture interrupted")
+                    );
+                    response_ref
+                }
+                other => panic!("unexpected terminal: {other:?}"),
+            };
+            let response: ProviderResponsePayload = h.payload(reference);
+            assert!(
+                response.blocks.len() < 100,
+                "fragment index must be batched"
+            );
+            let bytes: Vec<u8> = response
+                .blocks
+                .iter()
+                .flat_map(|b| match b {
+                    ResponseBlock::Reasoning { payload_ref, .. } => h.bytes(payload_ref),
+                    other => panic!("unexpected block {other:?}"),
+                })
+                .collect();
+            assert_eq!(bytes, "α".repeat(20_000).as_bytes());
+        }
+    }
+}
+
+#[tokio::test]
 async fn provider_content_metadata_survives_complete_and_interrupted_capture() {
     for backend in ["sqlite", "jsonl"] {
         for streamed in [false, true] {

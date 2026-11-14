@@ -3113,6 +3113,9 @@ fn sse_bytes_to_events_for_contract(
         let mut saw_completion = false;
         let mut saw_done = false;
         let mut frame_open = false;
+        // Stream-local cursor over the attribution already emitted. Repeated
+        // model fields on token frames do not represent new attribution facts.
+        let mut served_model = None;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -3190,9 +3193,12 @@ fn sse_bytes_to_events_for_contract(
                         };
 
                         if let Some(model) = &chunk.model
-                            && tx.send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"served_attribution","protocol":"openai_chat","model":model})))).await.is_err()
+                            && served_model.as_ref() != Some(model)
                         {
-                            return;
+                            if tx.send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"served_attribution","protocol":"openai_chat","model":model})))).await.is_err() {
+                                return;
+                            }
+                            served_model = Some(model.clone());
                         }
                         let mut should_emit_tool_calls = false;
                         for (choice_index, choice) in chunk.choices.iter().enumerate() {
