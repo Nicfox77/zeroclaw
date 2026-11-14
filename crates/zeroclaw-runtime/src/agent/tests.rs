@@ -350,6 +350,43 @@ fn build_agent_with(
         .unwrap()
 }
 
+#[tokio::test]
+async fn reasoning_survives_final_replies_and_both_retention_paths() {
+    let reasoning = "{\"thinking\":\"fixture\",\"signature\":\"fixture-signed\"}\n";
+    let provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+        output_blocks: vec![],
+        text: Some("answer".into()),
+        tool_calls: vec![],
+        usage: None,
+        reasoning_content: Some(reasoning.into()),
+    }]));
+    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+    assert_eq!(agent.turn("fixture").await.unwrap(), "answer");
+    let snapshot = agent.retained_context_snapshot();
+    let messages: Vec<_> = snapshot
+        .retained_messages
+        .iter()
+        .flat_map(|m| m.chat_messages())
+        .collect();
+    let reply = messages.iter().find(|m| m.role == "assistant").unwrap();
+    assert_eq!(reply.reasoning_content.as_deref(), Some(reasoning));
+    let snapshot = crate::agent::turn::retained_context_snapshot(&messages, false);
+    assert!(
+        snapshot
+            .retained_messages
+            .iter()
+            .flat_map(|m| m.chat_messages())
+            .any(|m| m.reasoning_content.as_deref() == Some(reasoning))
+    );
+    assert!(
+        messages
+            .iter()
+            .map(|m| m.estimated_context_tokens())
+            .sum::<usize>()
+            > 0
+    );
+}
+
 fn build_agent_with_memory(
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,

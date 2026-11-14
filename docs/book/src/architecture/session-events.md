@@ -133,6 +133,15 @@ effect has one initial outcome: completed, failed, verified cancelled or unknown
 Progress checkpoints preserve durable partial text, reasoning, media and tool
 output. Content still in an uncommitted memory buffer cannot survive a crash.
 
+Assistant reasoning stays in its structured reasoning field across final replies,
+tool rounds and retained-context snapshots. Provider adapters retain ownership
+of replay formatting, including signed or opaque payloads; reasoning is not
+inserted into the visible answer. It counts toward the ordinary context budget
+and follows turn trimming and compaction with the rest of the message.
+Transport failures and cancellation preserve accumulated replayable reasoning
+with an interruption marker, even when no answer text was emitted. Transient
+thinking projections are not fabricated into finalized signed replay blocks.
+
 Native streamed text and display reasoning are coalesced before capture, within
 the same protocol position and component, into batches of at most 4 KiB or
 100 ms. A provider's already larger fragment is preserved as received. The

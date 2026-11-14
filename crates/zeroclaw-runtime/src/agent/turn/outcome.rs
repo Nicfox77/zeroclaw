@@ -142,6 +142,7 @@ pub fn context_window_exceeded_from_error(err: &anyhow::Error) -> Option<&Contex
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
+    pub(crate) partial_reasoning: String,
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
     pub(crate) cause: zeroclaw_providers::ReliableProviderTerminalFailure,
@@ -395,6 +396,7 @@ pub fn append_safeguard_fallback_notice(
 #[derive(Debug)]
 pub(crate) struct StreamCancelledAfterOutput {
     pub(crate) partial_text: String,
+    pub(crate) partial_reasoning: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
     cause: ToolLoopCancelled,
 }
@@ -406,6 +408,7 @@ impl StreamCancelledAfterOutput {
     ) -> Self {
         Self {
             partial_text,
+            partial_reasoning: String::new(),
             usage,
             cause: ToolLoopCancelled,
         }

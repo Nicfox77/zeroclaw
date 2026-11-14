@@ -277,7 +277,9 @@ pub(crate) async fn interpret_chat_response(
             &calls,
             reasoning_content.as_deref(),
         )
-        .unwrap_or_else(|| ChatMessage::assistant(&response_text))
+        .unwrap_or_else(|| {
+            build_native_assistant_history(&response_text, &[], reasoning_content.as_deref())
+        })
     } else {
         build_native_assistant_history(
             &response_text,

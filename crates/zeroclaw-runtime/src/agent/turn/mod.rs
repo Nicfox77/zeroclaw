@@ -121,18 +121,6 @@ pub(crate) fn retained_context_snapshot(
                         if chat.role == "system"
                 )
             })
-            .map(|message| match message {
-                zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                    text,
-                    tool_calls,
-                    reasoning_content: _,
-                } => zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                    text,
-                    tool_calls,
-                    reasoning_content: None,
-                },
-                other => other,
-            })
             .collect(),
         breadcrumb,
     }
@@ -3155,26 +3143,32 @@ async fn run_tool_call_loop_body<'a>(
                 // partial with the interruption marker so wrappers/channels
                 // can commit what the consumer already saw.
                 if let Some(interrupted) = e.downcast_ref::<outcome::StreamInterruptedAfterOutput>()
-                    && !interrupted.partial_text.is_empty()
+                    && (!interrupted.partial_text.is_empty()
+                        || !interrupted.partial_reasoning.is_empty())
                 {
-                    let msg = ChatMessage::assistant(format!(
+                    let mut msg = ChatMessage::assistant(format!(
                         "{}\n\n{}",
                         interrupted.partial_text,
                         crate::i18n::get_required_cli_string("turn-stream-interrupted")
                     ));
+                    msg.reasoning_content = (!interrupted.partial_reasoning.is_empty())
+                        .then(|| interrupted.partial_reasoning.clone());
                     turn_state.push_dual(msg);
                 }
                 // Same for a user cancel after visible streamed output —
                 // the pre-consolidation streaming engine committed the
                 // watched partial with this exact marker.
                 if let Some(cancelled) = e.downcast_ref::<outcome::StreamCancelledAfterOutput>()
-                    && !cancelled.partial_text.is_empty()
+                    && (!cancelled.partial_text.is_empty()
+                        || !cancelled.partial_reasoning.is_empty())
                 {
-                    let msg = ChatMessage::assistant(format!(
+                    let mut msg = ChatMessage::assistant(format!(
                         "{}\n\n{}",
                         cancelled.partial_text,
                         crate::i18n::get_required_cli_string("turn-interrupted-by-user")
                     ));
+                    msg.reasoning_content = (!cancelled.partial_reasoning.is_empty())
+                        .then(|| cancelled.partial_reasoning.clone());
                     turn_state.push_dual(msg);
                 }
                 return Err(if recovered == ContextRecovery::Unrecoverable {
@@ -3421,7 +3415,7 @@ async fn run_tool_call_loop_body<'a>(
                     .await?;
             }
 
-            let msg = ChatMessage::assistant(response_text.clone());
+            let msg = assistant_history_content;
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
                 // Terminal response: no next request will be dispatched, so no

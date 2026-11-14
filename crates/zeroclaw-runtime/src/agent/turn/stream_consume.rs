@@ -206,14 +206,15 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     // Cancel after visible streamed text: persist-worthy,
                     // exactly like the pre-consolidation engine's
                     // committed-partial-on-cancel.
-                    if forwarded_text.is_empty() {
+                    if forwarded_text.is_empty() && outcome.reasoning_content.is_empty() {
                         return Err(StreamCancelledWithUsage::new(outcome.usage).into());
                     }
-                    return Err(StreamCancelledAfterOutput::with_usage(
+                    let mut cancelled = StreamCancelledAfterOutput::with_usage(
                         forwarded_text,
                         outcome.usage,
-                    )
-                    .into());
+                    );
+                    cancelled.partial_reasoning = outcome.reasoning_content;
+                    return Err(cancelled.into());
                 }
                 chunk = provider_stream.next() => chunk,
             }
@@ -250,7 +251,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
-                if visible_event_output {
+                if visible_event_output || !outcome.reasoning_content.is_empty() {
                     let provider_error = anyhow::Error::msg(message.clone());
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
@@ -269,6 +270,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     .with_terminal_cause(anyhow::Error::new(err));
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
+                        partial_reasoning: outcome.reasoning_content,
                         message,
                         usage,
                         cause,
@@ -530,6 +532,71 @@ mod tests {
     use zeroclaw_providers::traits::{
         ChatResponse, ProviderCapabilities, StreamOptions, StreamResult, TokenUsage,
     };
+
+    struct ReasoningOnlyThenError;
+    impl zeroclaw_api::attribution::Attributable for ReasoningOnlyThenError {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "reasoning-fixture"
+        }
+    }
+    #[async_trait]
+    impl ModelProvider for ReasoningOnlyThenError {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("stream fixture")
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+        fn stream_chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                    "unfinished fixture reasoning",
+                ))),
+                Err(zeroclaw_api::model_provider::StreamError::Http(
+                    "fixture interrupted".into(),
+                )),
+            ])
+            .boxed()
+        }
+    }
+    #[tokio::test]
+    async fn reasoning_only_interruption_is_retained_without_a_display_sink() {
+        let error = consume_provider_streaming_response(
+            &ReasoningOnlyThenError,
+            &[ChatMessage::user("fixture")],
+            None,
+            "fixture",
+            None,
+            None,
+            None,
+            None,
+            false,
+            StreamReasoningMode::Status,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let partial = error
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .unwrap();
+        assert_eq!(partial.partial_reasoning, "unfinished fixture reasoning");
+        assert!(partial.partial_text.is_empty());
+    }
 
     struct ToolThenTextProvider;
 

@@ -1418,18 +1418,7 @@ impl Agent {
                         ConversationMessage::Chat(chat) if chat.role == "system"
                     )
                 })
-                .map(|message| match message {
-                    ConversationMessage::AssistantToolCalls {
-                        text,
-                        tool_calls,
-                        reasoning_content: _,
-                    } => ConversationMessage::AssistantToolCalls {
-                        text: text.clone(),
-                        tool_calls: tool_calls.clone(),
-                        reasoning_content: None,
-                    },
-                    other => other.clone(),
-                })
+                .cloned()
                 .collect(),
             breadcrumb: self.history_has_trim_breadcrumb,
         }
@@ -1456,7 +1445,7 @@ impl Agent {
         let is_marker = matches!(
             history.last(),
             Some(ConversationMessage::Chat(message))
-                if message.role == "assistant" && message.content == marker
+                if message.role == "assistant" && message.content == marker && message.reasoning_content.is_none()
         );
         if is_marker {
             history.pop();
