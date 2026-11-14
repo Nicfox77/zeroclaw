@@ -378,12 +378,9 @@ async fn reasoning_survives_final_replies_and_both_retention_paths() {
             .flat_map(|m| m.chat_messages())
             .any(|m| m.reasoning_content.as_deref() == Some(reasoning))
     );
-    assert!(
-        messages
-            .iter()
-            .map(|m| m.estimated_context_tokens())
-            .sum::<usize>()
-            > 0
+    assert_eq!(
+        reply.context_text_bytes(),
+        ChatMessage::assistant(&reply.content).context_text_bytes() + reasoning.len()
     );
 }
 
