@@ -278,7 +278,9 @@ pub(crate) async fn interpret_chat_response(
             reasoning_content.as_deref(),
         )
         .unwrap_or_else(|| {
-            build_native_assistant_history(&response_text, &[], reasoning_content.as_deref())
+            let mut message = ChatMessage::assistant(&response_text);
+            message.reasoning_content = reasoning_content.clone();
+            message
         })
     } else {
         build_native_assistant_history(
