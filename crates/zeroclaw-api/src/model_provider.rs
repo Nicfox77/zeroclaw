@@ -305,7 +305,7 @@ impl ChatMessage {
             }])
         } else if self.role == "assistant"
             && self.attachments.is_empty()
-            && (!self.tool_calls.is_empty() || self.reasoning_content.is_some())
+            && !self.tool_calls.is_empty()
         {
             ConversationMessage::AssistantToolCalls {
                 text: (!self.content.is_empty()).then_some(self.content),
