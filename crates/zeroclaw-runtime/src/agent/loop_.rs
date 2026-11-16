@@ -627,7 +627,7 @@ fn mcp_tool_included_for_turn(
             return false;
         }
         match group.mode {
-            ToolFilterGroupMode::Always => true,
+            ToolFilterGroupMode::Always | ToolFilterGroupMode::Discoverable => true,
             ToolFilterGroupMode::Dynamic => group
                 .keywords
                 .iter()
@@ -18449,6 +18449,67 @@ Let me check the result."#;
         let guard = activated.lock().unwrap();
         assert!(guard.is_activated("files__list"));
         assert!(!guard.is_activated("lights__get_state"));
+    }
+
+    #[tokio::test]
+    async fn discoverable_groups_preserve_search_without_preactivating_optional_tools() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+        let deferred = make_deferred_set(&["jobs__start", "admin__inspect"]).await;
+        let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let mut groups = always_group(&["jobs__start"]);
+        groups.push(ToolFilterGroup {
+            mode: ToolFilterGroupMode::Discoverable,
+            tools: vec!["*".into()],
+            keywords: vec![],
+        });
+        let names =
+            super::preactivate_always_filter_groups(&deferred, &activated, &groups, None, None);
+        assert_eq!(names, mcp_set(&["jobs__start"]));
+        assert!(activated.lock().unwrap().is_activated("jobs__start"));
+        assert!(!activated.lock().unwrap().is_activated("admin__inspect"));
+        // Once discovered, optional schemas remain eligible even for a short
+        // user message that contains no administrative keyword.
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("jobs__start"),
+            make_spec("admin__inspect"),
+        ];
+        let filtered = filter_tool_specs_for_turn(
+            specs,
+            &groups,
+            "ok",
+            &mcp_set(&["jobs__start", "admin__inspect"]),
+        );
+        assert_eq!(filtered.len(), 3);
+        let excluded = super::compute_excluded_mcp_tools(
+            &counting_registry(&["shell", "jobs__start", "admin__inspect"]),
+            &groups,
+            "ok",
+            &mcp_set(&["jobs__start", "admin__inspect"]),
+        );
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn discoverable_groups_still_filter_unmatched_mcp_tools() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Discoverable,
+            tools: vec!["files__*".into()],
+            keywords: vec![],
+        }];
+        let filtered = filter_tool_specs_for_turn(
+            vec![
+                make_spec("shell"),
+                make_spec("files__read"),
+                make_spec("admin__inspect"),
+            ],
+            &groups,
+            "",
+            &mcp_set(&["files__read", "admin__inspect"]),
+        );
+        let names: Vec<_> = filtered.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(names, vec!["shell", "files__read"]);
     }
 
     #[tokio::test]

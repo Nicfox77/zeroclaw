@@ -6630,6 +6630,10 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
 pub enum ToolFilterGroupMode {
     /// Tools in this group are always included in every turn.
     Always,
+    /// Tools in this group are eligible every turn, but are not pre-activated
+    /// under MCP deferred loading. Their schemas are loaded through tool_search.
+    /// With eager MCP loading they follow normal eager exposure.
+    Discoverable,
     /// Tools in this group are included only when the user message contains
     /// at least one of the configured `keywords` (case-insensitive substring match).
     #[default]
@@ -6649,7 +6653,8 @@ pub enum ToolFilterGroupMode {
 ///
 /// Under `[mcp] deferred_loading = true`, `mode = "always"` entries are
 /// pre-activated at assembly time so matching tools are live from the first
-/// turn without a `tool_search` round-trip.
+/// turn without a `tool_search` round-trip. `mode = "discoverable"` keeps matching
+/// tools eligible for search without pre-activating their schemas.
 ///
 /// # Example
 /// ```toml
@@ -6673,7 +6678,7 @@ pub struct ToolFilterGroup {
     #[serde(default)]
     pub tools: Vec<String>,
     /// Keywords that activate this group in `dynamic` mode (case-insensitive substring).
-    /// Ignored when `mode = "always"`.
+    /// Ignored for `always` and `discoverable` modes.
     #[serde(default)]
     pub keywords: Vec<String>,
 }
@@ -30354,6 +30359,32 @@ mod tests {
             serde_json::to_value(&cfg).unwrap()["tls_ca_cert_path"],
             "/etc/zeroclaw/internal-ca.pem"
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn tool_filter_group_discoverable_round_trips_without_changing_defaults() {
+        let group: super::ToolFilterGroup = toml::from_str(
+            r#"
+            mode = "discoverable"
+            tools = ["admin__*"]
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            group.mode,
+            super::ToolFilterGroupMode::Discoverable
+        ));
+        let encoded = toml::to_string(&group).unwrap();
+        let decoded: super::ToolFilterGroup = toml::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded.mode,
+            super::ToolFilterGroupMode::Discoverable
+        ));
+        assert!(decoded.keywords.is_empty());
+        assert!(matches!(
+            super::ToolFilterGroupMode::default(),
+            super::ToolFilterGroupMode::Dynamic
+        ));
     }
 
     #[::core::prelude::v1::test]

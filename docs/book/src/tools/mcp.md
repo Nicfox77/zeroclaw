@@ -195,6 +195,32 @@ The MCP `__` auto-admit exception is scoped to the **risk profile**'s `allowed_t
 
 See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.
 
+### Keep a small eager core with optional discovery
+
+With `mcp.deferred_loading = true`, `always` filter groups pre-activate matching
+MCP tools. Use `discoverable` for tools that should remain available through
+`tool_search` without loading their schemas upfront:
+
+```toml
+[mcp]
+deferred_loading = true
+
+[[runtime_profiles.default.tool_filter_groups]]
+mode = "always"
+tools = ["jobs__start", "jobs__status"]
+
+[[runtime_profiles.default.tool_filter_groups]]
+mode = "discoverable"
+tools = ["*"]
+```
+
+The wildcard keeps the remaining admitted MCP tools searchable for every user
+message. It does not override risk-profile exclusions, caller allowlists or
+approval requirements. `discoverable` ignores keywords and does not pre-activate
+tools; with eager MCP loading it behaves like ordinary eager inclusion. Existing
+`always` and keyword-based `dynamic` groups retain their behavior. Built-in
+schema deferral is configured independently with `deferred_builtin_tools`.
+
 ## MCP Resources and Prompts
 
 In addition to MCP **tools**, ZeroClaw exposes MCP **resources** and **prompts**
