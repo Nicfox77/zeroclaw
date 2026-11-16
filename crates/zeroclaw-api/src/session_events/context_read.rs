@@ -253,28 +253,52 @@ fn resolve_source(
             }
             let mut text = String::new();
             let mut reasoning = String::new();
-            for part in content.parts {
-                match part {
-                    RecordedContentPart::Text { text_ref } => text.push_str(
-                        std::str::from_utf8(&present(store, &text_ref)?.body)
-                            .map_err(|e| ReadError::Corrupt(e.to_string()))?,
-                    ),
-                    RecordedContentPart::Opaque {
-                        type_name,
-                        body_ref,
-                    } if role == "assistant"
-                        && type_name == "assistant.reasoning"
-                        && body_ref.codec == "session.reasoning/v1" =>
-                    {
-                        reasoning.push_str(
-                            std::str::from_utf8(&present(store, &body_ref)?.body)
-                                .map_err(|e| ReadError::Corrupt(e.to_string()))?,
-                        );
-                    }
-                    _ => {
-                        return Err(ReadError::Corrupt(
+            // Stream capture keeps immutable fragments. Resolve their bodies
+            // in bounded batches rather than opening a transaction per token.
+            for parts in content.parts.chunks(256) {
+                let references = parts
+                    .iter()
+                    .map(|part| match part {
+                        RecordedContentPart::Text { text_ref } => Ok((text_ref, false)),
+                        RecordedContentPart::Opaque {
+                            type_name,
+                            body_ref,
+                        } if role == "assistant"
+                            && type_name == "assistant.reasoning"
+                            && body_ref.codec == "session.reasoning/v1" =>
+                        {
+                            Ok((body_ref, true))
+                        }
+                        _ => Err(ReadError::Corrupt(
                             "content source requires a complete chat representation".into(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let ids: Vec<_> = references
+                    .iter()
+                    .map(|(r, _)| r.payload_id.clone())
+                    .collect();
+                let records = store.read_payloads(&ids)?;
+                if records.len() != references.len() {
+                    return Err(ReadError::Corrupt(
+                        "context payload batch length mismatch".into(),
+                    ));
+                }
+                for ((reference, is_reasoning), record) in references.into_iter().zip(records) {
+                    let PayloadRead::Present(record) = record else {
+                        return Err(ReadError::OriginalPayloadErased(
+                            "context source content unavailable".into(),
                         ));
+                    };
+                    if StoredPayloadRef::from(&record) != *reference {
+                        return Err(ReadError::Corrupt("context reference mismatch".into()));
+                    }
+                    let value = std::str::from_utf8(&record.body)
+                        .map_err(|e| ReadError::Corrupt(e.to_string()))?;
+                    if is_reasoning {
+                        reasoning.push_str(value);
+                    } else {
+                        text.push_str(value);
                     }
                 }
             }

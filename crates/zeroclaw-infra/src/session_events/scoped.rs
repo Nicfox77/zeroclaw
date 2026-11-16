@@ -350,6 +350,9 @@ impl SessionEventStore for ScopedEventStore {
     fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
         self.store.read_payload(id)
     }
+    fn read_payloads(&self, ids: &[PayloadId]) -> Result<Vec<PayloadRead>, ReadError> {
+        self.store.read_payloads(ids)
+    }
     fn read_payload_disposition(
         &self,
         reference: &zeroclaw_api::session_events::StoredPayloadRef,

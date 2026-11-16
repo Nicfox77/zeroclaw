@@ -388,9 +388,7 @@ impl zeroclaw_api::session_events::capture::SessionContextPort for EngineSession
     }
 
     async fn restore_context(&self) -> anyhow::Result<Option<ContextSnapshot>> {
-        self.maintain_summary_deck().await?;
-        let event = self.latest_context().await?;
-        self.read_context_snapshot(event).await
+        Ok(self.read_maintained_context().await?.snapshot)
     }
 
     async fn prepare_context(
@@ -451,11 +449,26 @@ impl zeroclaw_api::session_events::capture::SessionContextPort for EngineSession
         if !main && self.summary_policy().await?.is_none() {
             return Ok(context);
         }
+        let replace_started = std::time::Instant::now();
         self.replace_context(context.clone(), reason).await?;
-        self.maintain_summary_deck().await?;
-        self.read_context_snapshot(self.latest_context().await?)
-            .await?
-            .ok_or_else(|| anyhow::Error::msg("summary_deck_context_missing"))
+        let summary_started = std::time::Instant::now();
+        let prepared = self.read_maintained_context().await?;
+        let snapshot = prepared
+            .snapshot
+            .ok_or_else(|| anyhow::Error::msg("summary_deck_context_missing"))?;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(serde_json::json!({
+                    "reason": reason,
+                    "context_replace_ms": summary_started.duration_since(replace_started).as_millis(),
+                    "summary_maintenance_ms": prepared.maintenance_time.as_millis(),
+                    "context_read_ms": prepared.read_time.as_millis(),
+                    "context_view_reused": prepared.reused,
+                })),
+            "session_context_preparation_timing"
+        );
+        Ok(snapshot)
     }
 
     async fn summarize_context(

@@ -188,11 +188,10 @@ impl ValidationSnapshot {
 }
 
 impl SqliteEventStore {
-    fn payload_disposition(
+    fn payload_validation(
         &self,
         conn: &Connection,
-        id: &PayloadId,
-    ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
+    ) -> Result<parking_lot::MutexGuard<'_, Option<ValidationSnapshot>>, ReadError> {
         let revision = checkpoints::canonical_revision(conn)?;
         let mut cached = self.validation.lock();
         if cached
@@ -218,7 +217,16 @@ impl SqliteEventStore {
                 })
             };
         }
-        Ok(cached
+        Ok(cached)
+    }
+
+    fn payload_disposition(
+        &self,
+        conn: &Connection,
+        id: &PayloadId,
+    ) -> Result<zeroclaw_api::session_events::payloads::PayloadDisposition, ReadError> {
+        Ok(self
+            .payload_validation(conn)?
             .as_ref()
             .ok_or_else(|| ReadError::Corrupt("read snapshot reconstruction missing".into()))?
             .disposition(id))
@@ -1006,37 +1014,58 @@ impl SessionEventStore for SqliteEventStore {
     }
 
     fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError> {
+        self.read_payloads(std::slice::from_ref(payload_id))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ReadError::Corrupt("payload batch result missing".into()))
+    }
+
+    fn read_payloads(&self, payload_ids: &[PayloadId]) -> Result<Vec<PayloadRead>, ReadError> {
+        if payload_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;
-        let row: Option<SqlitePayloadRow> = conn
-            .query_row(
+        let validation = self.payload_validation(&conn)?;
+        let validation = validation
+            .as_ref()
+            .ok_or_else(|| ReadError::Corrupt("read snapshot reconstruction missing".into()))?;
+        let mut statement = conn
+            .prepare_cached(
                 "SELECT payload_id, codec, body FROM event_payloads WHERE payload_id=?1",
-                params![payload_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()
             .map_err(read_error)?;
-        let Some((id, codec, body)) = row else {
-            return Err(ReadError::PayloadMissing(payload_id.to_string()));
-        };
-        use zeroclaw_api::session_events::payloads::PayloadDisposition;
-        match self.payload_disposition(&conn, payload_id)? {
-            PayloadDisposition::ErasurePending => return Ok(PayloadRead::ErasurePending),
-            PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
-            PayloadDisposition::Present => {}
-        }
-        let body = body.ok_or_else(|| {
-            ReadError::Corrupt("body missing without erasure evidence".to_owned())
-        })?;
-        let record = PayloadRecord {
-            payload_id: PayloadId::from(id),
-            codec,
-            body,
-        };
-        record
-            .validate()
-            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
-        Ok(PayloadRead::Present(record))
+        payload_ids
+            .iter()
+            .map(|payload_id| {
+                let row: Option<SqlitePayloadRow> = statement
+                    .query_row(params![payload_id.as_str()], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()
+                    .map_err(read_error)?;
+                let (id, codec, body) =
+                    row.ok_or_else(|| ReadError::PayloadMissing(payload_id.to_string()))?;
+                use zeroclaw_api::session_events::payloads::PayloadDisposition;
+                match validation.disposition(payload_id) {
+                    PayloadDisposition::ErasurePending => return Ok(PayloadRead::ErasurePending),
+                    PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
+                    PayloadDisposition::Present => {}
+                }
+                let body = body.ok_or_else(|| {
+                    ReadError::Corrupt("body missing without erasure evidence".into())
+                })?;
+                let record = PayloadRecord {
+                    payload_id: PayloadId::from(id),
+                    codec,
+                    body,
+                };
+                record
+                    .validate()
+                    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                Ok(PayloadRead::Present(record))
+            })
+            .collect()
     }
 
     fn read_payload_disposition(
@@ -1790,6 +1819,58 @@ mod conformance {
     }
 
     #[test]
+    fn sqlite_payload_batches_preserve_order_duplicates_and_missing_errors() {
+        let dir = TempDir::new().expect("directory");
+        let store = SqliteEventStore::open(dir.path()).expect("store");
+        let stream = SessionId::new();
+        let records: Vec<_> = (0..3)
+            .map(|i| {
+                PayloadRecord::new(
+                    PayloadId::new(),
+                    "session.text/v1".into(),
+                    format!("fragment {i}").into_bytes(),
+                )
+                .expect("payload")
+            })
+            .collect();
+        let mut events = vec![root(&stream)];
+        for record in &records {
+            events.push(
+                SessionEvent::typed(
+                    stream.clone(),
+                    EventData::SessionMetadataChanged {
+                        field: "title".into(),
+                        new_value_ref: StoredPayloadRef::from(record),
+                    },
+                    EventActor::default(),
+                )
+                .expect("event"),
+            );
+        }
+        store
+            .append_batch(batch(&store, &stream, events, records.clone()))
+            .expect("seed");
+        let ids = [
+            records[2].payload_id.clone(),
+            records[0].payload_id.clone(),
+            records[2].payload_id.clone(),
+        ];
+        assert_eq!(
+            store.read_payloads(&ids).expect("batch"),
+            vec![
+                PayloadRead::Present(records[2].clone()),
+                PayloadRead::Present(records[0].clone()),
+                PayloadRead::Present(records[2].clone())
+            ]
+        );
+        assert!(store.read_payloads(&[]).expect("empty").is_empty());
+        assert!(matches!(
+            store.read_payloads(&[records[0].payload_id.clone(), PayloadId::new()]),
+            Err(ReadError::PayloadMissing(_))
+        ));
+    }
+
+    #[test]
     fn sqlite_payload_reads_do_not_reparse_history_for_every_context_item() {
         let dir = TempDir::new().expect("directory");
         let store = SqliteEventStore::open(dir.path()).expect("store");
@@ -1941,6 +2022,12 @@ mod conformance {
             reader.read_payload(&payload.payload_id).expect("pending"),
             PayloadRead::ErasurePending
         );
+        assert_eq!(
+            reader
+                .read_payloads(&[payload.payload_id.clone(), payload.payload_id.clone()])
+                .expect("pending batch"),
+            vec![PayloadRead::ErasurePending, PayloadRead::ErasurePending]
+        );
         let confirm = SessionEvent::typed(
             stream.clone(),
             EventData::PayloadRedacted {
@@ -1955,6 +2042,12 @@ mod conformance {
         assert_eq!(
             reader.read_payload(&payload.payload_id).expect("redacted"),
             PayloadRead::Redacted
+        );
+        assert_eq!(
+            reader
+                .read_payloads(std::slice::from_ref(&payload.payload_id))
+                .expect("redacted batch"),
+            vec![PayloadRead::Redacted]
         );
         // A peer's invalid envelope must invalidate the read view and fail closed.
         writer
@@ -2351,3 +2444,6 @@ mod conformance {
         );
     }
 }
+
+#[cfg(test)]
+mod context_read_bench;

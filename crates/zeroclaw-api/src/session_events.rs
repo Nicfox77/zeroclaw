@@ -1060,6 +1060,12 @@ pub trait SessionEventStore: Send + Sync {
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError>;
     fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError>;
+    /// Read ordered payloads with the same validation and erasure semantics as
+    /// individual reads. Backends may share a read transaction within a batch;
+    /// no authorization or payload body is retained between calls.
+    fn read_payloads(&self, payload_ids: &[PayloadId]) -> Result<Vec<PayloadRead>, ReadError> {
+        payload_ids.iter().map(|id| self.read_payload(id)).collect()
+    }
     /// Check a frozen reference's erasure visibility without loading its content
     /// leaf. This is not validation/admission of a new reference or a read grant.
     fn read_payload_disposition(

@@ -994,3 +994,162 @@ async fn main_conversation_refreshes_stale_connections_inside_the_execution_lane
         assert_eq!(text.matches("Web architecture follow-up").count(), 1);
     }
 }
+
+#[tokio::test]
+async fn summary_context_reuses_only_a_witnessed_unchanged_view() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (port, _) = session(directory.path(), backend);
+        let port = port.with_summary_deck(Arc::new(Runtime::new()));
+        for n in 0..3 {
+            add_turn(&port, n).await.unwrap();
+        }
+        let before = port
+            .read_context_snapshot(port.latest_context().await.unwrap())
+            .await
+            .unwrap();
+        let result = port.read_maintained_context().await.unwrap();
+        assert_eq!(result.reused, backend == "sqlite");
+        assert!(
+            serde_json::to_value(result.snapshot).unwrap() == serde_json::to_value(before).unwrap()
+        );
+    }
+}
+
+struct MaintenanceHook {
+    base: Runtime,
+    calls: AtomicUsize,
+    hook: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+}
+impl SummaryDeckRuntime for MaintenanceHook {
+    fn resolve(&self) -> anyhow::Result<Option<ResolvedSummaryDeck>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            (self.hook)()?;
+        }
+        self.base.resolve()
+    }
+    fn executor(&self) -> anyhow::Result<ContextSummaryExecutor<'static>> {
+        self.base.executor()
+    }
+}
+
+#[tokio::test]
+async fn summary_context_rechecks_revision_and_permissions_after_maintenance() {
+    for revoke in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (port, authority) = session(directory.path(), "sqlite");
+        for n in 0..3 {
+            add_turn(&port, n).await.unwrap();
+        }
+        let owner = port.owner.clone();
+        let stream = port.stream.clone();
+        let hook = MaintenanceHook {
+            base: Runtime::new(),
+            calls: AtomicUsize::new(0),
+            hook: Box::new(move || {
+                if revoke {
+                    authority.0.store(false, Ordering::SeqCst);
+                } else {
+                    let title = PayloadRecord::new(
+                        PayloadId::new(),
+                        "session.text/v1".into(),
+                        b"changed during maintenance".to_vec(),
+                    )?;
+                    let event = SessionEvent::typed(
+                        stream.clone(),
+                        EventData::SessionMetadataChanged {
+                            field: "title".into(),
+                            new_value_ref: StoredPayloadRef::from(&title),
+                        },
+                        EventActor::default(),
+                    )?;
+                    owner.store.append_batch(AppendRequest {
+                        session_id: stream.clone(),
+                        expected_head: owner.store.head(&stream)?,
+                        idempotency_key: "maintenance-race-fixture".into(),
+                        events: vec![event],
+                        payloads: vec![title],
+                        erasure_reference_commitment: None,
+                    })?;
+                }
+                Ok(())
+            }),
+        };
+        let port = port.with_summary_deck(Arc::new(hook));
+        let result = port.read_maintained_context().await;
+        if revoke {
+            assert!(result.is_err());
+        } else {
+            assert!(
+                !result.unwrap().reused,
+                "a changed canonical revision requires a fresh read"
+            );
+        }
+    }
+}
+
+struct BenchmarkSummaryRuntime;
+impl SummaryDeckRuntime for BenchmarkSummaryRuntime {
+    fn resolve(&self) -> anyhow::Result<Option<ResolvedSummaryDeck>> {
+        Ok(Some(ResolvedSummaryDeck {
+            config: SummaryDeckConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            context_budget: 131_072,
+            max_turns: 200,
+            source_budget: 65_536,
+        }))
+    }
+    fn executor(&self) -> anyhow::Result<ContextSummaryExecutor<'static>> {
+        anyhow::bail!("benchmark must not invoke a model")
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly marked, isolated session-store copy"]
+async fn profile_context_preparation_on_an_isolated_copy() {
+    let path = std::path::PathBuf::from(
+        std::env::var("ZEROCLAW_CONTEXT_BENCH_DATA").expect("isolated data path"),
+    );
+    assert!(path.join(".context-benchmark-copy").is_file());
+    let id =
+        EventId::parse(std::env::var("ZEROCLAW_CONTEXT_BENCH_PROJECTION").expect("projection"))
+            .unwrap();
+    let store = Arc::new(zeroclaw_infra::session_events::SqliteEventStore::open(&path).unwrap());
+    let event = store.read_event(&id).unwrap().unwrap();
+    let authority = Arc::new(Authority(AtomicBool::new(true)));
+    let port = EngineSession::new(
+        Arc::new(SessionCoordinator::new(store)),
+        event.session_id.clone(),
+        event.branch_id.clone().unwrap(),
+        PrincipalId::shared_operator(),
+        authority,
+    )
+    .with_summary_deck(Arc::new(BenchmarkSummaryRuntime));
+    let mut snapshot = port.read_context_snapshot(event).await.unwrap().unwrap();
+    for round in 0..3 {
+        let started = std::time::Instant::now();
+        port.replace_context(snapshot.clone(), "summary_deck_working_context")
+            .await
+            .unwrap();
+        port.maintain_summary_deck().await.unwrap();
+        let serial = port
+            .read_context_snapshot(port.latest_context().await.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let serial_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
+        let prepared = port.prepare_context(snapshot.clone()).await.unwrap();
+        let prepared_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            serde_json::to_vec(&serial).unwrap() == serde_json::to_vec(&prepared).unwrap(),
+            "context changed"
+        );
+        eprintln!(
+            "context_prepare_bench round={round} serial_ms={serial_ms:.3} prepared_ms={prepared_ms:.3}"
+        );
+        snapshot = prepared;
+    }
+}

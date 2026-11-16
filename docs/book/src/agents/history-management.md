@@ -124,6 +124,13 @@ checked against its captured provider result before publication. The oldest
 cards leave the deck when its token allocation fills. Cards do not recursively
 fold the entire old deck into every new summary.
 
+Native context reads resolve captured text and reasoning fragments in bounded
+payload batches. Summary maintenance can reuse the just-read view when its
+projection and canonical database revision remain unchanged; current read
+permissions are checked again before returning it. A changed revision or a
+backend without a revision witness requires a fresh read. This avoids repeatedly
+materializing the same context without introducing a cross-turn body cache.
+
 Normal requests continue while inference runs. At the recent-context or turn
 limit, context preparation waits for the pending job. A failed, empty,
 oversized, unavailable or unauthorized summary never authorizes deleting the

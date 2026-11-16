@@ -303,7 +303,82 @@ pub(super) fn reconcile(
     Ok(Some(deck))
 }
 
+pub(super) struct MaintainedContext {
+    pub snapshot: Option<ContextSnapshot>,
+    pub read_time: Duration,
+    pub maintenance_time: Duration,
+    pub reused: bool,
+}
+
 impl EngineSession {
+    /// Reuse one resolved view only while its canonical revision stays fixed.
+    /// Stores without a revision witness retain the ordinary fresh-read path.
+    pub(super) async fn read_maintained_context(&self) -> anyhow::Result<MaintainedContext> {
+        let started = std::time::Instant::now();
+        let policy = self.summary_policy().await?;
+        if let Some(policy) = &policy {
+            policy.config.validate()?;
+        }
+        let needs_maintenance = policy.is_some_and(|p| p.config.enabled && p.context_budget > 0);
+        let owner = self.owner.clone();
+        let revision = if needs_maintenance {
+            self.owner
+                .blocking(move || Ok(owner.store.canonical_revision()?))
+                .await?
+        } else {
+            None
+        };
+        let input = self.latest_context().await?;
+        let snapshot = self.read_context_snapshot(input.clone()).await?;
+        let mut read_time = started.elapsed();
+        if !needs_maintenance {
+            return Ok(MaintainedContext {
+                snapshot,
+                read_time,
+                maintenance_time: Duration::ZERO,
+                reused: false,
+            });
+        }
+        let maintained = std::time::Instant::now();
+        if let Some(snapshot) = &snapshot {
+            self.maintain_summary_deck_with_context(Some((&input, snapshot)))
+                .await?;
+        } else {
+            self.maintain_summary_deck().await?;
+        }
+        let maintenance_time = maintained.elapsed();
+        let checking = std::time::Instant::now();
+        let current = self.latest_context().await?;
+        let session = self.clone();
+        let unchanged = self
+            .owner
+            .blocking(move || {
+                session.authority.authorize_actor(
+                    &session.actor,
+                    &session.stream,
+                    super::query::SessionAccess::Read,
+                )?;
+                session
+                    .authority
+                    .authorize_context(&session.stream, &session.branch)?;
+                Ok(revision.is_some() && revision == session.owner.store.canonical_revision()?)
+            })
+            .await?;
+        let reused = unchanged && input.event_id == current.event_id;
+        let snapshot = if reused {
+            snapshot
+        } else {
+            self.read_context_snapshot(current).await?
+        };
+        read_time += checking.elapsed();
+        Ok(MaintainedContext {
+            snapshot,
+            read_time,
+            maintenance_time,
+            reused,
+        })
+    }
+
     async fn summary_route(&self) -> anyhow::Result<Option<(String, String)>> {
         use zeroclaw_api::session_events::capture::{ModelOverrideSelection, current_engine_input};
         if self.is_active()
@@ -334,6 +409,13 @@ impl EngineSession {
         }
     }
     pub(super) async fn maintain_summary_deck(&self) -> anyhow::Result<()> {
+        self.maintain_summary_deck_with_context(None).await
+    }
+
+    async fn maintain_summary_deck_with_context(
+        &self,
+        prepared: Option<(&SessionEvent, &ContextSnapshot)>,
+    ) -> anyhow::Result<()> {
         let Some(policy) = self.summary_policy().await? else {
             return Ok(());
         };
@@ -341,11 +423,16 @@ impl EngineSession {
         if !policy.config.enabled || policy.context_budget == 0 {
             return Ok(());
         }
-        let input = self.latest_context().await?;
-        let snapshot = self
-            .read_context_snapshot(input.clone())
-            .await?
-            .ok_or_else(|| anyhow::Error::msg("summary_deck_context_missing"))?;
+        let (input, snapshot) = if let Some((input, snapshot)) = prepared {
+            (input.clone(), snapshot.clone())
+        } else {
+            let input = self.latest_context().await?;
+            let snapshot = self
+                .read_context_snapshot(input.clone())
+                .await?
+                .ok_or_else(|| anyhow::Error::msg("summary_deck_context_missing"))?;
+            (input, snapshot)
+        };
         let leading = snapshot
             .messages
             .iter()
