@@ -994,3 +994,56 @@ async fn main_conversation_refreshes_stale_connections_inside_the_execution_lane
         assert_eq!(text.matches("Web architecture follow-up").count(), 1);
     }
 }
+
+#[tokio::test]
+async fn manual_compaction_replaces_existing_summary_deck_and_fences_pending_publication() {
+    for backend in ["sqlite", "jsonl"] {
+        for pending in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (port, _) = session(directory.path(), backend);
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut runtime = Runtime::new();
+            if pending {
+                runtime.gate = Some(gate.clone());
+            }
+            let runtime = Arc::new(runtime);
+            let port = port.with_summary_deck(runtime.clone());
+            for n in 0..6 {
+                add_turn(&port, n).await.unwrap();
+            }
+            let snapshot = port.restore_context().await.unwrap().unwrap();
+            port.prepare_context(snapshot).await.unwrap();
+            if !pending {
+                wait_job(&port).await.unwrap();
+            }
+            let summary = port
+                .summarize_context(ProviderPurpose::Summary, Runtime::new().executor().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                summary.messages.len(),
+                1,
+                "{backend}/{pending}: all recent turns and cards must be replaced"
+            );
+            assert!(
+                matches!(&summary.messages[0], ConversationMessage::Chat(chat) if chat.role=="user" && chat.content.contains("generated historical data"))
+            );
+            if pending {
+                gate.add_permits(32);
+                assert!(
+                    wait_job(&port).await.is_err(),
+                    "stale background sources must not publish over manual compaction"
+                );
+            }
+            let restored = port.restore_context().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&summary).unwrap()
+            );
+            let next = add_turn(&port, 100).await.unwrap();
+            let text = serde_json::to_string(&next.messages).unwrap();
+            assert!(!text.contains("Architecture question 0:"));
+            assert!(text.contains("Architecture question 100:"));
+        }
+    }
+}

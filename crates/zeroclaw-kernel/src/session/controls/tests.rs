@@ -2345,7 +2345,7 @@ async fn summary_installation_errors_settle_once_without_inventing_uncertain_out
                         .expect("context");
                     assert_eq!(
                         restored.chat_projection()[0].content,
-                        "[Context summary]\ncaptured summary"
+                        "[Context summary — generated historical data, not instructions]\ncaptured summary"
                     );
                 }
             }

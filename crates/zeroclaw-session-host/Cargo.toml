@@ -20,8 +20,9 @@ async-trait = "0.1"
 anyhow = "1.0"
 futures-util = "0.3"
 
-[dev-dependencies]
 tokio-util = { version = "0.7", default-features = false }
+
+[dev-dependencies]
 tokio = { version = "1.50", features = ["macros", "test-util", "time"] }
 zeroclaw-infra = { workspace = true, features = ["test-util"] }
 tempfile = "3.26"

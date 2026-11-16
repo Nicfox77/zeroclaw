@@ -81,6 +81,32 @@ its own active turn; perform the task directly or trigger the job from the
 dashboard instead.
 Previously isolated run histories are not automatically merged.
 
+## Manual compaction from messaging channels
+
+Send `/compact` as a standalone message (including in SimpleX) to summarize the
+entire active conversation context and replace its recent messages and tool
+exchanges with one continuation summary. This also works in a continuous main
+conversation, where `/new` and `/clear` remain protected. Permanent history and
+long-term memories are preserved. Previously rotated messages are represented by
+the summaries already in active context; the command does not reread the archive.
+
+The command uses native session maintenance and the same configured summarizer
+selection as the summary deck, falling back to the current session model. It
+works even when automatic deck rotation is disabled. The existing
+`summary_deck.max_summary_tokens` bounds its output (estimated as four UTF-8 bytes
+per token). The channel acknowledges the request before inference and reports
+completion or failure. Failed or invalid generation keeps the previous context.
+If publication cannot be confirmed, the next turn reloads the committed context.
+The next turn reads the committed summary, including after a restart or from
+another transport bound to the same main conversation. Concurrent turns use the
+existing session execution lane and configured arrival/interruption policy.
+Wait for the completion notice before sending a follow-up.
+
+Compaction requires native persistent session history and makes an additional
+model call. It may reduce repetitive or stale context, but cannot guarantee that
+a model stops looping. Model selection is separate: use `/model` to choose the
+model for subsequent conversation turns.
+
 ## Optional asynchronous summary deck
 
 Native sessions can retain recent verbatim turns plus a rotating deck of older

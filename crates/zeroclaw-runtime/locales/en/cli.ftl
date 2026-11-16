@@ -1780,3 +1780,10 @@ channel-simplex-progress-working = Working…
 channel-simplex-progress-interrupted = [Interrupted]
 
 agent-turn-idle-timeout = The request stopped after { $seconds } seconds without model or tool progress. Increase pacing.turn_idle_timeout_secs for slow local-model prompt processing.
+
+channel-runtime-compact-usage = Send /compact without arguments to summarize the active conversation and start fresh from that summary.
+channel-runtime-compact-started = Summarizing the active conversation. The original transcript will remain stored.
+channel-runtime-compact-completed = Compaction complete. The next message will start from the summary with fresh recent context. The original transcript is preserved.
+channel-runtime-compact-empty = There is no active conversation context to summarize.
+channel-runtime-compact-failed = Compaction failed. The original transcript is preserved; the next message will reload the committed context. Try /compact again later.
+channel-runtime-compact-unavailable = Compaction requires native persistent session history, which is unavailable for this conversation.

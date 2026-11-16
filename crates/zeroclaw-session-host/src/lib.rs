@@ -23,6 +23,7 @@ use zeroclaw_kernel::session::{
 mod seed;
 mod summary_cost;
 mod summary_deck;
+pub use summary_deck::manual_context_summary_executor;
 
 type SessionOwner = Arc<tokio::sync::Mutex<Option<Arc<SessionCoordinator>>>>;
 type SessionOwners = HashMap<(std::path::PathBuf, String), SessionOwner>;
