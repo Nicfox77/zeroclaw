@@ -53,8 +53,9 @@ impl SummaryDeckRuntime for Runtime {
                     profile.summary_deck.timeout_secs,
                 )
             };
-            let warm =
-                zeroclaw_providers::factory::prefill_llamacpp_context(&config, &intent, timeout);
+            let warm = zeroclaw_providers::factory::prefill_llamacpp_context(
+                &config, &agent, &intent, timeout,
+            );
             tokio::pin!(warm);
             let mut changed = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -317,8 +318,15 @@ mod tests {
         zeroclaw_config::live::LiveConfig,
         Runtime,
         zeroclaw_api::session_events::capture::ProviderDispatchIntent,
+        tempfile::TempDir,
     ) {
         let mut config = config_fixture();
+        let workspace = tempfile::tempdir().unwrap();
+        config.agents.get_mut("fixture").unwrap().workspace.path = Some(workspace.path().into());
+        config.agents.get_mut("fixture").unwrap().risk_profile = "fixture".into();
+        config
+            .risk_profiles
+            .insert("fixture".into(), Default::default());
         config.agents.get_mut("fixture").unwrap().model_provider = "llamacpp.fixture".into();
         let deck = &mut config
             .runtime_profiles
@@ -357,12 +365,12 @@ mod tests {
             thinking: None,
             tool_round_policy: zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
         };
-        (live, runtime, intent)
+        (live, runtime, intent, workspace)
     }
 
     #[tokio::test]
     async fn warming_is_opt_in_and_never_uses_a_previous_or_unconfigured_route() {
-        let (live, runtime, mut intent) = warming_fixture("http://127.0.0.1:1/v1");
+        let (live, runtime, mut intent, _workspace) = warming_fixture("http://127.0.0.1:1/v1");
         intent.model = "previous-model".into();
         runtime.prefill_context(intent.clone()).await.unwrap();
         intent.model = "prefill-fixture".into();
@@ -381,6 +389,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warming_factory_checks_current_agents_image_read_policy_before_dispatch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (live, runtime, mut intent, _workspace) =
+            warming_fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("not-authorized.png");
+        std::fs::write(&source, b"must not be read or sent").unwrap();
+        intent.messages.last_mut().unwrap().attachments.push(
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: source.to_string_lossy().into_owned(),
+            },
+        );
+        let error = runtime.prefill_context(intent).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cache_warm_image_not_authorized")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(live);
+    }
+
+    #[tokio::test]
     async fn a_live_config_change_cancels_inflight_prefill_and_closes_its_connection() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -394,7 +430,7 @@ mod tests {
             send.send(()).unwrap();
             while socket.read(&mut buf).await.unwrap_or(0) > 0 {}
         });
-        let (live, runtime, intent) = warming_fixture(&format!("http://{address}"));
+        let (live, runtime, intent, _workspace) = warming_fixture(&format!("http://{address}"));
         let task = ::zeroclaw_spawn::spawn!(runtime.prefill_context(intent));
         started.await.unwrap();
         let config = live.snapshot();
@@ -416,7 +452,7 @@ mod tests {
     async fn real_llamacpp_warms_through_live_host_policy_and_the_native_factory() {
         let endpoint =
             std::env::var("ZEROCLAW_PREFILL_TEST_URL").expect("isolated fixture endpoint");
-        let (_, runtime, intent) = warming_fixture(&endpoint);
+        let (_live, runtime, intent, _workspace) = warming_fixture(&endpoint);
         runtime.prefill_context(intent).await.unwrap();
     }
     use std::time::Duration;

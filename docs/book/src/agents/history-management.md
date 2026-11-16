@@ -206,9 +206,18 @@ are not assumed. Actual prompt-processing progress renews the summary policy's
 `timeout_secs` inactivity allowance; empty frames and keepalives do not. A failed
 warmup releases the lane without invalidating an already committed summary.
 
-Warming stops before the first image-bearing turn rather than independently
-loading media paths or remote images. That text prefix remains reusable;
-foreground multimodal preparation still authorizes and processes images normally.
+Warming includes image-bearing turns and subsequent text. It uses ordinary
+multimodal preparation and its image age, count, size and decoding limits.
+Age and tool-image disposition are projected for a following user turn, without
+sending or recording a placeholder user message.
+The factory resolves the current agent's file-read policy before loading local
+images, including symlink-aware readability checks; remote images require
+`multimodal.allow_remote_fetch`. A denied active source cancels the optional
+warm-up instead of silently changing its prompt. The lower-level provider
+cache operation accepts prepared inline images and cannot independently load
+files or fetch URLs. Images already omitted by normal history/media policy do
+not prevent warming later text. Media paths and URLs are not added to warm-up
+logs.
 
 For the primary profile, `provider_extra = { cache_prompt = true, id_slot = 0 }`
 can explicitly select the resident slot. llama.cpp's default

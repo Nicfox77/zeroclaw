@@ -3634,6 +3634,23 @@ impl OpenAiCompatibleModelProvider {
         &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
+        self.normalize_messages_for_upstream_inner(messages, false)
+            .await
+    }
+
+    async fn normalize_inline_messages_for_cache_warm(
+        &self,
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        self.normalize_messages_for_upstream_inner(messages, true)
+            .await
+    }
+
+    async fn normalize_messages_for_upstream_inner(
+        &self,
+        messages: &[ChatMessage],
+        inline_only: bool,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
         let mut messages = messages.to_vec();
         if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
             for message in &mut messages {
@@ -3650,9 +3667,12 @@ impl OpenAiCompatibleModelProvider {
                 }
             }
         }
-        let mut messages = multimodal::prepare_messages_for_provider(&messages, &self.multimodal)
-            .await?
-            .messages;
+        let prepared = if inline_only {
+            multimodal::prepare_inline_messages_for_cache_warm(&messages, &self.multimodal).await?
+        } else {
+            multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?
+        };
+        let mut messages = prepared.messages;
         // Preserve tool identity through media policy. Only this leaf's wire
         // projection changes the role for the prompt-guided protocol.
         if !self.native_tool_calling {

@@ -689,7 +689,7 @@ pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
 ) -> Result<PreparedMessages, MultimodalError> {
-    prepare_messages_inner(messages, config, None).await
+    prepare_messages_inner(messages, config, None, ImageAccess::Request).await
 }
 
 pub async fn prepare_messages_for_provider_cached(
@@ -697,13 +697,48 @@ pub async fn prepare_messages_for_provider_cached(
     config: &MultimodalConfig,
     cache: &mut LocalImageCache,
 ) -> Result<PreparedMessages, MultimodalError> {
-    prepare_messages_inner(messages, config, Some(cache)).await
+    prepare_messages_inner(messages, config, Some(cache), ImageAccess::Request).await
+}
+
+// Borrowed for a single preparation. Never retained as an authorization cache.
+enum ImageAccess<'a> {
+    Request,
+    InlineOnly,
+    Policy(&'a zeroclaw_config::policy::SecurityPolicy),
+}
+
+/// Prepare all history for maintenance under the current agent's read policy.
+/// Age/count limits and attachment dispositions run before access checks, just
+/// as in ordinary preparation. Denied active sources fail the optional warm-up
+/// instead of constructing a different, partially warmed prompt.
+pub async fn prepare_messages_for_cache_warm(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    policy: &zeroclaw_config::policy::SecurityPolicy,
+) -> Result<PreparedMessages, MultimodalError> {
+    // Compute age and tool-image disposition for the next user turn, just as
+    // tool-history projection does. The empty row is preparation-only: it is
+    // removed before inference and is never recorded as conversation content.
+    let mut next_turn = messages.to_vec();
+    next_turn.push(ChatMessage::user(""));
+    let mut prepared =
+        prepare_messages_inner(&next_turn, config, None, ImageAccess::Policy(policy)).await?;
+    prepared.messages.pop();
+    Ok(prepared)
+}
+
+pub(crate) async fn prepare_inline_messages_for_cache_warm(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+) -> Result<PreparedMessages, MultimodalError> {
+    prepare_messages_inner(messages, config, None, ImageAccess::InlineOnly).await
 }
 
 async fn prepare_messages_inner(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
     mut cache: Option<&mut LocalImageCache>,
+    access: ImageAccess<'_>,
 ) -> Result<PreparedMessages, MultimodalError> {
     let mut candidates = if config.max_image_turns > 0 {
         trim_images_by_age(messages, config.max_image_turns)
@@ -728,6 +763,40 @@ async fn prepare_messages_inner(
             AttachmentDisposition::Normalized => {
                 let refs = message_image_refs(message);
                 if !refs.is_empty() {
+                    for reference in &refs {
+                        if reference.starts_with("data:") {
+                            continue;
+                        }
+                        let allowed = match &access {
+                            ImageAccess::Request => true,
+                            ImageAccess::InlineOnly => false,
+                            ImageAccess::Policy(_)
+                                if reference.starts_with("http://")
+                                    || reference.starts_with("https://") =>
+                            {
+                                config.allow_remote_fetch
+                            }
+                            ImageAccess::Policy(policy) => {
+                                let policy = (*policy).clone();
+                                let source = reference.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    Path::new(&source).is_absolute()
+                                        && policy.is_path_allowed(&source)
+                                        && policy.is_resolved_path_readable(
+                                            &policy.resolve_tool_path(&source),
+                                        )
+                                })
+                                .await
+                                .unwrap_or(false)
+                            }
+                        };
+                        if !allowed {
+                            return Err(MultimodalError::InvalidReference {
+                                input: "<cache-warm-source>".into(),
+                                reason: "cache_warm_image_not_authorized".into(),
+                            });
+                        }
+                    }
                     let normalized = normalize_image_references(
                         &refs,
                         config,
@@ -3131,6 +3200,92 @@ mod tests {
         assert_eq!(stored_reference, &image_failure_reference_key(&reference));
         assert_eq!(stored_reference.len(), 32);
         assert_eq!(*stored_kind, "invalid_reference");
+    }
+
+    #[tokio::test]
+    async fn cache_warm_projects_image_age_for_the_next_user_without_sending_a_dummy_row() {
+        let policy = zeroclaw_config::policy::SecurityPolicy::default();
+        let config = MultimodalConfig {
+            max_image_turns: 1,
+            ..Default::default()
+        };
+        let messages = vec![
+            ChatMessage::user("Image turn").with_attachments(vec![AttachmentReference {
+                kind: AttachmentKind::Image,
+                target: "/unapproved/nonexistent/image.png".into(),
+            }]),
+            ChatMessage::assistant("Completed answer"),
+        ];
+        let warmed = prepare_messages_for_cache_warm(&messages, &config, &policy)
+            .await
+            .unwrap();
+        let mut next_turn = messages.clone();
+        next_turn.push(ChatMessage::user("Real next message"));
+        let foreground = prepare_messages_for_provider(&next_turn, &config)
+            .await
+            .unwrap();
+        assert_eq!(warmed.messages.len(), messages.len());
+        assert_eq!(
+            serde_json::to_value(&warmed.messages).unwrap(),
+            serde_json::to_value(&foreground.messages[..messages.len()]).unwrap(),
+        );
+        assert!(warmed.messages.iter().all(|m| m.attachments.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn cache_warm_denies_sources_outside_live_read_policy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("pixel.png");
+        image::DynamicImage::new_rgb8(1, 1).save(&path).unwrap();
+        let policy = zeroclaw_config::policy::SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        let denied = |target: String| {
+            vec![
+                ChatMessage::user("Image").with_attachments(vec![AttachmentReference {
+                    kind: AttachmentKind::Image,
+                    target,
+                }]),
+            ]
+        };
+        let error = prepare_messages_for_cache_warm(
+            &denied(path.to_string_lossy().into_owned()),
+            &MultimodalConfig::default(),
+            &policy,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cache_warm_image_not_authorized")
+        );
+        assert!(!error.to_string().contains(path.to_str().unwrap()));
+        #[cfg(unix)]
+        {
+            let link = workspace.path().join("escape.png");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(
+                prepare_messages_for_cache_warm(
+                    &denied(link.to_string_lossy().into_owned()),
+                    &MultimodalConfig::default(),
+                    &policy,
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            prepare_messages_for_cache_warm(
+                &denied("https://example.invalid/image.png".into()),
+                &MultimodalConfig::default(),
+                &policy,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

@@ -34,30 +34,11 @@ impl OpenAiCompatibleModelProvider {
         let inactivity = Duration::from_secs(inactivity_secs);
         ensure!(!inactivity.is_zero(), "cache_warm_invalid_inactivity");
         let credential = self.resolve_credential().await?;
-        // Warming has no independent filesystem/media capability. Stop at
-        // the start of the first image-bearing turn; normal foreground image
-        // preparation remains responsible for path authorization and decoding.
-        let end = request
-            .messages
-            .iter()
-            .position(|message| {
-                message
-                    .attachments
-                    .iter()
-                    .any(|a| a.kind == AttachmentKind::Image)
-            })
-            .map(|image| {
-                request.messages[..=image]
-                    .iter()
-                    .rposition(|m| m.role == "user")
-                    .unwrap_or(0)
-            })
-            .unwrap_or(request.messages.len());
-        if end == 0 {
-            return Ok(());
-        }
+        // The factory resolves authorized media first. This lower-level path
+        // cannot independently load files or fetch URLs; inline images and
+        // policy-omitted historical attachments still use normal preparation.
         let normalized = self
-            .normalize_messages_for_upstream(&request.messages[..end])
+            .normalize_inline_messages_for_cache_warm(request.messages)
             .await?;
         let merge = self.effective_merge_system(model);
         let (messages, merged) = Self::flatten_system_messages(&normalized, merge);
@@ -344,17 +325,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warming_stops_before_media_instead_of_loading_unapproved_paths() {
+    async fn warming_includes_authorized_image_and_later_text_with_foreground_wire_shape() {
         let (url, seen, server) = server(vec![(0, terminal())]).await;
-        let p = provider(&url);
+        let mut p = provider(&url);
+        p.multimodal.max_image_turns = 0;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pixel.png");
+        image::DynamicImage::new_rgb8(1, 1).save(&path).unwrap();
+        let policy = zeroclaw_config::policy::SecurityPolicy {
+            workspace_dir: directory.path().to_path_buf(),
+            ..Default::default()
+        };
         let messages = vec![
             ChatMessage::system("Stable prefix"),
-            ChatMessage::user("Earlier text"),
-            ChatMessage::assistant("Earlier answer"),
-            ChatMessage::user("New image").with_attachments(vec![AttachmentReference {
+            ChatMessage::user("Image").with_attachments(vec![AttachmentReference {
+                kind: AttachmentKind::Image,
+                target: path.to_string_lossy().into_owned(),
+            }]),
+            ChatMessage::assistant("Image answer"),
+            ChatMessage::user("Later text"),
+        ];
+        let prepared =
+            multimodal::prepare_messages_for_cache_warm(&messages, &p.multimodal, &policy)
+                .await
+                .unwrap();
+        p.prefill_prompt(
+            ProviderChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+                thinking: None,
+            },
+            "fixture",
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        p.chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "fixture",
+            None,
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["messages"], seen[1]["messages"]);
+        let wire = seen[0]["messages"].to_string();
+        assert!(wire.contains("data:image/png;base64,"));
+        assert!(wire.contains("Later text"));
+        assert!(!wire.contains(path.to_str().unwrap()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn warming_continues_after_images_omitted_by_age_policy() {
+        let (url, seen, server) = server(vec![(0, terminal())]).await;
+        let mut p = provider(&url);
+        p.multimodal.max_image_turns = 1;
+        let messages = vec![
+            ChatMessage::user("Old image").with_attachments(vec![AttachmentReference {
                 kind: AttachmentKind::Image,
                 target: "/unapproved/nonexistent/image.png".into(),
             }]),
+            ChatMessage::assistant("Earlier answer"),
+            ChatMessage::user("Newest text"),
         ];
         p.prefill_prompt(
             ProviderChatRequest {
@@ -368,9 +407,56 @@ mod tests {
         )
         .await
         .unwrap();
+        p.chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "fixture",
+            None,
+        )
+        .await
+        .unwrap();
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0]["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(seen[0]["messages"], seen[1]["messages"]);
+        assert!(seen[0]["messages"].to_string().contains("Newest text"));
         assert!(!seen[0].to_string().contains("unapproved"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn warming_refuses_unprepared_media_instead_of_loading_unapproved_paths() {
+        let (url, seen, server) = server(vec![(0, terminal())]).await;
+        let p = provider(&url);
+        let messages = vec![
+            ChatMessage::system("Stable prefix"),
+            ChatMessage::user("Earlier text"),
+            ChatMessage::assistant("Earlier answer"),
+            ChatMessage::user("New image").with_attachments(vec![AttachmentReference {
+                kind: AttachmentKind::Image,
+                target: "/unapproved/nonexistent/image.png".into(),
+            }]),
+        ];
+        let error = p
+            .prefill_prompt(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "fixture",
+                None,
+                2,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cache_warm_image_not_authorized")
+        );
+        assert!(seen.lock().unwrap().is_empty());
         server.abort();
     }
 

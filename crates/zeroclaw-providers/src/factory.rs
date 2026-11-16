@@ -120,6 +120,7 @@ pub fn build_session_model_provider(
 /// execution. Ordinary construction still owns every request-shape option.
 pub async fn prefill_llamacpp_context(
     config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
     intent: &zeroclaw_api::session_events::capture::ProviderDispatchIntent,
     inactivity_secs: u64,
 ) -> Result<()> {
@@ -141,6 +142,15 @@ pub async fn prefill_llamacpp_context(
     crate::compatible::prefill::local_endpoint(
         entry.base.uri.as_deref().unwrap_or(LLAMACPP_DEFAULT_URL),
     )?;
+    // The caller's current agent/config is the authority for media reads.
+    // Prepare once before entering the inline-only provider cache operation.
+    let policy = zeroclaw_config::policy::SecurityPolicy::for_agent(config, agent_alias)?;
+    let prepared = crate::multimodal::prepare_messages_for_cache_warm(
+        &intent.messages,
+        &config.multimodal,
+        &policy,
+    )
+    .await?;
     let options = crate::provider_runtime_options_for_alias(config, family, alias);
     let provider = entry.create_provider(
         alias,
@@ -156,7 +166,7 @@ pub async fn prefill_llamacpp_context(
     provider
         .prefill_prompt(
             zeroclaw_api::model_provider::ChatRequest {
-                messages: &intent.messages,
+                messages: &prepared.messages,
                 tools: tools.as_deref(),
                 thinking: intent.thinking,
             },
