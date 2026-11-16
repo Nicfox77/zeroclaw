@@ -10501,9 +10501,13 @@ impl Default for ImageGenConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.image_gen.openai"]
 pub struct OpenAIImageProviderConfig {
-    /// API base URI; `/images/generations` is appended. HTTPS or literal-loopback HTTP.
+    /// API base URI; `/images/generations` is appended. HTTPS or literal-loopback HTTP by default.
     #[serde(default = "default_image_openai_uri")]
     pub uri: String,
+    /// Permit HTTP to this configured endpoint on a trusted network. Default: false.
+    /// This sends the Bearer token without TLS; redirects remain disabled.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     /// Image model identifier. Required when this provider is selected.
     #[serde(default)]
     pub model: String,
@@ -10529,6 +10533,7 @@ impl Default for OpenAIImageProviderConfig {
     fn default() -> Self {
         Self {
             uri: default_image_openai_uri(),
+            allow_insecure_http: false,
             model: String::new(),
             api_key_env: default_image_openai_key_env(),
             api_key_file: None,
@@ -10553,8 +10558,9 @@ impl OpenAIImageProviderConfig {
             .is_some_and(|ip| ip.is_loopback());
         anyhow::ensure!(
             base.host_str().is_some()
-                && (base.scheme() == "https" || (base.scheme() == "http" && loopback)),
-            "Image provider URI requires HTTPS or literal-loopback HTTP"
+                && (base.scheme() == "https"
+                    || (base.scheme() == "http" && (loopback || self.allow_insecure_http))),
+            "Image provider URI requires HTTPS or literal-loopback HTTP; set allow_insecure_http only for a trusted HTTP endpoint"
         );
         anyhow::ensure!(
             base.username().is_empty()
@@ -10640,6 +10646,59 @@ impl Config {
 #[cfg(test)]
 mod image_gen_config_tests {
     use super::*;
+    #[test]
+    fn openai_image_http_requires_explicit_profile_opt_in() {
+        let mut profile = OpenAIImageProviderConfig {
+            uri: "http://192.0.2.10:9000/v1".into(),
+            model: "example/image-model".into(),
+            ..Default::default()
+        };
+        assert!(!profile.allow_insecure_http);
+        assert!(profile.validate().is_err());
+        profile.allow_insecure_http = true;
+        assert_eq!(
+            profile.generation_url().unwrap().as_str(),
+            "http://192.0.2.10:9000/v1/images/generations"
+        );
+        let restored: OpenAIImageProviderConfig =
+            toml::from_str(&toml::to_string(&profile).unwrap()).unwrap();
+        assert!(restored.allow_insecure_http);
+        assert!(restored.validate().is_ok());
+        for uri in [
+            "http://127.0.0.1:9000/v1",
+            "http://[::1]:9000/v1",
+            "https://example.invalid/v1",
+        ] {
+            profile.uri = uri.into();
+            profile.allow_insecure_http = false;
+            assert!(profile.validate().is_ok(), "{uri}");
+        }
+        profile.uri = "http://images.example.invalid/v1".into();
+        assert!(profile.validate().is_err());
+        profile.allow_insecure_http = true;
+        assert!(profile.validate().is_ok());
+    }
+
+    #[test]
+    fn openai_image_http_opt_in_preserves_url_boundaries() {
+        for uri in [
+            "file:///etc/passwd",
+            "ftp://example.invalid/v1",
+            "http://user:password@example.invalid/v1",
+            "http://example.invalid/v1?token=secret",
+            "http://example.invalid/v1#fragment",
+            "http://example.invalid/white space",
+        ] {
+            let profile = OpenAIImageProviderConfig {
+                uri: uri.into(),
+                model: "example/image-model".into(),
+                allow_insecure_http: true,
+                ..Default::default()
+            };
+            assert!(profile.validate().is_err(), "{uri}");
+        }
+    }
+
     #[test]
     fn openai_image_generation_settings_round_trip_and_preserve_defaults() {
         let defaults: ImageGenConfig = toml::from_str("").unwrap();

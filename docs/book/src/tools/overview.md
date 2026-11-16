@@ -271,8 +271,13 @@ seed = 42
 Include `image_gen` in `[tools].optional`, or select `"*"`. Endpoint, image model,
 credentials, and optional request defaults belong to the image provider profile,
 separately from chat and speech providers. The URI is the API base; the client
-appends `/images/generations`. HTTPS or HTTP on a literal loopback IP is required.
-Redirects are refused and the key is sent only to that configured endpoint.
+appends `/images/generations`. HTTPS or HTTP on a literal loopback IP is accepted
+by default. For a trusted self-hosted HTTP endpoint on another host, explicitly
+set `allow_insecure_http = true` in that named image provider profile. This
+permission applies only to its configured endpoint and sends its Bearer token
+without TLS; use a trusted network or an encrypted transport. It cannot be
+selected through tool arguments. Redirects remain refused, and credentials,
+query parameters and fragments remain forbidden in the provider URI.
 
 A key file must use an absolute path and is read on each request. If no file is
 configured, `api_key_env` names the token environment variable, defaulting to

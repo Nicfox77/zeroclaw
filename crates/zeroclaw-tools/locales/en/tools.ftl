@@ -282,7 +282,7 @@ tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the tas
 # Configured image generation backend
 tool-image-gen = Generate an image from a text prompt using the configured image model. Saves the result to the workspace images directory and returns the file path.
 image-gen-model-description = Model identifier; omit to use the configured default image model.
-image-gen-size-description = Image size as WIDTHxHEIGHT (for example 512x512 or 1024x768), auto, or an existing aspect-ratio preset. The provider validates supported dimensions.
+image-gen-size-description = Image size as WIDTHxHEIGHT (for example 512x512 or 1024x768), auto, or an existing aspect-ratio preset. The provider validates supported dimensions. Omitting size defaults to 1024x1024. Set size explicitly when a resolution or aspect ratio is requested; describing it in the prompt alone does not change dimensions.
 image-gen-extras-description = Optional provider-specific generation parameters such as seed or steps. Cannot override model, prompt, size, image count, streaming, endpoint, or authentication.
 image-gen-error-size = Image size must be a preset, auto, or positive WIDTHxHEIGHT dimensions
 image-gen-error-extras = Invalid image generation extra_body parameters

@@ -725,6 +725,7 @@ mod tests {
 
     fn openai_profile(uri: &str, key_file: Option<PathBuf>) -> OpenAIImageProviderConfig {
         OpenAIImageProviderConfig {
+            allow_insecure_http: false,
             uri: uri.into(),
             model: "example/image-model".into(),
             api_key_file: key_file,
@@ -787,7 +788,10 @@ mod tests {
         let server = MockServer::start().await;
         let workspace = tempfile::tempdir().unwrap();
         let key_file = workspace.path().join("api.key");
-        let mut profile = openai_profile(&format!("{}/v1", server.uri()), Some(key_file.clone()));
+        let uri = format!("{}/v1", server.uri()).replace("127.0.0.1", "localhost");
+        let mut profile = openai_profile(&uri, Some(key_file.clone()));
+        assert!(profile.validate().is_err());
+        profile.allow_insecure_http = true;
         profile.extra_body = Some(json!({"seed":7,"steps":4}));
         let mut tool = test_tool();
         tool.workspace_dir = workspace.path().into();
@@ -815,6 +819,46 @@ mod tests {
             );
         }
     }
+    /// Explicit live proof against an operator-owned service. Never runs in
+    /// ordinary test suites, loads no models, and sends no channel messages.
+    #[tokio::test]
+    #[ignore = "requires ZEROCLAW_IMAGE_PROVIDER_TEST_PROFILE and performs a real image generation"]
+    async fn live_openai_image_provider_generates_requested_dimensions() {
+        let profile_path = std::env::var("ZEROCLAW_IMAGE_PROVIDER_TEST_PROFILE").unwrap();
+        let profile: OpenAIImageProviderConfig =
+            serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut tool = test_tool();
+        tool.workspace_dir = workspace.path().into();
+        let tool = tool.with_openai_profile(&profile).unwrap();
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({
+                "prompt":"A blue ceramic mug on a plain pale background, studio photograph.",
+                "size":"512x768", "filename":"provider-validation",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let bytes = std::fs::read(workspace.path().join("images/provider-validation.png")).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24);
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!((width, height), (512, 768));
+        assert_eq!(result.output.attachments().len(), 1);
+        let evidence = std::path::Path::new(&profile_path).parent().unwrap();
+        std::fs::write(evidence.join("provider-validation.png"), &bytes).unwrap();
+        std::fs::write(
+            evidence.join("provider-validation.json"),
+            serde_json::to_vec_pretty(&json!({
+                "model":profile.model, "width":width, "height":height, "bytes":bytes.len(),
+                "elapsed_seconds":started.elapsed().as_secs_f64(), "success":true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn openai_image_provider_rejects_redirects_error_bodies_and_malformed_results() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
