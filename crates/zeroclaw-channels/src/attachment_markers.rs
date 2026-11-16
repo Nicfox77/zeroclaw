@@ -8,7 +8,16 @@ pub const MAX_FILES: usize = 16;
 const PREFIX: &str = "<<file:";
 const MAX_PATH_BYTES: usize = 4096;
 
-pub const INSTRUCTIONS: &str = "## File Attachments\n\nTo attach a file to this reply, create it first, then place <<file:workspace-relative/path>> in the final answer. Use one marker per file, up to 16 files; multiple markers preserve their order. Existing permitted absolute paths also work. Images are detected from file contents; other files are sent as documents. Markers are removed from visible text and speech. Do not repeat files already delivered by an immediate send. No send_via call is needed for ordinary attachments; reserve that tool for routing, modality, or immediate sends. Use only existing local files, never URLs. Keep normal prose outside markers. Markers in code or quoted examples are literal. Do not claim delivery of a missing or unsaved file.\n";
+pub const INSTRUCTIONS: &str = r#"## File Attachments
+
+Attach an existing local file by wrapping its real path directly in <<file: and >> in the final answer. Prefer the exact absolute path returned by a file or image tool; copy it unchanged.
+Workspace-relative example: <<file:images/portrait.png>> resolves images/portrait.png inside the current workspace root.
+Absolute example: <<file:/workspace/images/portrait.png>> refers to that exact absolute path, subject to the configured file-read permissions.
+These examples illustrate syntax; substitute the actual existing file path. The words workspace-relative are explanatory, never a directory prefix. Do not prepend workspace-relative/ or invent, add, remove, or rewrite path components. If the path is uncertain, verify it with file tools first.
+Emit active attachment markers as plain text outside code blocks and quotes. Markers in code or quoted examples remain literal and do not attach files. Keep ordinary prose outside markers.
+Use one marker per file, up to 16 files; multiple markers preserve their order. Images are detected from file contents; other files are sent as documents. Active markers are removed from visible text and speech.
+No send_via call is needed for ordinary attachments; reserve that tool for routing, modality, or immediate sends. Do not repeat files already delivered by an immediate send. Use only existing local files, never URLs. Do not claim delivery of a missing or unsaved file.
+"#;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Projection {
