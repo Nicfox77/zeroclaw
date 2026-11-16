@@ -36937,257 +36937,256 @@ for await (const line of createInterface({input:process.stdin})) {
     #[test]
     fn manual_compaction_simplex_preserves_archive_and_reopens_summary() {
         run_channel_dispatch_test(|| async move {
-        use wiremock::{
-            Mock, MockServer, ResponseTemplate,
-            matchers::{method, path},
-        };
-        use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
-        for backend in ["sqlite", "jsonl"] {
-            for mode in ["valid", "empty", "oversized"] {
-                let server = MockServer::start().await;
-                let summary = match mode {
+            use wiremock::{
+                Mock, MockServer, ResponseTemplate,
+                matchers::{method, path},
+            };
+            use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
+            for backend in ["sqlite", "jsonl"] {
+                for mode in ["valid", "empty", "oversized"] {
+                    let server = MockServer::start().await;
+                    let summary = match mode {
                     "valid" => "I agreed to preserve the architecture decision and continue implementation.".to_string(),
                     "empty" => String::new(),
                     _ => "x".repeat(5000),
                 };
-                let chunk = serde_json::json!({"id":"summary-fixture", "choices":[{"index":0,"delta":{"content":summary},"finish_reason":null}]}).to_string();
-                let body = format!(
-                    "data: {chunk}\n\ndata: {{\"id\":\"summary-fixture\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
-                );
-                Mock::given(method("POST"))
-                    .and(path("/v1/chat/completions"))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .insert_header("content-type", "text/event-stream")
-                            .set_body_string(body),
-                    )
-                    .mount(&server)
-                    .await;
-                let directory = tempfile::tempdir().unwrap();
-                let provider = Arc::new(HistoryCaptureModelProvider::default());
-                let channel = Arc::new(SendMessageRecordingChannel {
-                    channel_name: "simplex",
-                    ..Default::default()
-                });
-                let mut config = Config {
-                    data_dir: directory.path().to_owned(),
-                    ..Default::default()
-                };
-                config.channels.session_backend = backend.into();
-                let agent = zeroclaw_config::schema::AliasedAgentConfig {
-                    channels: vec!["simplex.personal".into()],
-                    model_provider: "llamacpp.fixture".into(),
-                    runtime_profile: "fixture".into(),
-                    main_session: zeroclaw_config::main_session::MainSessionConfig {
-                        enabled: true,
-                        web: true,
-                        simplex: HashMap::from([("personal".into(), "10001".into())]),
+                    let chunk = serde_json::json!({"id":"summary-fixture", "choices":[{"index":0,"delta":{"content":summary},"finish_reason":null}]}).to_string();
+                    let body = format!(
+                        "data: {chunk}\n\ndata: {{\"id\":\"summary-fixture\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                    );
+                    Mock::given(method("POST"))
+                        .and(path("/v1/chat/completions"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .insert_header("content-type", "text/event-stream")
+                                .set_body_string(body),
+                        )
+                        .mount(&server)
+                        .await;
+                    let directory = tempfile::tempdir().unwrap();
+                    let provider = Arc::new(HistoryCaptureModelProvider::default());
+                    let channel = Arc::new(SendMessageRecordingChannel {
+                        channel_name: "simplex",
                         ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                config.providers.models.llamacpp.insert(
-                    "fixture".into(),
-                    zeroclaw_config::schema::LlamacppModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            uri: Some(format!("{}/v1", server.uri())),
-                            model: Some("test-model".into()),
+                    });
+                    let mut config = Config {
+                        data_dir: directory.path().to_owned(),
+                        ..Default::default()
+                    };
+                    config.channels.session_backend = backend.into();
+                    let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                        channels: vec!["simplex.personal".into()],
+                        model_provider: "llamacpp.fixture".into(),
+                        runtime_profile: "fixture".into(),
+                        main_session: zeroclaw_config::main_session::MainSessionConfig {
+                            enabled: true,
+                            web: true,
+                            simplex: HashMap::from([("personal".into(), "10001".into())]),
                             ..Default::default()
                         },
-                    },
-                );
-                // Explicit maintenance must work before automatic rotation is enabled.
-                let profile = zeroclaw_config::schema::RuntimeProfileConfig {
-                    summary_deck: zeroclaw_config::summary_deck::SummaryDeckConfig {
-                        enabled: false,
-                        provider: "llamacpp.fixture".into(),
-                        max_summary_tokens: 1000,
                         ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                config.runtime_profiles.insert("fixture".into(), profile);
-                config.agents.insert("test-agent".into(), agent.clone());
-                config.peer_groups.insert(
-                    "fixture".into(),
-                    peer_group("simplex.personal", &["10001"], false),
-                );
-                let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
-                    channel.clone(),
-                    provider.clone(),
-                    config,
-                    agent,
-                    "llamacpp.fixture",
-                    None,
-                );
-                let inner = Arc::get_mut(&mut ctx).unwrap();
-                inner.workspace_dir = Arc::new(directory.path().to_owned());
-                inner.ack_reactions = false;
-                inner.native_sessions = Some(Arc::new(
-                    zeroclaw_session_host::NativeSessionHub::new(inner.live_config.clone()),
-                ));
-                let mut message = ChannelMessage::new(
-                    "original",
-                    "10001",
-                    "10001",
-                    "ORIGINAL_ARCHITECTURE_DECISION",
-                    "simplex",
-                    1,
-                );
-                message.platform_sender_id = Some("10001".into());
-                message.channel_alias = Some("personal".into());
-                message.explicitly_addressed = true;
-                Box::pin(process_channel_message(
-                    ctx.clone(),
-                    message.clone(),
-                    CancellationToken::new(),
-                ))
-                .await;
-                message.id = "latest-source-turn".into();
-                message.content = "RECENT_UNRESOLVED_REQUEST".into();
-                Box::pin(process_channel_message(
-                    ctx.clone(),
-                    message.clone(),
-                    CancellationToken::new(),
-                ))
-                .await;
-                message.id = "compact-command".into();
-                message.content = "/compact".into();
-                Box::pin(process_channel_message(
-                    ctx.clone(),
-                    message.clone(),
-                    CancellationToken::new(),
-                ))
-                .await;
-                let requests = server.received_requests().await.unwrap();
-                assert_eq!(
-                    requests.len(),
-                    1,
-                    "{backend}/{mode}: summary must dispatch exactly once"
-                );
-                let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-                assert_eq!(request["stream"], true);
-                assert!(request["tools"].is_null());
-                assert!(
-                    request
-                        .to_string()
-                        .contains("ORIGINAL_ARCHITECTURE_DECISION")
-                );
-                assert!(request.to_string().contains("RECENT_UNRESOLVED_REQUEST"));
-                assert!(request.to_string().contains("4000 UTF-8 bytes"));
-                let sent = channel.sent_messages.lock().await;
-                assert!(
-                    sent.iter().any(|reply| reply
-                        .content
-                        .contains("Summarizing the active conversation")),
-                    "{backend}/{mode}: {sent:?}"
-                );
-                let expected = if mode == "valid" {
-                    "Compaction complete"
-                } else {
-                    "Compaction failed"
-                };
-                assert!(
-                    sent.iter().any(|reply| reply.content.contains(expected)),
-                    "{backend}/{mode}: {sent:?}"
-                );
-                drop(sent);
-                let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
-                    directory.path(),
-                    "main-session-test-agent",
-                )
-                .unwrap();
-                let stream =
-                    zeroclaw_api::session_events::SessionId::parse("main-session-test-agent")
-                        .unwrap();
-                let events = store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
+                    };
+                    config.providers.models.llamacpp.insert(
+                        "fixture".into(),
+                        zeroclaw_config::schema::LlamacppModelProviderConfig {
+                            base: zeroclaw_config::schema::ModelProviderConfig {
+                                uri: Some(format!("{}/v1", server.uri())),
+                                model: Some("test-model".into()),
+                                ..Default::default()
+                            },
+                        },
+                    );
+                    // Explicit maintenance must work before automatic rotation is enabled.
+                    let profile = zeroclaw_config::schema::RuntimeProfileConfig {
+                        summary_deck: zeroclaw_config::summary_deck::SummaryDeckConfig {
+                            enabled: false,
+                            provider: "llamacpp.fixture".into(),
+                            max_summary_tokens: 1000,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    config.runtime_profiles.insert("fixture".into(), profile);
+                    config.agents.insert("test-agent".into(), agent.clone());
+                    config.peer_groups.insert(
+                        "fixture".into(),
+                        peer_group("simplex.personal", &["10001"], false),
+                    );
+                    let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                        channel.clone(),
+                        provider.clone(),
+                        config,
+                        agent,
+                        "llamacpp.fixture",
                         None,
-                        10000,
+                    );
+                    let inner = Arc::get_mut(&mut ctx).unwrap();
+                    inner.workspace_dir = Arc::new(directory.path().to_owned());
+                    inner.ack_reactions = false;
+                    inner.native_sessions = Some(Arc::new(
+                        zeroclaw_session_host::NativeSessionHub::new(inner.live_config.clone()),
+                    ));
+                    let mut message = ChannelMessage::new(
+                        "original",
+                        "10001",
+                        "10001",
+                        "ORIGINAL_ARCHITECTURE_DECISION",
+                        "simplex",
+                        1,
+                    );
+                    message.platform_sender_id = Some("10001".into());
+                    message.channel_alias = Some("personal".into());
+                    message.explicitly_addressed = true;
+                    Box::pin(process_channel_message(
+                        ctx.clone(),
+                        message.clone(),
+                        CancellationToken::new(),
+                    ))
+                    .await;
+                    message.id = "latest-source-turn".into();
+                    message.content = "RECENT_UNRESOLVED_REQUEST".into();
+                    Box::pin(process_channel_message(
+                        ctx.clone(),
+                        message.clone(),
+                        CancellationToken::new(),
+                    ))
+                    .await;
+                    message.id = "compact-command".into();
+                    message.content = "/compact".into();
+                    Box::pin(process_channel_message(
+                        ctx.clone(),
+                        message.clone(),
+                        CancellationToken::new(),
+                    ))
+                    .await;
+                    let requests = server.received_requests().await.unwrap();
+                    assert_eq!(
+                        requests.len(),
+                        1,
+                        "{backend}/{mode}: summary must dispatch exactly once"
+                    );
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&requests[0].body).unwrap();
+                    assert_eq!(request["stream"], true);
+                    assert!(request["tools"].is_null());
+                    assert!(
+                        request
+                            .to_string()
+                            .contains("ORIGINAL_ARCHITECTURE_DECISION")
+                    );
+                    assert!(request.to_string().contains("RECENT_UNRESOLVED_REQUEST"));
+                    assert!(request.to_string().contains("4000 UTF-8 bytes"));
+                    let sent = channel.sent_messages.lock().await;
+                    assert!(
+                        sent.iter().any(|reply| reply
+                            .content
+                            .contains("Summarizing the active conversation")),
+                        "{backend}/{mode}: {sent:?}"
+                    );
+                    let expected = if mode == "valid" {
+                        "Compaction complete"
+                    } else {
+                        "Compaction failed"
+                    };
+                    assert!(
+                        sent.iter().any(|reply| reply.content.contains(expected)),
+                        "{backend}/{mode}: {sent:?}"
+                    );
+                    drop(sent);
+                    let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
+                        directory.path(),
+                        "main-session-test-agent",
                     )
-                    .unwrap()
-                    .events;
-                assert!(
-                    events
-                        .iter()
-                        .any(|event| event.body.kind() == EventKind::ProviderRequestPrepared)
-                );
-                let mut original_preserved = false;
-                for event in &events {
-                    if let zeroclaw_api::session_events::EventData::UserContentRecorded {
-                        content_ref,
-                        ..
-                    } = &event.body.data
-                    {
-                        let zeroclaw_api::session_events::PayloadRead::Present(payload) =
-                            store.read_payload(&content_ref.payload_id).unwrap()
-                        else {
-                            panic!("original content must remain readable");
-                        };
-                        let content: zeroclaw_api::session_events::ContentPayload =
-                            serde_json::from_slice(&payload.body).unwrap();
-                        for part in content.parts {
-                            if let zeroclaw_api::session_events::RecordedContentPart::Text {
-                                text_ref,
-                            } = part
-                            {
-                                let zeroclaw_api::session_events::PayloadRead::Present(text) =
-                                    store.read_payload(&text_ref.payload_id).unwrap()
-                                else {
-                                    panic!("original text must remain readable");
-                                };
-                                original_preserved |= String::from_utf8_lossy(&text.body)
-                                    .contains("ORIGINAL_ARCHITECTURE_DECISION");
+                    .unwrap();
+                    let stream =
+                        zeroclaw_api::session_events::SessionId::parse("main-session-test-agent")
+                            .unwrap();
+                    let events = store
+                        .read_page(
+                            &stream,
+                            &EventCursor::beginning(stream.clone()),
+                            None,
+                            10000,
+                        )
+                        .unwrap()
+                        .events;
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| event.body.kind() == EventKind::ProviderRequestPrepared)
+                    );
+                    let mut original_preserved = false;
+                    for event in &events {
+                        if let zeroclaw_api::session_events::EventData::UserContentRecorded {
+                            content_ref,
+                            ..
+                        } = &event.body.data
+                        {
+                            let zeroclaw_api::session_events::PayloadRead::Present(payload) =
+                                store.read_payload(&content_ref.payload_id).unwrap()
+                            else {
+                                panic!("original content must remain readable");
+                            };
+                            let content: zeroclaw_api::session_events::ContentPayload =
+                                serde_json::from_slice(&payload.body).unwrap();
+                            for part in content.parts {
+                                if let zeroclaw_api::session_events::RecordedContentPart::Text {
+                                    text_ref,
+                                } = part
+                                {
+                                    let zeroclaw_api::session_events::PayloadRead::Present(text) =
+                                        store.read_payload(&text_ref.payload_id).unwrap()
+                                    else {
+                                        panic!("original text must remain readable");
+                                    };
+                                    original_preserved |= String::from_utf8_lossy(&text.body)
+                                        .contains("ORIGINAL_ARCHITECTURE_DECISION");
+                                }
                             }
                         }
                     }
-                }
-                assert!(
-                    original_preserved,
-                    "Original transcript must remain readable after compaction"
-                );
-                // Rebuild the hub and clear all disposable channel context: next turn must restore the committed projection.
-                let inner = Arc::get_mut(&mut ctx).unwrap();
-                inner.conversation_histories.lock().unwrap().clear();
-                inner.native_sessions = Some(Arc::new(
-                    zeroclaw_session_host::NativeSessionHub::new(inner.live_config.clone()),
-                ));
-                message.id = "continuation".into();
-                message.content = "Continue implementation".into();
-                Box::pin(process_channel_message(
-                    ctx.clone(),
-                    message,
-                    CancellationToken::new(),
-                ))
-                .await;
-                let calls = provider.calls.lock().unwrap();
-                assert_eq!(
-                    calls.len(),
-                    3,
-                    "{backend}/{mode}: no conversational model call for command"
-                );
-                let next = format!("{:?}", calls[2]);
-                if mode == "valid" {
-                    assert!(!next.contains("RECENT_UNRESOLVED_REQUEST"));
-                    assert!(next.contains(&summary), "{backend}: {next}");
                     assert!(
-                        !next.contains("ORIGINAL_ARCHITECTURE_DECISION"),
-                        "{backend}: raw context must be replaced"
+                        original_preserved,
+                        "Original transcript must remain readable after compaction"
                     );
-                    assert!(
-                        calls[2].iter().any(|(role, text)| role == "user"
-                            && text.contains("generated historical data"))
+                    // Rebuild the hub and clear all disposable channel context: next turn must restore the committed projection.
+                    let inner = Arc::get_mut(&mut ctx).unwrap();
+                    inner.conversation_histories.lock().unwrap().clear();
+                    inner.native_sessions = Some(Arc::new(
+                        zeroclaw_session_host::NativeSessionHub::new(inner.live_config.clone()),
+                    ));
+                    message.id = "continuation".into();
+                    message.content = "Continue implementation".into();
+                    Box::pin(process_channel_message(
+                        ctx.clone(),
+                        message,
+                        CancellationToken::new(),
+                    ))
+                    .await;
+                    let calls = provider.calls.lock().unwrap();
+                    assert_eq!(
+                        calls.len(),
+                        3,
+                        "{backend}/{mode}: no conversational model call for command"
                     );
-                } else {
-                    assert!(
-                        next.contains("ORIGINAL_ARCHITECTURE_DECISION"),
-                        "{backend}/{mode}: failed summary must retain source"
-                    );
+                    let next = format!("{:?}", calls[2]);
+                    if mode == "valid" {
+                        assert!(!next.contains("RECENT_UNRESOLVED_REQUEST"));
+                        assert!(next.contains(&summary), "{backend}: {next}");
+                        assert!(
+                            !next.contains("ORIGINAL_ARCHITECTURE_DECISION"),
+                            "{backend}: raw context must be replaced"
+                        );
+                        assert!(calls[2].iter().any(|(role, text)| role == "user"
+                            && text.contains("generated historical data")));
+                    } else {
+                        assert!(
+                            next.contains("ORIGINAL_ARCHITECTURE_DECISION"),
+                            "{backend}/{mode}: failed summary must retain source"
+                        );
+                    }
                 }
             }
-        }
         });
     }
 
