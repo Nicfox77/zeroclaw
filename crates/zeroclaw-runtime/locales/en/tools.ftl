@@ -278,7 +278,7 @@ tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the tas
 # Configured image generation backend
 tool-image-gen = Generate an image from a text prompt using the configured image model. Saves the result to the workspace images directory and returns the file path.
 image-gen-model-description = Model identifier; omit to use the configured default image model.
-image-gen-size-description = Image size as WIDTHxHEIGHT (for example 512x512 or 1024x768), auto, or an existing aspect-ratio preset. The provider validates supported dimensions.
+image-gen-size-description = Image size as positive WIDTHxHEIGHT, auto (if supported), or a preset: square_hd=1024x1024, landscape_4_3=1024x768, portrait_4_3=768x1024, landscape_16_9=1024x576, portrait_16_9=576x1024. Default: 1024x1024. Check local tool notes and provider limits before choosing dimensions; the provider may adjust dimensions. Set size explicitly; wording in the prompt does not set resolution.
 image-gen-extras-description = Optional provider-specific generation parameters such as seed or steps. Cannot override model, prompt, size, image count, streaming, endpoint, or authentication.
 image-gen-error-size = Image size must be a preset, auto, or positive WIDTHxHEIGHT dimensions
 image-gen-error-extras = Invalid image generation extra_body parameters
@@ -291,3 +291,7 @@ image-gen-error-endpoint-response = Image endpoint did not return a valid image-
 image-gen-error-single-image = Image endpoint must return exactly one image in data
 image-gen-error-base64 = Image endpoint must return valid base64 image data in data[0].b64_json; URL responses are not supported
 image-gen-error-json-limit = Image response exceeds the 20 MiB decoded image size limit
+
+image-gen-error-endpoint-rejected = Image endpoint rejected the request with HTTP { $status }. Check the configured provider's supported size, model, and extra_body options before retrying. This is a tool failure; continue the conversation or correct the request.
+
+image-gen-output-dimensions = Actual dimensions: { $width }x{ $height } pixels

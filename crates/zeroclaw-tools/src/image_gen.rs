@@ -25,6 +25,14 @@ struct OpenAIImageBackend {
     extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Only explicit request rejections are safe to return to the model for repair.
+/// Transport errors and server failures can follow an external effect and must
+/// retain the runtime's uncertain-outcome handling.
+enum OpenAIImageResponse {
+    Generated(Vec<u8>),
+    Rejected(String),
+}
+
 fn openai_image_size(size: &str) -> Option<String> {
     let size = match size {
         "square_hd" => "1024x1024",
@@ -360,9 +368,7 @@ impl ImageGenTool {
         prompt: &str,
         size: &str,
         extra_body: Option<&serde_json::Value>,
-    ) -> anyhow::Result<Vec<u8>> {
-        let size = openai_image_size(size)
-            .ok_or_else(|| anyhow::Error::msg(get_required_tool_string("image-gen-error-size")))?;
+    ) -> anyhow::Result<OpenAIImageResponse> {
         let mut body = backend.extra_body.clone();
         if let Some(extra) = extra_body {
             body.extend(
@@ -388,14 +394,31 @@ impl ImageGenTool {
             .send()
             .await
             .context(get_required_tool_string("image-gen-error-endpoint-request"))?;
+        let status = response.status();
+        if matches!(
+            status.as_u16(),
+            400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 | 429
+        ) {
+            // Do not expose arbitrary endpoint bodies: they can echo credentials
+            // or private request contents. Provider-specific size guidance belongs
+            // in the operator's local tool notes.
+            return Ok(OpenAIImageResponse::Rejected(
+                get_required_tool_string_with_args(
+                    "image-gen-error-endpoint-rejected",
+                    &[("status", &status.to_string())],
+                ),
+            ));
+        }
         anyhow::ensure!(
-            response.status().is_success(),
+            status.is_success(),
             get_required_tool_string_with_args(
                 "image-gen-error-endpoint-status",
                 &[("status", &response.status().to_string())]
             )
         );
-        read_openai_image_body(response).await
+        read_openai_image_body(response)
+            .await
+            .map(OpenAIImageResponse::Generated)
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -507,6 +530,28 @@ impl ImageGenTool {
             });
         }
 
+        let openai_size = if self.openai.is_some() {
+            let Some(size) = openai_image_size(size) else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(get_required_tool_string("image-gen-error-size")),
+                });
+            };
+            if let Some(extra) = args.get("extra_body") {
+                if OpenAIImageProviderConfig::validate_extra_body(extra).is_err() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(get_required_tool_string("image-gen-error-extras")),
+                    });
+                }
+            }
+            Some(size)
+        } else {
+            None
+        };
+
         let model = args
             .get("model")
             .and_then(|v| v.as_str())
@@ -546,15 +591,26 @@ impl ImageGenTool {
         };
 
         let bytes = if let Some(backend) = &self.openai {
-            self.generate_openai(
-                backend,
-                &api_key,
-                model,
-                &prompt,
-                size,
-                args.get("extra_body"),
-            )
-            .await?
+            match self
+                .generate_openai(
+                    backend,
+                    &api_key,
+                    model,
+                    &prompt,
+                    openai_size.as_deref().unwrap_or(size),
+                    args.get("extra_body"),
+                )
+                .await?
+            {
+                OpenAIImageResponse::Generated(bytes) => bytes,
+                OpenAIImageResponse::Rejected(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+            }
         } else {
             // ── Call fal.ai ────────────────────────────────────────────
             let client = Self::http_client()?;
@@ -629,7 +685,23 @@ impl ImageGenTool {
         let size_kb = bytes.len() / 1024;
 
         let path_display = output_path.display().to_string();
-        let output = format_image_tool_output(&path_display, size_kb, model, &prompt);
+        let mut output = format_image_tool_output(&path_display, size_kb, model, &prompt);
+        // Report the returned PNG, not the requested size: compatible providers
+        // may normalize dimensions to their model's latent grid.
+        if bytes.len() >= 24 && &bytes[12..16] == b"IHDR" {
+            let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+            let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+            output.push_str(&format!(
+                "\n{}",
+                get_required_tool_string_with_args(
+                    "image-gen-output-dimensions",
+                    &[
+                        ("width", &width.to_string()),
+                        ("height", &height.to_string())
+                    ]
+                )
+            ));
+        }
 
         // The generated image is declared as an attachment; the body keeps
         // the durable File: line instead of marker syntax (which is text
@@ -824,6 +896,7 @@ mod tests {
         let valid =
             json!({"b64_json":base64::engine::general_purpose::STANDARD.encode(png_fixture())});
         for (status, body) in [(302, "redirect".into()), (401, "fixture-private-key".into()),
+            (408, "timeout".into()), (500, "server failure".into()),
             (200, "not JSON".into()), (200, json!({"data":[]}).to_string()),
             (200, json!({"data":[{"url":"http://127.0.0.1:1/must-not-fetch"}]}).to_string()),
             (200, json!({"data":[{"b64_json":"not-base64!"}]}).to_string()),
@@ -835,11 +908,76 @@ mod tests {
                 .expect(1).mount(&server).await;
             let mut tool = test_tool(); tool.workspace_dir = workspace.path().into();
             let tool = tool.with_openai_profile(&openai_profile(&server.uri(), Some(key.clone()))).unwrap();
-            let error = tool.execute(json!({"prompt":"A blue circle"})).await.unwrap_err();
-            assert!(!error.to_string().contains("fixture-private-key"));
+            let result = tool.execute(json!({"prompt":"A blue circle"})).await;
+            let error = if status == 401 {
+                let result = result.unwrap();
+                assert!(!result.success);
+                result.error.unwrap()
+            } else {
+                result.unwrap_err().to_string()
+            };
+            assert!(!error.contains("fixture-private-key"));
             assert!(!workspace.path().join("images").exists());
         }
     }
+    #[tokio::test]
+    async fn openai_image_rejection_is_recoverable_and_corrected_request_succeeds() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let key = workspace.path().join("api.key");
+        tokio::fs::write(&key, "fixture-private-key").await.unwrap();
+        let mut tool = test_tool();
+        tool.workspace_dir = workspace.path().into();
+        let tool = tool
+            .with_openai_profile(&openai_profile(&server.uri(), Some(key)))
+            .unwrap();
+        for (size, status) in [("700x1024", 400), ("701x1024", 422)] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"size":size})))
+                .respond_with(ResponseTemplate::new(status).set_body_string("fixture-private-key"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = tool
+                .execute(json!({"prompt":"A circle", "size":size}))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            let error = result.error.unwrap();
+            assert!(error.contains(&status.to_string()));
+            assert!(!error.contains("fixture-private-key"));
+            assert!(result.output.attachments().is_empty());
+            assert!(!workspace.path().join("images").exists());
+        }
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"size":"704x1024"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":[{"b64_json":
+                base64::engine::general_purpose::STANDARD.encode(png_fixture())}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = tool
+            .execute(json!({"prompt":"A circle", "size":"704x1024"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output.attachments().len(), 1);
+        assert!(result.output.to_string().contains("1x1"));
+        let count = server.received_requests().await.unwrap().len();
+        let invalid = tool
+            .execute(json!({"prompt":"A circle", "size":"not-a-size"}))
+            .await
+            .unwrap();
+        assert!(!invalid.success);
+        assert_eq!(server.received_requests().await.unwrap().len(), count);
+    }
+
     #[tokio::test]
     async fn openai_image_provider_rejects_reserved_extras_before_request() {
         use wiremock::MockServer;
@@ -860,9 +998,11 @@ mod tests {
             json!("invalid"),
         ] {
             assert!(
-                tool.execute(json!({"prompt":"A circle","extra_body":extra}))
+                !tool
+                    .execute(json!({"prompt":"A circle","extra_body":extra}))
                     .await
-                    .is_err()
+                    .unwrap()
+                    .success
             );
             let mut invalid = profile.clone();
             invalid.extra_body = Some(extra);

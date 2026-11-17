@@ -293,6 +293,15 @@ attachment. JSON is bounded before parsing and decoded bytes are checked before
 writing. URL responses, multiple images, edits, and streaming are not supported.
 Omit `image_gen.provider` to retain existing fal.ai behavior and settings.
 
+Malformed size or extra parameters and explicit endpoint request rejections
+return an unsuccessful tool result, allowing the agent to correct the request.
+Transport errors, request timeouts and uncertain server outcomes still propagate
+rather than automatically replaying a potentially accepted image generation.
+The tool reports actual dimensions from the returned PNG header; compatible
+providers may adjust requested sizes to their model's supported grid. Record
+provider-specific size limits and supported extras in local tool notes.
+
+
 ## See also
 
 - [MCP](./mcp.md)
