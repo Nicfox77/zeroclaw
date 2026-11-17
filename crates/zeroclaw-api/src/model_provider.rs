@@ -557,6 +557,13 @@ impl ChatResponse {
 /// An unclosed opening tag suppresses the remainder so partial reasoning never
 /// becomes final output.
 pub fn strip_think_tags(text: &str) -> String {
+    strip_think_tags_preserving_whitespace(text)
+        .trim()
+        .to_string()
+}
+
+/// Remove inline reasoning without changing visible whitespace needed for replay.
+pub fn strip_think_tags_preserving_whitespace(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
     loop {
@@ -572,7 +579,7 @@ pub fn strip_think_tags(text: &str) -> String {
             break;
         }
     }
-    result.trim().to_string()
+    result
 }
 
 /// Requested tool-call cadence for one provider response.

@@ -28,7 +28,7 @@ pub(crate) fn build_native_assistant_history(
     reasoning_content: Option<&str>,
 ) -> ChatMessage {
     ChatMessage::assistant_tool_calls(
-        text.trim(),
+        text,
         tool_calls.to_vec(),
         reasoning_content.map(str::to_owned),
     )
@@ -167,6 +167,12 @@ pub(crate) async fn interpret_chat_response(
 ) -> InterpretedResponse {
     let resp_input_tokens = resp.usage.as_ref().and_then(|u| u.input_tokens);
 
+    // Display cleanup may trim text; replay must retain the provider's visible
+    // bytes so the next request extends its generated token prefix.
+    let replay_text = strip_trailing_terminal_markers(
+        &zeroclaw_api::model_provider::strip_think_tags_preserving_whitespace(resp.text_or_empty()),
+    );
+
     let response_text = strip_think_tags(resp.text_or_empty());
     // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
     // Handles stacked markers with arbitrary whitespace between them.
@@ -277,13 +283,9 @@ pub(crate) async fn interpret_chat_response(
             &calls,
             reasoning_content.as_deref(),
         )
-        .unwrap_or_else(|| ChatMessage::assistant(&response_text))
+        .unwrap_or_else(|| ChatMessage::assistant(&replay_text))
     } else {
-        build_native_assistant_history(
-            &response_text,
-            &resp.tool_calls,
-            reasoning_content.as_deref(),
-        )
+        build_native_assistant_history(&replay_text, &resp.tool_calls, reasoning_content.as_deref())
     };
 
     let native_calls = resp.tool_calls;
@@ -629,6 +631,90 @@ mod argument_preservation_tests {
             false,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn native_replay_preserves_whitespace_without_changing_display_cleanup() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "test.provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "argument-preservation",
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let specs = IterationToolSpecs {
+            known_tool_names: HashSet::from(["probe".to_string()]),
+            tool_specs: vec![ToolSpec::new(
+                "probe",
+                "test fixture",
+                json!({"type":"object"}),
+            )],
+            exposed_tool_specs: None,
+            use_native_tools: true,
+        };
+        for (raw, replay, display) in [
+            ("\n ACK \n\n", "\n ACK \n\n", "ACK"),
+            ("\n<think>hidden</think>\n ACK \n\n", "\n\n ACK \n\n", "ACK"),
+            (" \nACK \n<eom> ", " \nACK \n", "ACK \n"),
+        ] {
+            for with_call in [false, true] {
+                let calls = if with_call {
+                    vec![ToolCall {
+                        id: "call-test".into(),
+                        name: "probe".into(),
+                        arguments: r#"{"z":1, "a":2}"#.into(),
+                        extra_content: None,
+                    }]
+                } else {
+                    vec![]
+                };
+                let result = interpret_chat_response(
+                    &ctx,
+                    "test.provider",
+                    "test-model",
+                    ChatResponse {
+                        output_blocks: vec![],
+                        text: Some(raw.into()),
+                        tool_calls: calls,
+                        usage: None,
+                        reasoning_content: None,
+                    },
+                    &[],
+                    &specs,
+                    false,
+                    0,
+                    false,
+                )
+                .await;
+                assert_eq!(result.response_text, display);
+                assert_eq!(result.assistant_history_content.content, replay);
+                if with_call {
+                    assert_eq!(
+                        result.assistant_history_content.tool_calls[0].arguments,
+                        r#"{"z":1, "a":2}"#
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
