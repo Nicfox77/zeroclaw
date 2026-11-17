@@ -109,9 +109,8 @@ pub use zeroclaw_api::model_provider::CONTEXT_IMAGE_TOKEN_ESTIMATE as IMAGE_TOKE
 /// attachments it declared, with any attachment-looking syntax in its body counted as text,
 /// and a user message is charged for its loadable structured image attachments.
 /// The per-image charge applies only when preparation
-/// dispatches the images ([`AttachmentDisposition::Normalized`]); stale
-/// tool-result carriers are priced as their bytes (the same formula as
-/// literal text; see the arm below), and system or assistant content
+/// dispatches the images ([`AttachmentDisposition::Normalized`]); retained
+/// tool-result images use the same charge as user images, and system or assistant content
 /// stays literal text. A message without loadable attachments keeps the
 /// plain-text formula. Single-sourced so the history
 /// and system-floor estimates stay in lock-step.
@@ -126,8 +125,6 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: AttachmentDisposi
         AttachmentDisposition::Normalized => {
             summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
         }
-        // Stripped attachments are not sent; only the text is charged.
-        AttachmentDisposition::Stripped => text_estimate,
         // Unreachable after the guard; keeps the arm total.
         AttachmentDisposition::Literal => text_estimate,
     }
@@ -136,13 +133,8 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: AttachmentDisposi
 /// Estimate token count for a message history using the ~4 chars/token
 /// heuristic plus ~4 framing tokens per message. Images are charged per
 /// image only where preparation dispatches them: structured attachments on
-/// user turns and on the tool-result carriers of
-/// the current user turn. Stale tool-result carriers are priced as their
-/// bytes, and system or assistant content is priced
-/// as text. Trim
-/// probes estimate history suffixes that always retain the newest turn, so
-/// the current turn's tool-result carriers carry the same disposition in
-/// every probe as in the full history.
+/// user turns and retained tool-result carriers. System and assistant content is priced
+/// as text. Trim probes use the same attachment disposition as preparation.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     let dispositions = attachment_dispositions(history);
     history
@@ -442,6 +434,32 @@ mod tests {
         assert_eq!(
             estimate_history_tokens(&[message]),
             IMAGE_TOKEN_ESTIMATE + 4
+        );
+    }
+
+    #[test]
+    fn retained_tool_image_stays_in_followup_token_budget() {
+        let result = ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: "image-call".into(),
+            tool_name: "image_gen".into(),
+            success: Some(true),
+            content: "Generated".into(),
+            attachments: vec![zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "/tmp/generated.png".into(),
+            }],
+        });
+        let mut history = vec![
+            ChatMessage::user("Generate"),
+            result,
+            ChatMessage::assistant("Done"),
+            ChatMessage::user("Follow up"),
+        ];
+        let with_image = estimate_history_tokens(&history);
+        history[1].attachments.clear();
+        assert_eq!(
+            with_image - estimate_history_tokens(&history),
+            IMAGE_TOKEN_ESTIMATE
         );
     }
 

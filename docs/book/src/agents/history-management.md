@@ -234,11 +234,17 @@ Token counts are estimated by `history::estimate_history_tokens`: roughly four
 UTF-8 bytes per token plus four framing tokens per message. Tool arguments,
 reasoning and structured message metadata contribute to this estimate. This is a heuristic,
 not a provider tokenizer. Loadable image attachments are charged a fixed
-per-image cost only in messages whose images are dispatched: user turns and the
-tool results of the current user turn. A tool result's images are the
-attachments the tool declared, not marker text in its output. Older tool
-results are priced as their message bytes, and system and
-assistant text is priced as text.
+per-image cost only in messages whose images are dispatched: user turns and
+retained tool results. A tool result's images are the attachments the tool
+declared, not marker text in its output. System and assistant text is priced
+as text.
+
+Tool-result images remain available across follow-up turns under the same
+`multimodal.max_images` and `max_image_turns` limits as user images. A tool
+result belongs to the user turn that produced it. With age-based trimming
+disabled, adding a text-only follow-up does not remove an earlier tool image
+from the provider request, preserving its cached prefix. Explicit image
+eviction or a changed/unavailable source can still change that prefix.
 
 Reported provider input-token usage calibrates the foreground request estimate
 conservatively upward for the same provider and model. Switching either route

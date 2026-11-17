@@ -7305,12 +7305,11 @@ pub struct MultimodalConfig {
     pub max_image_size_mb: usize,
     /// Maximum age of images in conversation turns.
     ///
-    /// When non-zero, images in user messages that are more than this many
+    /// When non-zero, images in user messages or tool results more than this many
     /// turns back from the end of history are stripped before the request is
     /// sent to the provider. This prevents a single screenshot from being
     /// re-encoded and re-uploaded on every subsequent turn indefinitely.
-    /// Tool-result images are already managed by the stale-tool-result
-    /// mechanism and are not affected by this setting.
+    /// Tool results have the age of the user turn that produced them.
     ///
     /// `0` (the default) disables age-based trimming entirely — images are
     /// only evicted by the `max_images` count cap.

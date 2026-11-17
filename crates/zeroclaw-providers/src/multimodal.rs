@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::media::{
@@ -607,32 +607,8 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
-/// Locate tool results belonging to the most recent user turn.
-fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
-    let current_turn_start = messages.iter().rposition(|message| message.role == "user");
-
-    let mut indices = HashSet::new();
-    for (index, message) in messages.iter().enumerate() {
-        if current_turn_start.is_some_and(|start| index < start) {
-            continue;
-        }
-        if message.tool_result.is_some() {
-            indices.insert(index);
-        }
-    }
-    indices
-}
-
-fn should_normalize_message_images(
-    index: usize,
-    message: &ChatMessage,
-    current_turn_tool_result_indices: &HashSet<usize>,
-) -> bool {
-    if message.tool_result.is_some() {
-        return current_turn_tool_result_indices.contains(&index);
-    }
-
-    message.role == "user"
+fn should_normalize_message_images(message: &ChatMessage) -> bool {
+    message.role == "user" || message.tool_result.is_some()
 }
 
 /// How multimodal preparation will treat the image attachments in a
@@ -640,30 +616,23 @@ fn should_normalize_message_images(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentDisposition {
     /// Loadable attachments become provider image blocks: user messages and
-    /// tool-result carriers in the current user turn.
+    /// retained tool-result carriers, subject to the configured age/count limits.
     Normalized,
-    /// Attachments are stripped before dispatch: tool-result carriers before the
-    /// current user turn.
-    Stripped,
     /// Content is dispatched verbatim as text: system and assistant messages.
     Literal,
 }
 
 /// One disposition per message, computed with the same predicates preparation
-/// uses (typed tool-result metadata, `current_turn_tool_result_indices`,
-/// `should_normalize_message_images`). Dispositions do not model the
+/// uses (typed tool-result metadata and `should_normalize_message_images`).
+/// Dispositions do not model the
 /// config-dependent image limits (`max_images`, `max_image_turns`), which can
 /// strip or cap images preparation would otherwise dispatch.
 pub fn attachment_dispositions(messages: &[ChatMessage]) -> Vec<AttachmentDisposition> {
-    let current_turn_indices = current_turn_tool_result_indices(messages);
     messages
         .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            if should_normalize_message_images(index, message, &current_turn_indices) {
+        .map(|message| {
+            if should_normalize_message_images(message) {
                 AttachmentDisposition::Normalized
-            } else if message.tool_result.is_some() {
-                AttachmentDisposition::Stripped
             } else {
                 AttachmentDisposition::Literal
             }
@@ -722,9 +691,6 @@ async fn prepare_messages_inner(
         let mut result = message.clone();
         match dispositions[index] {
             AttachmentDisposition::Literal => {}
-            AttachmentDisposition::Stripped => {
-                result = trim_message_images(message, usize::MAX);
-            }
             AttachmentDisposition::Normalized => {
                 let refs = message_image_refs(message);
                 if !refs.is_empty() {
@@ -823,7 +789,10 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
             if message.role == "user" {
                 turn_count += 1;
             }
-            if turn_count > max_turns && message.role == "user" {
+            // A result belongs to the user message preceding it. In reverse
+            // order that user row has not been counted yet.
+            let age = turn_count + usize::from(message.tool_result.is_some());
+            if age > max_turns && should_normalize_message_images(message) {
                 trim_message_images(message, usize::MAX)
             } else {
                 message.clone()
@@ -6487,11 +6456,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_strips_tool_image_after_next_user_message() {
+    async fn prepare_messages_preserves_tool_image_prefix_after_next_user_message() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("same-turn-tool-result.png");
-        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        std::fs::write(&image_path, png).unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let image_tool_content = native_carrier(
             "tc_image",
@@ -6520,16 +6488,25 @@ mod tests {
                 None,
             ),
             weather_tool_content,
+            ChatMessage::assistant("The screenshot is ready and the weather is sunny."),
             ChatMessage::user("What did you find?".to_string()),
         ];
 
+        let previous = prepare_messages_for_provider(&messages[..5], &MultimodalConfig::default())
+            .await
+            .expect("prepare original tool-result request");
         let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
-            .expect("stale tool images should strip without loading them");
+            .expect("retained tool images should remain loadable");
 
         assert!(
-            !prepared.contains_images,
-            "once the next user message arrives the turn's tool images are stale"
+            prepared.contains_images,
+            "a follow-up must retain the previous tool image"
+        );
+        assert_eq!(
+            serde_json::to_vec(&prepared.messages[..5]).unwrap(),
+            serde_json::to_vec(&previous.messages).unwrap(),
+            "the existing provider request prefix must stay byte-stable"
         );
 
         let value: serde_json::Value =
@@ -6544,8 +6521,8 @@ mod tests {
             .expect("content should remain a JSON string");
         assert_eq!(inner, "generated screenshot");
         assert!(
-            carrier_image_targets(&prepared.messages[2]).is_empty(),
-            "the turn's tool images are stale once the next user message arrives"
+            carrier_image_targets(&prepared.messages[2])[0].starts_with("data:image/png;base64,"),
+            "retain the normalized attachment rather than only the tool text"
         );
         assert!(!inner.contains("data:image"));
         assert!(!inner.contains("same-turn-tool-result.png"));
@@ -6680,7 +6657,7 @@ mod tests {
     }
 
     #[test]
-    fn count_image_attachments_ignores_stale_tool_results() {
+    fn count_image_attachments_includes_retained_tool_results() {
         let messages = vec![
             (native_carrier("tc1", "Generated", &["/tmp/stale-tool.png".to_string()])),
             ChatMessage {
@@ -6696,7 +6673,7 @@ mod tests {
             ChatMessage::user("Next question".to_string()),
         ];
 
-        assert_eq!(count_image_attachments(&messages), 0);
+        assert_eq!(count_image_attachments(&messages), 1);
 
         let messages = vec![
             ChatMessage::user("Create an image".to_string()),
@@ -6704,6 +6681,49 @@ mod tests {
         ];
 
         assert_eq!(count_image_attachments(&messages), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_tool_images_obey_age_and_count_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("retained.png");
+        std::fs::write(&path, valid_png()).unwrap();
+        let image = path.display().to_string();
+        let mut messages = vec![
+            ChatMessage::user("Generate"),
+            native_carrier("old", "Generated", &[image.clone()]),
+            ChatMessage::assistant("Done"),
+            ChatMessage::user("Follow up"),
+        ];
+        let aged = prepare_messages_for_provider(
+            &messages,
+            &MultimodalConfig {
+                max_image_turns: 1,
+                ..MultimodalConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!aged.contains_images);
+        assert!(aged.messages[1].attachments.is_empty());
+        assert_eq!(
+            messages[1].attachments.len(),
+            1,
+            "do not mutate canonical history"
+        );
+        messages.push(native_carrier("new", "Generated again", &[image]));
+        let capped = prepare_messages_for_provider(
+            &messages,
+            &MultimodalConfig {
+                max_images: 1,
+                ..MultimodalConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(capped.messages[1].attachments.is_empty());
+        assert_eq!(capped.messages[4].attachments.len(), 1);
+        assert_eq!(count_image_attachments(&capped.messages), 1);
     }
 
     #[test]
