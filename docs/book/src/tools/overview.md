@@ -301,7 +301,6 @@ The tool reports actual dimensions from the returned PNG header; compatible
 providers may adjust requested sizes to their model's supported grid. Record
 provider-specific size limits and supported extras in local tool notes.
 
-
 ## See also
 
 - [MCP](./mcp.md)
