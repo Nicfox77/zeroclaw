@@ -7336,11 +7336,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// Fails before the change: preparation already produced the data URI, and
     /// the converter then stripped it and wrote an omission note.
     ///
-    /// The tool message has to stay inside the current user turn.
-    /// `current_turn_tool_result_indices` normalizes tool-result images only
-    /// for the turn that produced them; once a later user message arrives the
-    /// marker is replaced with `[image removed from history]` and this test
-    /// asserts nothing.
+    /// The declared attachment remains eligible for normalization on later
+    /// user turns, subject to the configured image age/count limits.
     #[tokio::test]
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
