@@ -7,6 +7,7 @@ pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
 pub(crate) mod elicitation;
 pub(crate) mod events;
+pub(crate) mod evidence;
 pub(crate) mod execution;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
@@ -40,6 +41,7 @@ pub use events::{
     StreamDelta, THINKING_STATUS_PREFIX, is_thinking_status_text, thinking_status_label_round,
     thinking_status_round, thinking_status_text,
 };
+pub use evidence::{AppliedSteering, TurnEvidence, TurnEvidenceCapture};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
@@ -1631,13 +1633,14 @@ pub(crate) enum InitialIngressSubject<'a> {
 /// yielded with `SteeringPending`, so the resumed run calibrates its first
 /// dispatch exactly as the yielded run would have. Agent owns the repetition
 /// guard for its API turn, including steering/model-switch reentry.
-pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
+pub(crate) fn run_tool_call_loop_with_initial_ingress_and_optional_evidence<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    evidence: Option<&'a TurnEvidenceCapture>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard, evidence)
 }
 
 /// Non-streamed Agent turns own the guard without steering ingress.
@@ -1646,13 +1649,25 @@ pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, None, None, repetition_guard)
+    run_tool_call_loop_impl(p, None, None, repetition_guard, None)
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None, None)
+    run_tool_call_loop_impl(p, None, None, None, None)
+}
+
+/// Run a pull-based channel tool loop and retain authoritative turn evidence.
+///
+/// Existing callers use [`run_tool_call_loop`] and retain their current
+/// behavior. A consumer that retains completed conversations creates one
+/// [`TurnEvidenceCapture`] for the turn and reads its snapshot after the loop.
+pub fn run_tool_call_loop_with_evidence<'a>(
+    p: ToolLoop<'a>,
+    evidence: &'a TurnEvidenceCapture,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_impl(p, None, None, None, Some(evidence))
 }
 
 async fn run_tool_call_loop_impl<'a>(
@@ -1660,6 +1675,7 @@ async fn run_tool_call_loop_impl<'a>(
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    evidence: Option<&'a TurnEvidenceCapture>,
 ) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -1756,6 +1772,10 @@ async fn run_tool_call_loop_impl<'a>(
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
+
+    if let Some(evidence) = evidence {
+        evidence.begin_turn(turn_id);
+    }
 
     let ingress_policy_cfg = IngressPolicy::default();
 
@@ -2069,6 +2089,9 @@ async fn run_tool_call_loop_impl<'a>(
                     // Not reachable under the default policy; drop the injection
                     // (do not append it) when it is.
                     IngressDecision::Drop { .. } => continue,
+                }
+                if let Some(evidence) = evidence {
+                    evidence.apply_steering(&steering_input);
                 }
                 let msg = ChatMessage::user(steering_input.into_text());
                 has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
@@ -3313,6 +3336,9 @@ async fn run_tool_call_loop_impl<'a>(
             }
 
             let msg = ChatMessage::assistant(response_text.clone());
+            if let Some(evidence) = evidence {
+                evidence.replace_model_final(&response_text);
+            }
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
                 // Terminal response: no next request will be dispatched, so no

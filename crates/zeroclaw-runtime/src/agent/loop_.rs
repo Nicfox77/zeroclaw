@@ -1332,7 +1332,8 @@ pub use super::turn::{
     ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
     THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
     is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
-    scrub_credentials, thinking_status_label_round, thinking_status_round, thinking_status_text,
+    run_tool_call_loop_with_evidence, scrub_credentials, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
 };
 #[cfg(test)]
 pub(crate) use super::turn::{
@@ -4655,6 +4656,108 @@ mod tests {
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
         }
+    }
+
+    #[tokio::test]
+    async fn evidence_mode_records_the_raw_model_final_for_a_pull_loop() {
+        let principal = zeroclaw_api::principal::PrincipalId::from("user:alice");
+        let evidence = crate::agent::TurnEvidenceCapture::new(principal.clone());
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["model final"]);
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("original request"),
+        ];
+        let mut crumb_present = false;
+        let mut injected_memory_preamble = None;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(2);
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::new("apply correction").with_ingress(
+                    zeroclaw_api::ingress::IngressContext {
+                        message_id: Some("steer-1".into()),
+                        source_class: zeroclaw_api::ingress::SourceClass::External,
+                        sender: Some(principal.as_str().into()),
+                        transport: zeroclaw_api::ingress::Transport::Rpc,
+                        trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+                        origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+                        internal_principal: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
+        let response = run_tool_call_loop_with_evidence(
+            ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                capability_binding: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                    security: None,
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut injected_memory_preamble,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: Some(&mut steering_rx),
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                agent_alias: Some("fixture"),
+                turn_id: &turn_id,
+            },
+            &evidence,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response, "model final");
+        let evidence = evidence.snapshot().expect("completed evidence");
+        assert_eq!(evidence.principal, principal);
+        assert_eq!(evidence.model_final, "model final");
+        assert_eq!(evidence.steering.len(), 1);
+        assert_eq!(evidence.steering[0].text, "apply correction");
     }
 
     fn extract_sop_started_run_id(content: &str) -> Option<String> {

@@ -1,5 +1,6 @@
 //! Shared turn execution. Single source of truth for spawn-drain-cancel.
 
+use crate::agent::TurnEvidenceCapture;
 use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
 use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
@@ -141,6 +142,46 @@ where
     Prep: std::future::Future<Output = Result<tokio::sync::OwnedMutexGuard<Agent>, StreamedTurnError>>
         + Send,
 {
+    execute_turn_prepared_with_evidence(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx,
+        admission,
+        None,
+        callbacks,
+    )
+    .await
+}
+
+/// [`execute_turn_prepared`] with an optional authoritative turn-evidence sink.
+///
+/// The capture is an owned clone deliberately moved into the spawned turn
+/// task. Task-local state established by the caller would not cross
+/// `zeroclaw_spawn::spawn!`; this handle does. The caller retains another clone
+/// and reads [`TurnEvidenceCapture::snapshot`] after the returned outcome.
+pub async fn execute_turn_prepared_with_evidence<F, Fut, P, Prep>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
+    evidence: Option<TurnEvidenceCapture>,
+    callbacks: (P, F),
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+    P: FnOnce(tokio::sync::OwnedMutexGuard<Agent>) -> Prep + Send + 'static,
+    Prep: std::future::Future<Output = Result<tokio::sync::OwnedMutexGuard<Agent>, StreamedTurnError>>
+        + Send,
+{
     let (prepare, on_event) = callbacks;
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
@@ -181,14 +222,32 @@ where
             TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            steering_rx.as_mut(),
-                        )
-                        .instrument(span),
+                    async move {
+                        match evidence.as_ref() {
+                            Some(evidence) => {
+                                guard
+                                    .turn_streamed_with_steering_state_and_evidence(
+                                        &prompt,
+                                        event_tx,
+                                        Some(cancel_clone),
+                                        steering_rx.as_mut(),
+                                        evidence,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                guard
+                                    .turn_streamed_with_steering_state(
+                                        &prompt,
+                                        event_tx,
+                                        Some(cancel_clone),
+                                        steering_rx.as_mut(),
+                                    )
+                                    .await
+                            }
+                        }
+                    }
+                    .instrument(span),
                 )
                 .await
         })

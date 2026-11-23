@@ -27,6 +27,10 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
+    AppliedSteering, SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture,
+    TurnEvidence, TurnEvidenceCapture,
+};
+pub use turn::{
     ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
     is_semantic_empty_terminal_completion,
     media_degrade::{
@@ -35,7 +39,6 @@ pub use turn::{
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
-pub use turn::{SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture};
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     zeroclaw_api::tool::takes_runtime_approval(tool_name)

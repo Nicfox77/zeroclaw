@@ -2356,11 +2356,11 @@ impl Agent {
         &mut self,
         prepared: Vec<(crate::agent::SteeringInput, ChatMessage)>,
         turn_id: &str,
-    ) -> Vec<ChatMessage> {
+    ) -> Vec<(crate::agent::SteeringInput, ChatMessage)> {
         let mut admitted = Vec::with_capacity(prepared.len());
         for (input, message) in prepared {
             if self.admit_steering_input(&input, turn_id) {
-                admitted.push(message);
+                admitted.push((input, message));
             }
         }
         admitted
@@ -4920,6 +4920,31 @@ impl Agent {
             event_tx,
             cancel_token,
             steering.0.as_deref_mut(),
+            None,
+        )
+        .await
+    }
+
+    /// Run one streamed turn while the caller retains the raw accepted model
+    /// final and the corrections that actually entered provider-visible
+    /// history. Evidence failures never replace the authorized chat outcome;
+    /// they only make [`crate::agent::TurnEvidenceCapture::snapshot`] return
+    /// `None`.
+    pub async fn turn_streamed_with_steering_state_and_evidence(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+        evidence: &crate::agent::TurnEvidenceCapture,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        let mut steering = CloseSteeringOnExit(steering_rx);
+        self.turn_streamed_with_steering_body(
+            user_message,
+            event_tx,
+            cancel_token,
+            steering.0.as_deref_mut(),
+            Some(evidence),
         )
         .await
     }
@@ -4933,6 +4958,7 @@ impl Agent {
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+        evidence: Option<&crate::agent::TurnEvidenceCapture>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
@@ -4999,6 +5025,9 @@ impl Agent {
         let attempt_allowlist = model_selection.allowed_provider_refs;
         let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
+        if let Some(evidence) = evidence {
+            evidence.begin_turn(&turn_id);
+        }
         // This frame owns the turn id and the model-switch round loop, so it
         // backstops the turn's elicitation hint record on every exit — a
         // switch round that fails to rebuild its provider included.
@@ -5184,7 +5213,8 @@ impl Agent {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         // Steering prepared and judged at the end of a round, consumed at the
         // top of the next with no await in between.
-        let mut steered_continuation: Option<Vec<ChatMessage>> = None;
+        let mut steered_continuation: Option<Vec<(crate::agent::SteeringInput, ChatMessage)>> =
+            None;
         // Provider-reported usage handed over by a run that yielded to
         // steering, so the resumed run keeps the same token calibration.
         let mut carried_reported_usage: Option<crate::agent::turn::ReportedRequestUsage> = None;
@@ -5234,7 +5264,18 @@ impl Agent {
                     self.readmit_prepared_steering(pending, &turn_id)
                 }
             };
-            round_added.extend(steering_messages);
+            if !steering_messages.is_empty() {
+                if let Some(evidence) = evidence {
+                    // A prior round may have produced a model final before the
+                    // wrapper discovered steering. Only the final after this
+                    // correction is evidence for the logical turn.
+                    evidence.clear_model_final();
+                    for (input, _) in &steering_messages {
+                        evidence.apply_steering(input);
+                    }
+                }
+            }
+            round_added.extend(steering_messages.into_iter().map(|(_, message)| message));
             let initial_ingress_subject = if round == 0 {
                 crate::agent::turn::InitialIngressSubject::Original(user_message)
             } else {
@@ -5245,7 +5286,7 @@ impl Agent {
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    Box::pin(crate::agent::turn::run_tool_call_loop_with_initial_ingress(
+                    Box::pin(crate::agent::turn::run_tool_call_loop_with_initial_ingress_and_optional_evidence(
                         crate::agent::loop_::ToolLoop {
                             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                                 crate::agent::loop_::ResolvedModelAccess {
@@ -5363,6 +5404,7 @@ impl Agent {
                         initial_ingress_subject,
                         carried_reported_usage.take(),
                         Some(&repetition_guard),
+                        evidence,
                     )),
                 ),
             );
@@ -18048,6 +18090,150 @@ mod tests {
         assert_eq!(
             memory_stores, 3,
             "only the original and two admitted injections should reach auto-save"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_evidence_records_the_model_final_and_same_principal_steering() {
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        let principal = zeroclaw_api::principal::PrincipalId::from("actor-a");
+        let capture = crate::agent::TurnEvidenceCapture::new(principal.clone());
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(2);
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::new("Use the corrected target.").with_ingress(
+                    steering_context(
+                        "rpc-1",
+                        principal.as_str(),
+                        zeroclaw_api::ingress::Transport::Rpc,
+                    ),
+                ),
+            )
+            .await
+            .expect("steering should enqueue");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        agent
+            .turn_streamed_with_steering_state_and_evidence(
+                "Original request",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+                &capture,
+            )
+            .await
+            .expect("the evidence-enabled turn should complete");
+
+        let evidence = capture.snapshot().expect("completed turn evidence");
+        assert_eq!(evidence.principal, principal);
+        assert_eq!(evidence.model_final, "draft");
+        assert_eq!(evidence.steering.len(), 1);
+        assert_eq!(evidence.steering[0].text, "Use the corrected target.");
+        assert!(
+            seen_messages
+                .lock()
+                .iter()
+                .flat_map(|messages| messages.iter())
+                .any(|message| message.role == "user"
+                    && message.content.contains("Use the corrected target.")),
+            "the correction captured as applied must have reached the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_steering_invalidates_only_evidence_not_the_authorized_turn() {
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        let capture = crate::agent::TurnEvidenceCapture::new(
+            zeroclaw_api::principal::PrincipalId::from("actor-a"),
+        );
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(2);
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::new("foreign correction").with_ingress(
+                    steering_context("rpc-2", "actor-b", zeroclaw_api::ingress::Transport::Rpc),
+                ),
+            )
+            .await
+            .expect("steering should enqueue");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        let outcome = agent
+            .turn_streamed_with_steering_state_and_evidence(
+                "Original request",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+                &capture,
+            )
+            .await
+            .expect("foreign provenance must not reject the authorized chat turn");
+
+        assert_eq!(outcome.response, "draft");
+        assert!(capture.snapshot().is_none());
+        assert!(
+            seen_messages
+                .lock()
+                .iter()
+                .flat_map(|messages| messages.iter())
+                .any(|message| message.role == "user"
+                    && message.content.contains("foreign correction")),
+            "the authorized correction must still reach the model"
         );
     }
 

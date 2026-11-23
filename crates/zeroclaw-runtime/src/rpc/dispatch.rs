@@ -7190,11 +7190,28 @@ impl RpcDispatcher {
             .session_owner_principal(sid)
             .await
             .flatten()
+            // A privileged caller may operate another user's session; that
+            // permission does not make their words the owner's memories.
+            .filter(|owner| Some(owner) == self.owner_principal_id().as_ref())
             .map(|owner| {
                 zeroclaw_api::memory_traits::PrincipalScope::new(owner)
                     .with_agent(Some(agent_alias.clone()))
             });
-        let turn = crate::rpc::turn::execute_turn_prepared(
+        let evidence = hindsight_scope.as_ref().and_then(|scope| {
+            let config = self.ctx.config.read();
+            (matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
+                && config.memory.backend == "hindsight"
+                && config.memory.hindsight.auto_retain
+                && config.agent(&agent_alias).is_some_and(|a| {
+                    a.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight
+                }))
+            .then(|| {
+                crate::agent::TurnEvidenceCapture::new(zeroclaw_api::principal::PrincipalId(
+                    scope.principal_id.clone(),
+                ))
+            })
+        });
+        let turn = crate::rpc::turn::execute_turn_prepared_with_evidence(
             agent,
             prompt.clone(),
             cancel.clone(),
@@ -7209,6 +7226,7 @@ impl RpcDispatcher {
             self.connection_activity.clone(),
             Some(steering_rx),
             None,
+            evidence.clone(),
             (prepare, move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -7486,16 +7504,22 @@ impl RpcDispatcher {
                             && cfg.agent(&agent_alias).is_some_and(|a| a.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight)
                     };
                     if capture_enabled
-                        && let Ok(TurnOutcome::Completed { text, .. }) = &outcome
+                        && matches!(outcome, Ok(TurnOutcome::Completed { .. }))
+                        && let Some(proof) = evidence
+                            .as_ref()
+                            .and_then(crate::agent::TurnEvidenceCapture::snapshot)
                         && let Some(scope) = hindsight_scope.as_ref()
                     {
-                        if zeroclaw_memory::hindsight::upstream::commit_completed_turn(
+                        let corrections: Vec<_> =
+                            proof.steering.into_iter().map(|step| step.text).collect();
+                        if zeroclaw_memory::hindsight::upstream::commit_completed_turn_with_corrections(
                             &self.ctx.config,
                             scope,
                             &key,
                             &turn_id,
                             &req.prompt,
-                            text,
+                            &corrections,
+                            &proof.model_final,
                             zeroclaw_infra::session_sqlite::CompletedSessionWrite::Replace {
                                 messages: &durable,
                                 breadcrumb_present: agent.history_has_trim_breadcrumb(),
@@ -53248,6 +53272,58 @@ mod tests {
     }
 
     const STEER_TEXT: &str = "please also check the second file";
+
+    #[tokio::test]
+    async fn hindsight_outbox_retains_the_applied_rpc_correction_with_the_final_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "hindsight-steer";
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config.memory.backend = "hindsight".into();
+        config.channels.session_backend = "sqlite".into();
+        config.channels.session_persistence = true;
+        config.agents.get_mut("test-agent").unwrap().memory.backend =
+            zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight;
+        let workspace = config.agent_workspace_dir("test-agent");
+        let db = config.data_dir.join("sessions/sessions.db");
+        let (ctx, backend, _) = persistence_enforcement_ctx(config);
+        let mut handles =
+            install_recording_session(&ctx, &backend, sid, "user:alice", &workspace, vec![], true)
+                .await;
+        let (mut driver, mut driver_rx) = roster_peer(&ctx, 4242).await;
+        let (mut steerer, mut steerer_rx) = roster_peer(&ctx, 4242).await;
+        send_prompt(&mut driver, 1, sid, 1).await;
+        handles.await_start().await;
+        let accepted = rpc(
+            &mut steerer,
+            &mut steerer_rx,
+            2,
+            "session/steer",
+            json!({"session_id":sid, "content":STEER_TEXT}),
+        )
+        .await;
+        assert_eq!(accepted["result"]["accepted"], true, "{accepted}");
+        handles.release();
+        let (done, _) = response_and_notifications(&mut driver_rx, 1).await;
+        assert!(done.get("error").is_none(), "{done}");
+        let db = rusqlite::Connection::open(db).unwrap();
+        let payload: String = db
+            .query_row("SELECT body FROM hindsight_pending", [], |r| r.get(0))
+            .unwrap();
+        let items: Value = serde_json::from_str(&payload).unwrap();
+        let transcript: Vec<Value> =
+            serde_json::from_str(items[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|m| (m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("user", "hello"),
+                ("user", STEER_TEXT),
+                ("assistant", "steered reply")
+            ]
+        );
+    }
 
     /// Alice's turn on her own session is parked at its first model call; a
     /// second Alice connection steers it after `before_steer`, then

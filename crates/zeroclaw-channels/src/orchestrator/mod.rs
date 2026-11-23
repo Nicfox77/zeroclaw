@@ -130,9 +130,10 @@ use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    run_tool_call_loop_with_evidence, scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
+use zeroclaw_runtime::agent::{TurnEvidence, TurnEvidenceCapture};
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
 use zeroclaw_runtime::observability::{self, Observer};
@@ -8303,6 +8304,58 @@ pub(super) fn channel_ingress_context(
     ingress
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct HindsightCompletedTurn {
+    user: String,
+    corrections: Vec<String>,
+    assistant: String,
+}
+
+/// Admit Hindsight content only from runtime evidence for this logical turn
+/// and its original private-memory principal, after the normal outbound
+/// sanitizer. A sending hook that changed the delivered text makes the whole
+/// turn ineligible.
+fn accepted_hindsight_turn(
+    scope: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    turn_id: &str,
+    user: &str,
+    evidence: Option<TurnEvidence>,
+    outbound_hook_modified: bool,
+    sanitize_model_final: impl FnOnce(&str) -> String,
+) -> Option<HindsightCompletedTurn> {
+    let scope = scope?;
+    let evidence = evidence?;
+    if outbound_hook_modified
+        || evidence.turn_id != turn_id
+        || evidence.principal.as_str() != scope.principal_id.as_str()
+    {
+        return None;
+    }
+    let assistant = sanitize_model_final(&evidence.model_final);
+    if assistant.trim().is_empty() {
+        return None;
+    }
+    Some(HindsightCompletedTurn {
+        user: user.to_owned(),
+        corrections: evidence
+            .steering
+            .into_iter()
+            .map(|step| step.text)
+            .collect(),
+        assistant,
+    })
+}
+
+async fn run_channel_tool_loop<'a>(
+    tool_loop: ToolLoop<'a>,
+    evidence: Option<&'a TurnEvidenceCapture>,
+) -> Result<String> {
+    match evidence {
+        Some(evidence) => run_tool_call_loop_with_evidence(tool_loop, evidence).await,
+        None => run_tool_call_loop(tool_loop).await,
+    }
+}
+
 #[cfg(test)]
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
@@ -10519,6 +10572,11 @@ async fn process_channel_message_body(
     } else {
         None
     };
+    let turn_evidence = hindsight_scope.as_ref().map(|scope| {
+        TurnEvidenceCapture::new(zeroclaw_api::principal::PrincipalId::from(
+            scope.principal_id.clone(),
+        ))
+    });
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -10533,7 +10591,7 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
-            let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
+            let tool_loop = Box::pin(run_channel_tool_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
@@ -10629,7 +10687,7 @@ async fn process_channel_message_body(
                     live_config: Some(ctx.live_config.clone()),
                     memory_owner: ctx.memory.principal_scope(),
                 }),
-            }));
+            }, turn_evidence.as_ref()));
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =
@@ -10922,6 +10980,7 @@ async fn process_channel_message_body(
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = response;
+            let mut outbound_hook_modified = false;
             if let Some(hooks) = &ctx.hooks {
                 match hooks
                     .run_on_message_sending(
@@ -10967,6 +11026,7 @@ async fn process_channel_message_body(
                         }
 
                         if modified_content != outbound_response {
+                            outbound_hook_modified = true;
                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sender": msg.sender, "before_len": outbound_response.chars().count(), "after_len": modified_content.chars().count()})), "outgoing message content modified by hook");
                         }
 
@@ -11039,21 +11099,45 @@ async fn process_channel_message_body(
                                 == zeroclaw_config::multi_agent::MemoryBackendKind::Hindsight
                         })
                 };
-                if capture_enabled && let Some(scope) = hindsight_scope.as_ref() {
+                let hindsight_turn = if capture_enabled {
+                    accepted_hindsight_turn(
+                        hindsight_scope.as_ref(),
+                        &turn_id,
+                        &inbound_content,
+                        turn_evidence
+                            .as_ref()
+                            .and_then(TurnEvidenceCapture::snapshot),
+                        outbound_hook_modified,
+                        |model_final| {
+                            sanitize_channel_response_for_format_with_leak_detection(
+                                model_final,
+                                ctx.tools_registry.as_ref(),
+                                &ctx.prompt_config.security.leak_detection,
+                                outbound_content_format_for_channel(&msg.channel),
+                            )
+                        },
+                    )
+                } else {
+                    None
+                };
+                if let (Some(scope), Some(hindsight_turn)) =
+                    (hindsight_scope.as_ref(), hindsight_turn)
+                {
                     append_sender_turn_with(
                         ctx.as_ref(),
                         &history_key,
                         ChatMessage::assistant(&history_response),
                         true,
                         |reply| {
-                            let committed =
-                                zeroclaw_memory::hindsight::upstream::commit_completed_turn(
+                            let committed = zeroclaw_memory::hindsight::upstream::
+                                commit_completed_turn_with_corrections(
                                     &ctx.live_config,
                                     scope,
                                     &history_key,
                                     &turn_id,
-                                    &msg.content,
-                                    &history_response,
+                                    &hindsight_turn.user,
+                                    &hindsight_turn.corrections,
+                                    &hindsight_turn.assistant,
                                     zeroclaw_infra::session_sqlite::CompletedSessionWrite::Append(
                                         reply,
                                     ),
@@ -20582,6 +20666,167 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hindsight_capture_sanitizes_reasoning_and_leaks_without_delivery_fallback() {
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new("channel-peer:\"alice\"");
+        let evidence = TurnEvidence {
+            turn_id: "turn-1".into(),
+            principal: zeroclaw_api::principal::PrincipalId::from(scope.principal_id.clone()),
+            model_final:
+                "<think>private reasoning</think>Access key AKIAABCDEFGHIJKLMNOP Visible answer"
+                    .into(),
+            steering: Vec::new(),
+        };
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let captured = accepted_hindsight_turn(
+            Some(&scope),
+            "turn-1",
+            "original prompt",
+            Some(evidence),
+            false,
+            |model_final| sanitize_channel_response(model_final, &tools),
+        )
+        .expect("a sanitized main-model reply is retainable");
+
+        assert_eq!(captured.user, "original prompt");
+        assert!(!captured.assistant.contains("private reasoning"));
+        assert!(!captured.assistant.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(captured.assistant.contains("[REDACTED"));
+        assert!(captured.assistant.contains("Visible answer"));
+        assert_ne!(captured.assistant, EMPTY_CHANNEL_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn hindsight_capture_skips_hook_changes_and_empty_sanitized_evidence() {
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new("channel-peer:\"alice\"");
+        let evidence = |model_final: &str| TurnEvidence {
+            turn_id: "turn-1".into(),
+            principal: zeroclaw_api::principal::PrincipalId::from(scope.principal_id.clone()),
+            model_final: model_final.into(),
+            steering: Vec::new(),
+        };
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        assert!(
+            accepted_hindsight_turn(
+                Some(&scope),
+                "turn-1",
+                "original prompt",
+                None,
+                false,
+                |model_final| sanitize_channel_response(model_final, &tools),
+            )
+            .is_none(),
+            "missing runtime evidence must use the ordinary session append path"
+        );
+        assert!(
+            accepted_hindsight_turn(
+                Some(&scope),
+                "turn-1",
+                "original prompt",
+                Some(evidence("model-authored answer")),
+                true,
+                |model_final| sanitize_channel_response(model_final, &tools),
+            )
+            .is_none(),
+            "a hook-rewritten delivery must not be retained as model evidence"
+        );
+        assert!(
+            accepted_hindsight_turn(
+                Some(&scope),
+                "turn-1",
+                "original prompt",
+                Some(evidence("<think>reasoning only</think>")),
+                false,
+                |model_final| sanitize_channel_response(model_final, &tools),
+            )
+            .is_none(),
+            "an empty sanitized proof must be skipped instead of retaining the delivery fallback"
+        );
+    }
+
+    #[test]
+    fn hindsight_capture_preserves_applied_corrections_in_order() {
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new("channel-peer:\"alice\"");
+        let principal = zeroclaw_api::principal::PrincipalId::from(scope.principal_id.clone());
+        let ingress = channel_ingress_context(&ChannelMessage {
+            id: "steer-1".into(),
+            sender: scope.principal_id.clone(),
+            channel: "telegram".into(),
+            channel_alias: Some("alice".into()),
+            ..ChannelMessage::default()
+        });
+        let steering = ["focus on the second file", "keep the first result"]
+            .into_iter()
+            .map(|text| zeroclaw_runtime::agent::AppliedSteering {
+                text: text.into(),
+                principal: principal.clone(),
+                ingress: ingress.clone(),
+            })
+            .collect();
+        let evidence = TurnEvidence {
+            turn_id: "turn-1".into(),
+            principal,
+            model_final: "The second file is the one that changed.".into(),
+            steering,
+        };
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let captured = accepted_hindsight_turn(
+            Some(&scope),
+            "turn-1",
+            "original prompt",
+            Some(evidence),
+            false,
+            |model_final| sanitize_channel_response(model_final, &tools),
+        )
+        .expect("valid evidence with corrections is retainable");
+
+        assert_eq!(
+            captured.corrections,
+            vec![
+                "focus on the second file".to_string(),
+                "keep the first result".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn hindsight_capture_rejects_foreign_principal_or_stale_turn_evidence() {
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new("channel-peer:\"alice\"");
+        let evidence = |turn_id: &str, principal: &str| TurnEvidence {
+            turn_id: turn_id.into(),
+            principal: zeroclaw_api::principal::PrincipalId::from(principal),
+            model_final: "answer".into(),
+            steering: Vec::new(),
+        };
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        assert!(
+            accepted_hindsight_turn(
+                Some(&scope),
+                "turn-1",
+                "original prompt",
+                Some(evidence("turn-1", "channel-peer:\"mallory\"")),
+                false,
+                |model_final| sanitize_channel_response(model_final, &tools),
+            )
+            .is_none()
+        );
+        assert!(
+            accepted_hindsight_turn(
+                Some(&scope),
+                "turn-1",
+                "original prompt",
+                Some(evidence("turn-2", &scope.principal_id)),
+                false,
+                |model_final| sanitize_channel_response(model_final, &tools),
+            )
+            .is_none()
+        );
     }
 
     /// Upper bound for "this must not deadlock" waits in the assembly tests.

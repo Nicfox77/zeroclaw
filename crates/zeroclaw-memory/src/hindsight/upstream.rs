@@ -183,7 +183,16 @@ impl SessionTranscripts {
         let Some(snapshot) = self.store.read_metadata(session)? else {
             return Ok(());
         };
-        self.capture_on(&tx, &snapshot, expected, session, turn, user, assistant)?;
+        self.capture_on(
+            &tx,
+            &snapshot,
+            expected,
+            session,
+            turn,
+            user,
+            &[],
+            assistant,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -196,12 +205,22 @@ impl SessionTranscripts {
         session: &str,
         turn: &str,
         user: &str,
+        corrections: &[String],
         assistant: &str,
         write: zeroclaw_infra::session_sqlite::CompletedSessionWrite<'_>,
     ) -> anyhow::Result<bool> {
         self.store
             .commit_completed_with(session, write, |tx, snapshot| {
-                self.capture_on(tx, snapshot, expected, session, turn, user, assistant)
+                self.capture_on(
+                    tx,
+                    snapshot,
+                    expected,
+                    session,
+                    turn,
+                    user,
+                    corrections,
+                    assistant,
+                )
             })
     }
 
@@ -214,6 +233,7 @@ impl SessionTranscripts {
         session: &str,
         turn: &str,
         user: &str,
+        corrections: &[String],
         assistant: &str,
     ) -> anyhow::Result<bool> {
         let cfg = self.live.read();
@@ -259,10 +279,13 @@ impl SessionTranscripts {
         let terminal = hash(&serde_json::to_vec(&(&stream.id, turn))?);
         let occurred = chrono::Utc::now();
         let names = zeroclaw_config::speakers::resolve(&self.live.read(), agent, &principal)?;
-        let content = serde_json::json!([
-            {"role":"user","speaker":names.user,"timestamp":occurred.to_rfc3339(),"content":user},
-            {"role":"assistant","speaker":names.assistant,"timestamp":occurred.to_rfc3339(),"content":assistant}
-        ]).to_string();
+        let timestamp = occurred.to_rfc3339();
+        let mut messages: Vec<_> = std::iter::once(user)
+            .chain(corrections.iter().map(String::as_str))
+            .map(|text| serde_json::json!({"role":"user","speaker":names.user,"timestamp":timestamp,"content":text}))
+            .collect();
+        messages.push(serde_json::json!({"role":"assistant","speaker":names.assistant,"timestamp":timestamp,"content":assistant}));
+        let content = serde_json::to_string(&messages)?;
         anyhow::ensure!(content.len() <= 128 * 1024, "hindsight_turn_too_large");
         let item = Item {
             content,
@@ -275,7 +298,12 @@ impl SessionTranscripts {
             ),
             metadata: BTreeMap::new(),
         };
-        let fingerprint = hash(&serde_json::to_vec(&(user, assistant))?);
+        // Keep existing receipts comparable on replay of an unsteered turn.
+        let fingerprint = if corrections.is_empty() {
+            hash(&serde_json::to_vec(&(user, assistant))?)
+        } else {
+            hash(&serde_json::to_vec(&(user, corrections, assistant))?)
+        };
         let previous: Option<String> = tx
             .query_row(
                 "SELECT fingerprint FROM hindsight_pending WHERE terminal=?1",
@@ -416,17 +444,25 @@ impl TranscriptSource for SessionTranscripts {
 
 /// Persist the successful final session mutation and its durable ingestion payload.
 #[allow(clippy::too_many_arguments)] // The host supplies one admitted completed turn.
-pub fn commit_completed_turn(
+pub fn commit_completed_turn_with_corrections(
     live: &LiveConfigHandle,
     expected: &zeroclaw_api::memory_traits::PrincipalScope,
     session: &str,
     turn: &str,
     user: &str,
+    corrections: &[String],
     assistant: &str,
     write: zeroclaw_infra::session_sqlite::CompletedSessionWrite<'_>,
 ) -> anyhow::Result<bool> {
-    SessionTranscripts::new(live.clone())?
-        .commit_turn(expected, session, turn, user, assistant, write)
+    SessionTranscripts::new(live.clone())?.commit_turn(
+        expected,
+        session,
+        turn,
+        user,
+        corrections,
+        assistant,
+        write,
+    )
 }
 
 pub struct Worker(tokio::task::AbortHandle);
@@ -617,6 +653,7 @@ mod tests {
                     "rpc_fixture",
                     "atomic-one",
                     "original",
+                    &[],
                     "accepted final reply",
                     CompletedSessionWrite::Append(&reply)
                 )
@@ -629,6 +666,7 @@ mod tests {
                     "rpc_fixture",
                     "atomic-one",
                     "original",
+                    &[],
                     "accepted final reply",
                     CompletedSessionWrite::Append(&reply)
                 )
@@ -648,6 +686,7 @@ mod tests {
                     "rpc_fixture",
                     "atomic-two",
                     "second",
+                    &[],
                     "must roll back",
                     CompletedSessionWrite::Append(&ChatMessage::assistant("must roll back"))
                 )
@@ -682,6 +721,7 @@ mod tests {
                     "rpc_fixture",
                     "deleted",
                     "ignored",
+                    &[],
                     "ignored",
                     CompletedSessionWrite::Append(&reply)
                 )
@@ -696,24 +736,22 @@ mod tests {
         let live = zeroclaw_config::live::LiveConfig::new(config(dir.path(), "http://127.0.0.1:1"));
         let source = SessionTranscripts::new(live.handle()).unwrap();
         session(&source);
-        source
-            .capture(
+        let reply = ChatMessage::assistant("Accepted answer");
+        let commit = |corrections: &[String]| {
+            source.commit_turn(
                 &scope(),
                 "rpc_fixture",
                 "turn-one",
                 "Original source",
+                corrections,
                 "Accepted answer",
+                zeroclaw_infra::session_sqlite::CompletedSessionWrite::Append(&reply),
             )
-            .unwrap();
-        source
-            .capture(
-                &scope(),
-                "rpc_fixture",
-                "turn-one",
-                "Original source",
-                "Accepted answer",
-            )
-            .unwrap();
+        };
+        let corrections = ["First correction".into(), "Second correction".into()];
+        commit(&corrections).unwrap();
+        commit(&corrections).unwrap();
+        assert!(commit(&["Different correction".into()]).is_err());
         source
             .store
             .replace_conversation_state("rpc_fixture", &[ChatMessage::user("Later context")], true)
@@ -739,7 +777,19 @@ mod tests {
                 .contains("Keep User's actions and preferences attributed to User.")
         );
         assert!(body[0].context.ends_with("Timestamps are capture times."));
-        assert!(body[0].content.contains("Original source"));
+        let messages: Vec<serde_json::Value> = serde_json::from_str(&body[0].content).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("user", "Original source"),
+                ("user", "First correction"),
+                ("user", "Second correction"),
+                ("assistant", "Accepted answer")
+            ]
+        );
         assert!(!body[0].content.contains("Later context"));
         assert!(!dir.path().join("sessions/events.db").exists());
         assert!(!dir.path().join("brain.db").exists());
