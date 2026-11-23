@@ -369,6 +369,47 @@ impl Client {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    #[ignore = "requires an explicitly selected Hindsight service"]
+    async fn real_external_service_accepts_and_tracks_a_retain() -> anyhow::Result<()> {
+        let client = Client::new(&HindsightConfig {
+            mode: zeroclaw_config::hindsight::RuntimeMode::External,
+            api_url: std::env::var("ZEROCLAW_TEST_HINDSIGHT_URL")?,
+            ..Default::default()
+        })?;
+        let bank = format!("zeroclaw-smoke-{}", uuid::Uuid::new_v4());
+        client.ensure_bank(&bank).await?;
+        let result = async {
+            let operation = uuid::Uuid::new_v4().to_string();
+            let item = Item {
+                content: "The fictional test rover is named Larch.".into(),
+                document_id: "rover".into(),
+                update_mode: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                context: "Synthetic smoke test".into(),
+                metadata: BTreeMap::new(),
+            };
+            let ack = client.retain(&bank, &[item], &operation).await?;
+            anyhow::ensure!(ack["success"] == true);
+            let tracked = client.operation(&bank, &operation).await?;
+            anyhow::ensure!(matches!(
+                tracked.status.as_str(),
+                "pending" | "processing" | "completed"
+            ));
+            anyhow::Ok(())
+        }
+        .await;
+        client
+            .request(
+                Method::DELETE,
+                &["v1", "default", "banks", &bank],
+                None,
+                false,
+            )
+            .await?;
+        result
+    }
+
     async fn fixture(response: Vec<u8>) -> (Client, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = HindsightConfig {

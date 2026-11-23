@@ -951,6 +951,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(memory.name(), "hindsight");
+        assert_eq!(
+            crate::configured_memory_backend(&config, Some("fixture")),
+            memory.name()
+        );
         assert!(
             memory
                 .recall("anything", 5, None, None, None)

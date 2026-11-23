@@ -1038,9 +1038,11 @@ impl AgentMemorySource {
         match backend {
             Backend::Markdown => Self::WorkspaceMarkdown,
             Backend::None => Self::Disabled,
-            Backend::Sqlite | Backend::Postgres | Backend::Qdrant | Backend::Lucid => {
-                Self::InstallWide
-            }
+            Backend::Sqlite
+            | Backend::Postgres
+            | Backend::Qdrant
+            | Backend::Lucid
+            | Backend::Hindsight => Self::InstallWide,
         }
     }
 }

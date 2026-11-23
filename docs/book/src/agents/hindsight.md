@@ -6,11 +6,19 @@ This feature does not install the proposed native session-event history subsyste
 
 ## Configuration
 
-Start with an independently provisioned Hindsight service and a normal configured agent. Select `hindsight` both globally and for that agent, enable SQLite session persistence, and disable the local memory processors rejected by configuration validation. Other enabled agents must select Hindsight or `none`; cross-agent memory grants are unsupported.
+Start with an independently provisioned Hindsight service and a normal configured agent. Select `hindsight` both globally and for that agent, enable SQLite session persistence, and disable the local memory processors rejected by configuration validation. All other configured agents must select Hindsight or `none`; cross-agent memory grants are unsupported.
 
 ```toml
 [memory]
 backend = "hindsight"
+consolidation_extract_facts = false
+rerank_enabled = false
+
+[memory.types]
+enabled = false
+
+[knowledge]
+enabled = false
 
 [memory.hindsight]
 mode = "external"
@@ -29,6 +37,26 @@ backend = "hindsight"
 Use the normal secret configuration mechanism for service credentials. Never commit credentials or a managed runtime profile. Managed mode additionally requires provisioning the pinned runtime/models and running `zeroclaw memory setup`; setup writes a protected profile, not a runtime installation. Start the daemon to run the background delivery worker. `zeroclaw memory status` reports service and delivery diagnostics; `zeroclaw memory retry-pending` schedules unfinished operations for reconciliation.
 
 Hindsight reflection is an optional built-in: full tool selection includes it; minimal selection can add `hindsight_reflect` to `[tools].optional`. Permission policy still controls its availability. Turning off automatic recall does not restore manual recall or write tools.
+
+## Verify an external service
+
+Run the backend suite from the repository root with
+`cargo test --locked -p zeroclaw-memory --lib hindsight`. It covers completed-turn
+capture, durable delivery, principal isolation, and deletion with temporary
+storage and HTTP fixtures.
+
+To check a provisioned service, set `ZEROCLAW_TEST_HINDSIGHT_URL` to a test
+service origin and run:
+
+```sh
+cargo test --locked -p zeroclaw-memory --lib real_external_service_accepts_and_tracks_a_retain -- --ignored
+```
+
+This creates a disposable bank, submits a synthetic document, looks up the
+operation by its client-generated ID, and deletes the bank. It verifies the
+HTTP handoff without waiting for extraction. For end-to-end extraction, recall,
+and reflection, use the separate `real_local_retain_recall_reflect_and_principal_isolation`
+test with the same environment variable and an active model-backed worker.
 
 ## Conversation perspective
 
